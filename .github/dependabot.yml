@@ -1,10 +1,11 @@
 version: 2
 updates:
-  # Maintain dependencies for GitHub Actions
-  - package-ecosystem: "github-actions"
+  - package-ecosystem: "pip"
     directory: "/"
+    insecure-external-code-execution: allow
+    pull-request-branch-name:
+      # Separate sections of the branch name with a hyphen
+      # for example, `dependabot-npm_and_yarn-next_js-acorn-6.4.1`
+      separator: "-"
     schedule:
-      interval: "weekly"
-    labels:
-      - "GitHub CI/CD"
-      - "no releasenotes"
+      interval: "daily"
