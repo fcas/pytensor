@@ -1,5 +1,7 @@
 import logging
+import re
 import sys
+from contextlib import nullcontext
 from io import StringIO
 
 import numpy as np
@@ -9,41 +11,40 @@ from numpy.testing import assert_array_equal
 import pytensor
 import pytensor.scalar as scal
 import pytensor.tensor.basic as ptb
-from pytensor import function
-from pytensor.compile import DeepCopyOp, shared
+from pytensor import function, shared
 from pytensor.compile.io import In
-from pytensor.compile.mode import Mode
+from pytensor.compile.mode import Mode, get_default_mode
+from pytensor.compile.ops import DeepCopyOp
 from pytensor.configdefaults import config
 from pytensor.gradient import grad
-from pytensor.graph.op import get_test_value
-from pytensor.graph.rewriting.utils import is_same_graph
+from pytensor.graph.basic import equal_computations
+from pytensor.link.numba import NumbaLinker
 from pytensor.printing import pprint
 from pytensor.scalar.basic import as_scalar, int16
-from pytensor.tensor import as_tensor, get_vector_length, vectorize
-from pytensor.tensor.blockwise import Blockwise
+from pytensor.tensor import as_tensor, constant, get_vector_length, ivector, vectorize
+from pytensor.tensor.blockwise import Blockwise, BlockwiseWithCoreShape
 from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import exp, isinf
+from pytensor.tensor.math import exp, isinf, lt, maximum, minimum, switch
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.shape import specify_shape
+from pytensor.tensor.shape import specify_broadcastable, specify_shape
 from pytensor.tensor.subtensor import (
     AdvancedIncSubtensor,
-    AdvancedIncSubtensor1,
-    AdvancedIndexingError,
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     IncSubtensor,
     Subtensor,
+    _is_provably_non_negative,
+    _is_provably_positive,
     advanced_inc_subtensor,
     advanced_inc_subtensor1,
     advanced_set_subtensor,
     advanced_set_subtensor1,
+    advanced_subtensor,
     advanced_subtensor1,
     as_index_literal,
     basic_shape,
     flip,
     get_canonical_form_slice,
     inc_subtensor,
-    index_vars_to_types,
     indexed_result_shape,
     set_subtensor,
     slice_at_axis,
@@ -74,13 +75,7 @@ from pytensor.tensor.type import (
     tensor5,
     vector,
 )
-from pytensor.tensor.type_other import (
-    NoneConst,
-    SliceConstant,
-    as_symbolic_slice,
-    make_slice,
-    slicetype,
-)
+from pytensor.tensor.type_other import NoneConst
 from tests import unittest_tools as utt
 from tests.tensor.utils import inplace_func, integers_ranged, random
 
@@ -88,8 +83,8 @@ from tests.tensor.utils import inplace_func, integers_ranged, random
 subtensor_ops = (
     Subtensor,
     IncSubtensor,
-    AdvancedSubtensor1,
-    AdvancedIncSubtensor1,
+    AdvancedSubtensor,
+    AdvancedIncSubtensor,
 )
 
 
@@ -100,20 +95,73 @@ def test_as_index_literal():
     assert res == slice(1, None)
     res = as_index_literal(slice(None, None, ptb.as_tensor(2)))
     assert res == slice(None, None, 2)
-    res = as_index_literal(SliceConstant(slicetype, slice(None)))
-    assert res == slice(None)
-    res = as_index_literal(make_slice(None, ptb.as_tensor(1)))
-    assert res == slice(None, 1)
 
     res = as_index_literal(ptb.as_tensor(2))
     assert res == 2
 
     res = as_index_literal(np.newaxis)
     assert res is np.newaxis
-    res = as_index_literal(NoneConst)
-    assert res is np.newaxis
-    res = as_index_literal(NoneConst.clone())
-    assert res is np.newaxis
+
+
+class TestProvablyPositive:
+    @pytest.mark.parametrize(
+        "data, strict, expected",
+        [
+            ([1.0, 2.0], True, True),
+            ([1.0, 2.0], False, True),
+            ([0.0, 2.0], True, False),
+            ([0.0, 2.0], False, True),
+            ([-1.0, 2.0], True, False),
+            ([-1.0, 2.0], False, False),
+        ],
+        ids=[
+            "all-positive-strict",
+            "all-positive-loose",
+            "zero-fails-strict",
+            "zero-passes-loose",
+            "negative-fails-strict",
+            "negative-fails-loose",
+        ],
+    )
+    def test_constant_data_respects_strictness(self, data, strict, expected):
+        assert (
+            _is_provably_positive(constant(np.array(data)), strict=strict) is expected
+        )
+
+    @pytest.mark.parametrize(
+        "make_var",
+        [
+            pytest.param(lambda: vector("v", dtype="uint8"), id="uint-dtype"),
+            pytest.param(lambda: matrix("m").shape[0], id="shape-dim"),
+            pytest.param(lambda: constant(np.array([0.5])).astype("int64"), id="cast"),
+        ],
+    )
+    def test_proves_non_negative_but_not_strict_positive(self, make_var):
+        """A uint value, a shape dimension, and a cast can each equal zero, so
+        they establish ``>= 0`` but never strict ``> 0``."""
+        var = make_var()
+        assert _is_provably_non_negative(var) is True
+        assert _is_provably_positive(var, strict=True) is False
+
+    @pytest.mark.parametrize(
+        "expr, strict, expected",
+        [
+            (minimum(2, 3), True, True),
+            (minimum(2, 0), True, False),
+            (minimum(2, 0), False, True),
+            (maximum(5, -10), True, True),
+            (maximum(-1, -10), True, False),
+        ],
+        ids=[
+            "min-needs-all-positive",
+            "min-zero-fails-strict",
+            "min-zero-passes-loose",
+            "max-needs-any-positive",
+            "max-none-positive",
+        ],
+    )
+    def test_recurses_through_min_and_max(self, expr, strict, expected):
+        assert _is_provably_positive(expr, strict=strict) is expected
 
 
 class TestGetCanonicalFormSlice:
@@ -122,8 +170,6 @@ class TestGetCanonicalFormSlice:
         [
             NoneConst,
             None,
-            as_symbolic_slice(slice(3, 7, 2)),
-            as_symbolic_slice(slice(3, int16(), 2)),
             vector(),
         ],
     )
@@ -131,33 +177,57 @@ class TestGetCanonicalFormSlice:
         with pytest.raises(ValueError, match="not a supported slice"):
             get_canonical_form_slice(idx, 5)
 
+    @pytest.mark.parametrize(
+        "idx,expected_direction",
+        [
+            (slice(3, 7, 2), 1),
+            (slice(None, None), 1),
+            (slice(None, None, -1), -1),
+        ],
+    )
+    def test_python_slice_support(self, idx, expected_direction):
+        result, direction = get_canonical_form_slice(idx, 10)
+        assert isinstance(result, slice)
+        assert direction == expected_direction
+
     def test_scalar_constant(self):
         a = as_scalar(0)
         length = lscalar()
-        res = get_canonical_form_slice(a, length)
-        assert isinstance(res[0].owner.op, ptb.ScalarFromTensor)
-        assert res[1] == 1
+        res, direction = get_canonical_form_slice(a, length)
+        assert res == 0
+        assert direction == 1
+
+        b = as_scalar(-1)
+        res, direction = get_canonical_form_slice(b, length)
+        assert equal_computations([res], [as_tensor(-1) + length])
+        assert direction == 1
 
     def test_tensor_constant(self):
         a = as_tensor(0)
         length = lscalar()
-        res = get_canonical_form_slice(a, length)
-        assert isinstance(res[0].owner.op, ptb.ScalarFromTensor)
-        assert res[1] == 1
+        res, direction = get_canonical_form_slice(a, length)
+        assert equal_computations([res], [a])
+        assert direction == 1
+
+        b = as_tensor(-1)
+        res, direction = get_canonical_form_slice(b, length)
+        assert equal_computations([res], [b + length])
+        assert direction == 1
 
     def test_symbolic_scalar(self):
         a = int16()
         length = lscalar()
-        res = get_canonical_form_slice(a, length)
-        assert res[0].owner.op, ptb.switch
-        assert res[1] == 1
+        res, direction = get_canonical_form_slice(a, length)
+        a_t = as_tensor(a)
+        assert equal_computations([res], [switch(lt(a_t, 0), a_t + length, a_t)])
+        assert direction == 1
 
     def test_symbolic_tensor(self):
         a = lscalar()
         length = lscalar()
-        res = get_canonical_form_slice(a, length)
-        assert isinstance(res[0].owner.op, ptb.ScalarFromTensor)
-        assert res[1] == 1
+        res, direction = get_canonical_form_slice(a, length)
+        assert equal_computations([res], [switch(lt(a, 0), a + length, a)])
+        assert direction == 1
 
     @pytest.mark.parametrize("int_fn", [int, np.int64, as_tensor, as_scalar])
     def test_all_integer(self, int_fn):
@@ -349,10 +419,8 @@ class TestSubtensor(utt.OptimizationTestMixin):
         self.dtype = config.floatX
         mode = pytensor.compile.mode.get_default_mode()
         self.mode = mode.including(
-            "local_replace_AdvancedSubtensor",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
             "local_useless_subtensor",
-        )
+        ).excluding("bool_idx_to_nonzero", "fuse_indexed_into_elemwise")
         self.fast_compile = config.mode == "FAST_COMPILE"
 
     def function(
@@ -391,7 +459,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
         f = inplace_func([], t, mode=mode)
         topo = f.maker.fgraph.toposort()
         topo_ = [node for node in topo if not isinstance(node.op, DeepCopyOp)]
-        assert len(topo_) == length
+        assert len(topo_) == length, f.dprint()
         if length == 1:
             assert isinstance(topo_[0].op, op_type)
         tval = f()
@@ -403,7 +471,6 @@ class TestSubtensor(utt.OptimizationTestMixin):
         with pytest.raises(IndexError):
             n.__getitem__(0)
 
-    @config.change_flags(compute_test_value="off")
     def test_err_bounds(self):
         n = self.shared(np.ones(3, dtype=self.dtype))
         t = n[7]
@@ -447,7 +514,11 @@ class TestSubtensor(utt.OptimizationTestMixin):
         assert isinstance(t.owner.op, Subtensor)
         self.eval_output_and_check(
             t,
-            mode=self.mode.excluding("local_useless_subtensor", "local_useless_slice"),
+            mode=self.mode.excluding(
+                "local_useless_subtensor",
+                "local_useless_slice",
+                "extract_diag_lift_pass",
+            ),
         )
 
     def test_err_invalid_2(self):
@@ -484,7 +555,6 @@ class TestSubtensor(utt.OptimizationTestMixin):
         assert tval.shape == (2,)
         assert (tval == [0.0, 2.0]).all()
 
-    @config.change_flags(compute_test_value="off")
     def test_err_bounds0(self):
         n = self.shared(np.ones((2, 3), dtype=self.dtype) * 5)
         for idx in [(0, 4), (0, -4)]:
@@ -500,7 +570,6 @@ class TestSubtensor(utt.OptimizationTestMixin):
             finally:
                 _logger.setLevel(oldlevel)
 
-    @config.change_flags(compute_test_value="off")
     def test_err_bounds1(self):
         n = self.shared(np.ones((2, 3), dtype=self.dtype) * 5)
         t = n[4:5, 3]
@@ -603,10 +672,14 @@ class TestSubtensor(utt.OptimizationTestMixin):
             (1, Subtensor, np.index_exp[..., 1, 2, 3]),
             (1, Subtensor, np.index_exp[1, ..., 2, 3]),
             (1, Subtensor, np.index_exp[1, 2, 3, ...]),
-            (3, DimShuffle, np.index_exp[..., [0, 2, 3]]),
+            (1, AdvancedSubtensor, np.index_exp[..., [0, 2, 3]]),
             (1, DimShuffle, np.index_exp[np.newaxis, ...]),
             (
-                1,
+                # ``[1, 2]`` is folded to a basic slice by
+                # ``local_adv_idx_to_slice`` in canonicalize, so the
+                # AdvancedSubtensor never reaches the linker — toposort is the
+                # same shape regardless of FAST_RUN vs FAST_COMPILE.
+                3,
                 AdvancedSubtensor,
                 np.index_exp[..., np.newaxis, [1, 2]],
             ),
@@ -722,71 +795,85 @@ class TestSubtensor(utt.OptimizationTestMixin):
             inc_subtensor(n4[test_array > 2, ..., 0, 1], 1).eval(),
         )
 
-        with config.change_flags(compute_test_value="off"):
-            # the boolean mask should have the correct shape
-            # - too large, padded with True
-            mask = np.array([True, False, True])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                test_array[mask, ...].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask, ...], 1).eval()
-            mask = np.array([[True, False, False, True], [False, True, False, True]])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            # - too large, padded with False (this works in NumPy < 0.13.0)
-            mask = np.array([True, False, False])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                test_array[mask, ...].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask, ...], 1).eval()
-            mask = np.array([[True, False, False, False], [False, True, False, False]])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            # - mask too small (this works in NumPy < 0.13.0)
-            mask = np.array([True])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                test_array[mask, ...].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask, ...], 1).eval()
-            mask = np.array([[True], [True]])
-            with pytest.raises(IndexError):
-                test_array[mask].eval()
-            with pytest.raises(IndexError):
-                inc_subtensor(test_array[mask], 1).eval()
-            # - too many dimensions
-            mask = np.array([[[True, False, False], [False, True, False]]])
-            with pytest.raises(IndexError):
-                test_array.__getitem__(mask)
-            with pytest.raises(IndexError):
-                test_array.__getitem__(mask)
+        # the boolean mask should have the correct shape
+        # - too large, padded with True
+        mask = np.array([True, False, True])
+        # Single-axis bool reads rewrite ``[T, F, T]`` -> ``[0, 2]`` ->
+        # ``[0:4:2]`` via ``local_adv_idx_to_slice`` (shape_unsafe),
+        # silently truncating the gather. Exclude it so the IndexError from
+        # the out-of-bounds gather still surfaces.
+        shape_safe_read_mode = get_default_mode().excluding("shape_unsafe")
+        with pytest.raises(IndexError):
+            test_array[mask].eval(mode=shape_safe_read_mode)
+        with pytest.raises(IndexError):
+            test_array[mask, ...].eval(mode=shape_safe_read_mode)
+        with pytest.raises(IndexError):
+            inc_subtensor(test_array[mask], 1).eval()
+        with pytest.raises(IndexError):
+            inc_subtensor(test_array[mask, ...], 1).eval()
+        mask = np.array([[True, False, False, True], [False, True, False, True]])
+        with pytest.raises(IndexError):
+            test_array[mask].eval()
+        with pytest.raises(IndexError):
+            inc_subtensor(test_array[mask], 1).eval()
+        # - too large, padded with False
+        # When padded with False converting boolean to nonzero() will not fail
+        # We exclude that rewrite by excluding `shape_unsafe` more generally
+        # However numba doesn't enforce masked array sizes: https://github.com/numba/numba/issues/10374
+        # So the tests that use numba native impl will not fail.
+        shape_safe_mode = get_default_mode().excluding("shape_unsafe")
+        linker_dependent_expectation = (
+            nullcontext()
+            if isinstance(get_default_mode().linker, NumbaLinker)
+            else pytest.raises(IndexError)
+        )
+        mask = np.array([True, False, False])
+        with linker_dependent_expectation:
+            test_array[mask].eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            test_array[mask, ...].eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            inc_subtensor(test_array[mask], 1).eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            inc_subtensor(test_array[mask, ...], 1).eval(mode=shape_safe_mode)
+        mask = np.array([[True, False, False, False], [False, True, False, False]])
+        with pytest.raises(IndexError):
+            test_array[mask].eval(mode=shape_safe_mode)
+        with pytest.raises(IndexError):
+            inc_subtensor(test_array[mask], 1).eval(mode=shape_safe_mode)
+        # - mask too small
+        mask = np.array([True])
+        with linker_dependent_expectation:
+            test_array[mask].eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            test_array[mask, ...].eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            inc_subtensor(test_array[mask], 1).eval(mode=shape_safe_mode)
+        with linker_dependent_expectation:
+            inc_subtensor(test_array[mask, ...], 1).eval(mode=shape_safe_mode)
+        mask = np.array([[True], [True]])
+        with pytest.raises(IndexError):
+            test_array[mask].eval(mode=shape_safe_mode)
+        with pytest.raises(IndexError):
+            inc_subtensor(test_array[mask], 1).eval(mode=shape_safe_mode)
+        # - too many dimensions
+        mask = np.array([[[True, False, False], [False, True, False]]])
+        with pytest.raises(IndexError):
+            test_array.__getitem__(mask)
+        with pytest.raises(IndexError):
+            test_array.__getitem__(mask)
 
-            # special cases: Python bools and bools nested in Python arrays are not supported
-            with pytest.raises(TypeError):
-                test_array.__getitem__((True,))
-            with pytest.raises(TypeError):
-                test_array.__getitem__((False,))
-            with pytest.raises(TypeError):
-                test_array.__getitem__((True, False))
-            with pytest.raises(TypeError):
-                test_array.__getitem__(([0, 1], [0, False]))
-            with pytest.raises(TypeError):
-                test_array.__getitem__(([0, 1], [0, pytensor.shared(True)]))
+        # special cases: Python bools and bools nested in Python arrays are not supported
+        with pytest.raises(TypeError):
+            test_array.__getitem__((True,))
+        with pytest.raises(TypeError):
+            test_array.__getitem__((False,))
+        with pytest.raises(TypeError):
+            test_array.__getitem__((True, False))
+        with pytest.raises(TypeError):
+            test_array.__getitem__(([0, 1], [0, False]))
+        with pytest.raises(TypeError):
+            test_array.__getitem__(([0, 1], [0, pytensor.shared(True)]))
 
     def test_grad_1d(self):
         subi = 0
@@ -825,7 +912,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
                 mv = np.asarray(random(*m_shape), dtype=self.dtype)
 
                 t = op(n[:z, :z], m)
-                gn, gm = pytensor.grad(pt_sum(t), [n, m])
+                _gn, _gm = pytensor.grad(pt_sum(t), [n, m])
                 utt.verify_grad(lambda m: op(n[:z, :z], m), [mv], mode=self.mode)
                 utt.verify_grad(lambda nn: op(nn[:z, :z], mv), [data], mode=self.mode)
 
@@ -848,6 +935,10 @@ class TestSubtensor(utt.OptimizationTestMixin):
         assert np.allclose(gval, good), (gval, good)
 
     def test_ok_list(self):
+        # ``local_adv_idx_to_slice`` (shape_unsafe) rewrites
+        # constant-step gathers like ``[1, 0]`` to a basic slice — exclude it
+        # here so the AdvancedSubtensor1 op survives for inspection.
+        shape_safe_mode = self.mode.excluding("shape_unsafe")
         for data, idx in [
             (random(4), [1, 0]),
             (random(4, 5), [2, 3, -1]),
@@ -865,7 +956,9 @@ class TestSubtensor(utt.OptimizationTestMixin):
             n = self.shared(data)
             t = n[idx]
 
-            val = self.eval_output_and_check(t, op_type=AdvancedSubtensor1)
+            val = self.eval_output_and_check(
+                t, op_type=AdvancedSubtensor, mode=shape_safe_mode
+            )
             if isinstance(idx, list):
                 good = data[idx]
             else:
@@ -874,21 +967,9 @@ class TestSubtensor(utt.OptimizationTestMixin):
             assert np.allclose(val, good), (val, good)
 
             # Test reuse of output memory
-            if type(AdvancedSubtensor1) is AdvancedSubtensor1:
-                op = AdvancedSubtensor1()
-                # When idx is a TensorConstant.
-                if hasattr(idx, "data"):
-                    idx = idx.data
-                test_out = [[None]]
-                op.perform(None, [data, idx], test_out)
-                out1 = test_out[0][0]
-                op.perform(None, [data, idx], test_out)
-                out2 = test_out[0][0]
-                assert out1 is out2
-
             # test the grad
             gn = pytensor.grad(t.sum(), n)
-            g = self.function([], gn, op=AdvancedIncSubtensor1)
+            g = self.function([], gn, op=AdvancedIncSubtensor)
             utt.verify_grad(
                 lambda m: m[[1, 3]],
                 [np.random.random((5, 5)).astype(self.dtype)],
@@ -902,7 +983,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
         idx = [2, 2, 0, 0, 1, 1]
         n = self.shared(data)
         t = n[self.shared(np.asarray(idx).astype("int64"))[::2]]
-        val = self.eval_output_and_check(t, op_type=AdvancedSubtensor1, length=2)
+        val = self.eval_output_and_check(t, op_type=AdvancedSubtensor, length=2)
         utt.assert_allclose(data[idx[::2]], val)
 
     def test_err_invalid_list(self):
@@ -920,12 +1001,12 @@ class TestSubtensor(utt.OptimizationTestMixin):
         l = lvector()
         t = n[l]
 
-        f = self.function([l], t, op=AdvancedSubtensor1)
+        f = self.function([l], t, op=AdvancedSubtensor)
 
         g = self.function(
             [l],
             inc_subtensor(t, np.asarray([[1.0]], self.dtype)),
-            op=AdvancedIncSubtensor1,
+            op=AdvancedIncSubtensor,
         )
 
         for shp in [[0, 4], [0, -3], [-10]]:
@@ -940,11 +1021,11 @@ class TestSubtensor(utt.OptimizationTestMixin):
         idx = lvector()
         t = n[idx]
 
-        f = self.function([idx], t, op=AdvancedSubtensor1)
+        f = self.function([idx], t, op=AdvancedSubtensor)
         topo = f.maker.fgraph.toposort()
         topo_ = [node for node in topo if not isinstance(node.op, DeepCopyOp)]
         assert len(topo_) == 1
-        assert isinstance(topo_[0].op, AdvancedSubtensor1)
+        assert isinstance(topo_[0].op, AdvancedSubtensor)
         f_0 = f([0])
         assert f_0.shape == (1, 3)
         assert np.allclose(f_0, v * 5)
@@ -957,7 +1038,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
         # Test the gradient
         c = t.sum()
         gn = pytensor.grad(c, n)
-        g = self.function([idx], gn, op=AdvancedIncSubtensor1)
+        g = self.function([idx], gn, op=AdvancedIncSubtensor)
         g_0 = g([0])
         assert g_0.shape == (1, 3)
         assert np.allclose(g_0, 1)
@@ -1006,12 +1087,9 @@ class TestSubtensor(utt.OptimizationTestMixin):
         h = set_subtensor(h[indexes], h[indexes])
         g = pytensor.grad(h.sum(), W)
         N = 2
-        if (
-            config.mode == "FAST_COMPILE"
-            and AdvancedIncSubtensor1 is AdvancedIncSubtensor1
-        ):
+        if config.mode == "FAST_COMPILE":
             N = 3
-        f = self.function([x], g, op=AdvancedIncSubtensor1, N=N)
+        f = self.function([x], g, op=AdvancedIncSubtensor, N=N)
 
         f(np.random.random((10, 10, 3, 3)).astype(self.dtype))
 
@@ -1023,11 +1101,11 @@ class TestSubtensor(utt.OptimizationTestMixin):
         assert idx.type.shape == (1,)
         t = n[idx]
 
-        f = self.function([idx], t, op=AdvancedSubtensor1)
+        f = self.function([idx], t, op=AdvancedSubtensor)
         topo = f.maker.fgraph.toposort()
         topo_ = [node for node in topo if not isinstance(node.op, DeepCopyOp)]
         assert len(topo_) == 1
-        assert isinstance(topo_[0].op, AdvancedSubtensor1)
+        assert isinstance(topo_[0].op, AdvancedSubtensor)
         f_0 = f([0])
         assert f_0.shape == (1, 3)
         assert np.allclose(f_0, 5)
@@ -1035,7 +1113,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
         # Test the gradient
         c = t.sum()
         gn = pytensor.grad(c, n)
-        g = self.function([idx], gn, op=AdvancedIncSubtensor1)
+        g = self.function([idx], gn, op=AdvancedIncSubtensor)
         g_0 = g([0])
         assert g_0.shape == (4, 3)
         assert np.allclose(g_0[0], 1)
@@ -1087,20 +1165,20 @@ class TestSubtensor(utt.OptimizationTestMixin):
         n = self.shared(data)
 
         for idx in idxs:
-            # Should stay on the cpu.
-            idx_ = shared(np.asarray(idx))
-            t = n[idx_]
+            idx_np = np.asarray(idx)
+            idx_pt = shared(idx_np, shape=(1 if idx_np.shape[0] == 1 else None,))
+            t = n[idx_pt]
             gn = pytensor.grad(pt_sum(exp(t)), n)
-            f = self.function([], [gn, gn.shape], op=AdvancedIncSubtensor1)
+            f = self.function([], [gn, gn.shape], op=AdvancedIncSubtensor)
             topo = f.maker.fgraph.toposort()
             if not self.fast_compile:
                 assert any(
-                    isinstance(node.op, AdvancedIncSubtensor1) and node.op.inplace
+                    isinstance(node.op, AdvancedIncSubtensor) and node.op.inplace
                     for node in topo
                 )
             else:
-                assert any(isinstance(node.op, AdvancedIncSubtensor1) for node in topo)
-            assert any(isinstance(node.op, AdvancedSubtensor1) for node in topo)
+                assert any(isinstance(node.op, AdvancedIncSubtensor) for node in topo)
+            assert any(isinstance(node.op, AdvancedSubtensor) for node in topo)
             gval, gshape = f()
             good = np.zeros_like(data)
             # don't work when the same index is used many time
@@ -1112,24 +1190,26 @@ class TestSubtensor(utt.OptimizationTestMixin):
             assert np.allclose(gshape, data.shape)
 
             def fct(t):
-                return pt_sum(t[idx_])
+                return pt_sum(t[idx_pt])
 
             utt.verify_grad(fct, [data], mode=self.mode)
 
             # Test the grad of the grad (e.i. AdvancedIncSubtensor1.grad)
             def fct2(t):
-                return pytensor.grad(pt_sum(t[idx_]), t)
+                return pytensor.grad(pt_sum(t[idx_pt]), t)
 
             utt.verify_grad(fct2, [data], mode=self.mode)
 
             # Test shape of AdvancedIncSubtensor1 and AdvancedSubtensor1
             if not self.fast_compile:
-                ops = (AdvancedIncSubtensor1, AdvancedSubtensor1)
+                ops = (AdvancedIncSubtensor, AdvancedSubtensor)
             else:
                 ops = subtensor_ops
             if idx is idxs[0]:
                 # TODO FIXME: This is a very poorly specified test.
-                f = self.function([], [gn.shape, n[idx_].shape], op=ops, N=0, N_fast=0)
+                f = self.function(
+                    [], [gn.shape, n[idx_pt].shape], op=ops, N=0, N_fast=0
+                )
                 f()
 
     def test_wrong_exception_regression(self):
@@ -1217,10 +1297,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
                     data_num_init = np.arange(data_size, dtype=self.dtype)
                     data_num_init = data_num_init.reshape(data_shape)
                     inc_shapes = [data_shape[i:] for i in range(0, len(data_shape) + 1)]
-                    # Test broadcasting of y.
-                    inc_shapes += [(1,) + inc_shapes[-1][1:]]
                     for inc_shape in inc_shapes:
-                        inc_n_dims = len(inc_shape)
                         # We copy the numeric value to be 100% sure there is no
                         # risk of accidentally sharing it.
                         data_num = data_num_init.copy()
@@ -1249,10 +1326,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
                             replace=(not set_instead_of_inc),
                         )
                         idx_num = idx_num.astype("int64")
-                        # Symbolic variable with increment value.
-                        inc_var = TensorType(
-                            shape=(None,) * inc_n_dims, dtype=self.dtype
-                        )()
+
                         # Trick for the case where `inc_shape` is the same as
                         # `data_shape`: what we actually want is the first
                         # shape element to be equal to the number of rows to
@@ -1260,7 +1334,16 @@ class TestSubtensor(utt.OptimizationTestMixin):
                         if len(inc_shape) == len(data_shape) and (
                             len(inc_shapes) == 0 or inc_shape[0] != 1
                         ):
-                            inc_shape = (n_to_inc,) + inc_shape[1:]
+                            inc_shape = (n_to_inc, *inc_shape[1:])
+
+                        # Symbolic variable with increment value.
+                        inc_var_static_shape = tuple(
+                            1 if dim_length == 1 else None for dim_length in inc_shape
+                        )
+                        inc_var = TensorType(
+                            shape=inc_var_static_shape, dtype=self.dtype
+                        )()
+
                         # The param dtype is needed when inc_shape is empty.
                         # By default, it would return a float and rng.uniform
                         # with NumPy 1.10 will raise a Deprecation warning.
@@ -1314,7 +1397,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
             all_inputs_var,
             all_outputs_var,
             accept_inplace=True,
-            op=AdvancedIncSubtensor1,
+            op=AdvancedIncSubtensor,
             N=len(all_outputs_var),
         )
 
@@ -1327,6 +1410,71 @@ class TestSubtensor(utt.OptimizationTestMixin):
             # you enable the debug code above.
             assert np.allclose(f_out, output_num), (params, f_out, output_num)
 
+    @pytest.mark.parametrize("func", (advanced_inc_subtensor1, advanced_set_subtensor1))
+    def test_advanced1_inc_runtime_broadcast(self, func):
+        y = matrix("y", dtype="float64", shape=(None, None))
+        idx = lvector("idx")
+
+        x = ptb.zeros((10, 5))
+        idxs = np.repeat(np.arange(10), 2)
+        out = func(x, y, idx)
+
+        f = function([y, idx], out)
+        f(np.ones((20, 5)), idxs)  # Fine
+
+        # A length-one index is an exact fit for a length-one update, not a broadcast
+        expected = np.zeros((10, 5))
+        expected[1] = 1.0
+        assert_array_equal(f(np.ones((1, 5)), np.array([1])), expected)
+
+        err_message = (
+            "(Runtime broadcasting not allowed\\. AdvancedIncSubtensor was asked"
+            "|The number of indices and values must match)"
+        )
+        numba_linker = isinstance(f.maker.linker, NumbaLinker)
+        # Numba implementation does not raise for runtime broadcasting
+        with (
+            nullcontext()
+            if numba_linker
+            else pytest.raises(ValueError, match=err_message)
+        ):
+            f(np.ones((1, 5)), idxs)
+        with (
+            nullcontext()
+            if numba_linker
+            else pytest.raises(ValueError, match=err_message)
+        ):
+            f(np.ones((20, 1)), idxs)
+
+    @pytest.mark.xfail(reason="Runtime broadcasting is only checked for a vector index")
+    @pytest.mark.parametrize("idx_dtype", ("bool", "int64"))
+    def test_advanced_set_runtime_broadcast_unchecked_indices(self, idx_dtype):
+        """These index forms should be checked too, but we only kept the original AdvancedIncSubtensor1 check.
+
+        Rewrites are off to keep `bool_idx_to_nonzero` from turning the mask into
+        integer positions before it reaches the Op.
+        """
+        x = vector("x", dtype="float64", shape=(None,))
+        y = vector("y", dtype="float64", shape=(None,))
+        idx = (
+            vector("idx", dtype="bool", shape=(None,))
+            if idx_dtype == "bool"
+            else lmatrix("idx")
+        )
+
+        out = advanced_set_subtensor(x, y, idx)
+        f = function([x, y, idx], out, mode=Mode(linker="py", optimizer=None))
+
+        idx_val = (
+            np.array([True, True, True, False, False])
+            if idx_dtype == "bool"
+            else np.array([[0, 1], [2, 3]])
+        )
+        with pytest.raises(
+            ValueError, match=r"Runtime broadcasting not allowed\. AdvancedIncSubtensor"
+        ):
+            f(np.zeros(5), np.ones(1), idx_val)
+
     def test_adv_constant_arg(self):
         # Test case provided (and bug detected, gh-607) by John Salvatier
         m = matrix("m")
@@ -1338,7 +1486,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
         s1 = m[gv, i]
         s2 = m[g, i]
 
-        assert is_same_graph(s1, s2)
+        assert equal_computations([s1], [s2])
 
     def test_adv1_inc_sub_notlastdim(self):
         # Test that taking 1-dimensional advanced indexing
@@ -1685,7 +1833,7 @@ class TestIncSubtensor:
         )
 
 
-class TestIncSubtensor1:
+class TestAdvancedIncSubtensor1:
     def setup_method(self):
         self.rng = np.random.default_rng(seed=utt.fetch_seed())
 
@@ -1718,9 +1866,9 @@ class TestIncSubtensor1:
 
     @pytest.mark.parametrize("ignore_duplicates", [True, False])
     def test_inc_subtensor_AdvancedSubtensor1(self, ignore_duplicates):
-        x = AdvancedSubtensor1()(self.v, self.adv1q)
+        x = advanced_subtensor1(self.v, self.adv1q)
         a = inc_subtensor(x, self.v[self.adv1q], ignore_duplicates=ignore_duplicates)
-        assert isinstance(a.owner.op, AdvancedIncSubtensor1 | AdvancedIncSubtensor)
+        assert isinstance(a.owner.op, AdvancedIncSubtensor)
         assert getattr(a.owner.op, "ignore_duplicates", False) == ignore_duplicates
 
     def test_1d_inc_adv_selection(self):
@@ -1772,6 +1920,16 @@ class TestIncSubtensor1:
         out1val, out2val = f(mval, incval, incval)
         utt.assert_allclose(out1val, out2val)
 
+    def test_empty_index(self):
+        x = fvector()
+        idx = constant([], dtype="int64")
+        y = idx.astype("float32")
+        out = advanced_inc_subtensor1(x, y, idx)
+
+        test_x = np.array([1, 2, 3], dtype="float32")
+        res = out.eval({x: test_x}, mode=Mode(optimizer=None))
+        np.testing.assert_array_equal(res, test_x)
+
 
 class TestAdvancedSubtensor:
     """Test inc_subtensor and set_subtensor."""
@@ -1792,6 +1950,96 @@ class TestAdvancedSubtensor:
         self.ix2 = lmatrix()
         self.ixr = lrow()
 
+    def test_static_shape(self):
+        x = tensor("x", shape=(None, None))
+        y = tensor("y", shape=(4, 5, 6))
+        idx1 = tensor("idx1", shape=(10,), dtype=int)
+        idx2 = tensor("idx2", shape=(3, None), dtype=int)
+
+        assert x[idx1].type.shape == (10, None)
+        assert x[:, idx1].type.shape == (None, 10)
+        assert x[None, :, idx1].type.shape == (1, None, 10)
+        assert x[idx2, :5].type.shape == (3, None, None)
+        assert specify_shape(x, (None, 7))[idx2, :5].type.shape == (3, None, 5)
+        assert specify_shape(x, (None, 3))[idx2, :5].type.shape == (3, None, 3)
+        assert x[idx1, idx2].type.shape == (3, 10)
+        assert x[idx2, idx1].type.shape == (3, 10)
+        assert x[None, idx1, idx2].type.shape == (1, 3, 10)
+        assert x[idx1, None, idx2].type.shape == (3, 10, 1)
+        assert x[idx1, idx2, None].type.shape == (3, 10, 1)
+
+        assert y[idx1, idx2, ::-1].type.shape == (3, 10, 6)
+        assert y[idx1, ::-1, idx2].type.shape == (3, 10, 5)
+        assert y[::-1, idx1, idx2].type.shape == (4, 3, 10)
+        assert y[::-1, idx1, None, idx2].type.shape == (3, 10, 4, 1)
+
+        msg = re.escape(
+            "shape mismatch: indexing tensors could not be broadcast together with shapes [(10,), (9,)]"
+        )
+        with pytest.raises(IndexError, match=msg):
+            x[idx1, idx1[1:]]
+
+    def test_static_shape_boolean(self):
+        y = tensor("y", shape=(4, 5, 6))
+        idx1 = tensor("idx1", shape=(4,), dtype=int)
+        idx2 = tensor("idx2", shape=(3, None), dtype=int)
+        bool_idx1 = tensor("bool_idx1", shape=(4,), dtype=bool)
+        bool_idx2 = tensor(
+            "bool_idx2",
+            shape=(
+                None,
+                5,
+            ),
+            dtype=bool,
+        )
+
+        assert y[bool_idx1].type.shape == (None, 5, 6)
+        assert y[bool_idx1, :, None:-4:-1].type.shape == (None, 5, 3)
+        assert y[bool_idx1, idx2].type.shape == (3, None, 6)
+        assert y[bool_idx1, idx1, :].type.shape == (4, 6)
+        assert y[bool_idx1, :, idx1].type.shape == (4, 5)
+        assert y[bool_idx1, idx1, idx2].type.shape == (3, 4)
+        assert y[None, bool_idx1, None, idx2, None, idx1].type.shape == (3, 4, 1, 1, 1)
+
+        assert y[bool_idx2, :].type.shape == (None, 6)
+        assert y[bool_idx2, idx1].type.shape == (4,)
+        assert y[bool_idx2, idx2].type.shape == (3, None)
+
+        msg = re.escape(
+            "too many indices for tensor: tensor is 3-dimensional, but 4 were indexed"
+        )
+        with pytest.raises(IndexError, match=msg):
+            y[bool_idx2, bool_idx2]
+
+        # Case that could conceivably be detected as index error at definition time
+        bad_idx = ptb.concatenate([idx1, idx1])
+        assert y[bool_idx1, bad_idx].type.shape == (8, 6)
+
+    def test_static_shape_constant_boolean(self):
+        y = tensor("y", shape=(None, None, None))
+        idx1 = tensor("idx1", shape=(3,), dtype=int)
+        idx2 = tensor("idx2", shape=(4, None), dtype=int)
+
+        bool_idx1 = constant(np.array([True, False, True, True]), name="bool_idx1")
+        bool_idx2 = constant(
+            np.array([[True, False, True, True], [True, False, False, True]]),
+            name="bool_idx2",
+        )
+
+        assert y[bool_idx1].type.shape == (3, None, None)
+        assert y[bool_idx1, :, idx1].type.shape == (3, None)
+        assert y[bool_idx1, :, idx2].type.shape == (4, 3, None)
+
+        assert y[bool_idx2].type.shape == (5, None)
+        assert y[bool_idx1, idx2].type.shape == (4, 3, None)
+
+        bad_idx = ptb.concatenate([idx1, idx1])
+        msg = re.escape(
+            "shape mismatch: indexing tensors could not be broadcast together with shapes [(3,), (6,)]"
+        )
+        with pytest.raises(IndexError, match=msg):
+            y[bool_idx1, bad_idx]
+
     @pytest.mark.parametrize(
         "inplace",
         [
@@ -1806,7 +2054,7 @@ class TestAdvancedSubtensor:
             x = self.shared(x_val, name="x")
             y = tensor(dtype="float32", shape=(None,) * len(y_val.shape), name="y")
             sym_idx = [ptb.as_tensor_variable(ix) for ix in idx]
-            expr = AdvancedIncSubtensor(inplace=inplace)(x, y, *sym_idx)
+            expr = advanced_inc_subtensor(x, y, *sym_idx, inplace=inplace)
             f = pytensor.function(
                 [y], expr, mode=self.mode.excluding("inplace"), accept_inplace=inplace
             )
@@ -2142,10 +2390,29 @@ class TestAdvancedSubtensor:
     def test_adv_sub_slice(self):
         # Reported in https://github.com/Theano/Theano/issues/5898
         var = self.shared(np.zeros([3, 3], dtype=config.floatX))
-        slc = slicetype()
-        f = pytensor.function([slc], var[slc], mode=self.mode)
-        s = slice(1, 3)
-        f(s)
+
+        # Test with scalar variables for slice boundaries
+        start = lscalar("start")
+        stop = lscalar("stop")
+
+        # Create sliced output
+        f = pytensor.function([start, stop], var[start:stop], mode=self.mode)
+        result = f(1, 3)
+        assert result.shape == (2, 3)
+
+        f_shape0 = pytensor.function(
+            [start, stop], var[start:stop].shape[0], mode=self.mode
+        )
+        assert f_shape0(1, 3) == 2
+
+        f_shape1 = pytensor.function(
+            [start, stop], var[start:stop].shape[1], mode=self.mode
+        )
+        assert not any(
+            isinstance(node.op, AdvancedSubtensor)
+            for node in f_shape1.maker.fgraph.toposort()
+        )
+        assert f_shape1(1, 3) == 3
 
     def test_adv_grouped(self):
         # Reported in https://github.com/Theano/Theano/issues/6152
@@ -2237,6 +2504,8 @@ class TestAdvancedSubtensor:
 
 
 class TestInferShape(utt.InferShapeTester):
+    mode = get_default_mode().excluding("bool_idx_to_nonzero")
+
     @staticmethod
     def random_bool_mask(shape, rng=None):
         if rng is None:
@@ -2374,9 +2643,13 @@ class TestInferShape(utt.InferShapeTester):
         aivec_val = [2, 3]
         self._compile_and_check(
             [admat, bdmat],
-            [advanced_set_subtensor1(admat, bdmat, aivec_val)],
+            [
+                advanced_set_subtensor1(
+                    admat, specify_broadcastable(bdmat, 0), aivec_val
+                )
+            ],
             [admat_val, [[1, 2, 3, 4]]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [1, 3, 2]
@@ -2384,7 +2657,7 @@ class TestInferShape(utt.InferShapeTester):
             [admat, advec],
             [advanced_set_subtensor1(admat, advec, aivec_val)],
             [admat_val, [1, 2, 3, 4]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [0, 3, 0]
@@ -2392,7 +2665,7 @@ class TestInferShape(utt.InferShapeTester):
             [admat, adscal],
             [advanced_set_subtensor1(admat, adscal, aivec_val)],
             [admat_val, 1],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         adtens4 = dtensor4()
@@ -2401,9 +2674,13 @@ class TestInferShape(utt.InferShapeTester):
         aivec_val = [2, 3]
         self._compile_and_check(
             [adtens4, bdtens4],
-            [advanced_set_subtensor1(adtens4, bdtens4, aivec_val)],
+            [
+                advanced_set_subtensor1(
+                    adtens4, specify_broadcastable(bdtens4, 0, 1, 2), aivec_val
+                )
+            ],
             [adtens4_val, [[[[1, 2, 3, 4, 5]]]]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
             warn=False,
         )
 
@@ -2412,7 +2689,7 @@ class TestInferShape(utt.InferShapeTester):
             [adtens4, advec],
             [advanced_set_subtensor1(adtens4, advec, aivec_val)],
             [adtens4_val, [1, 2, 3, 4, 5]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [0, 3, 0]
@@ -2420,7 +2697,7 @@ class TestInferShape(utt.InferShapeTester):
             [adtens4, adscal],
             [advanced_set_subtensor1(adtens4, adscal, aivec_val)],
             [adtens4_val, 1],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [2, 3]
@@ -2428,7 +2705,7 @@ class TestInferShape(utt.InferShapeTester):
             [admat, bdmat],
             [advanced_set_subtensor1(admat, bdmat, aivec_val)],
             [admat_val, [[1, 2, 3, 4], [5, 6, 7, 8]]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [1, 3, 2]
@@ -2436,7 +2713,7 @@ class TestInferShape(utt.InferShapeTester):
             [admat, advec],
             [advanced_set_subtensor1(admat, advec, aivec_val)],
             [admat_val, [1, 2, 3, 4]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [0, 3, 0]
@@ -2444,7 +2721,7 @@ class TestInferShape(utt.InferShapeTester):
             [admat, adscal],
             [advanced_set_subtensor1(admat, adscal, aivec_val)],
             [admat_val, 1],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         bdtens4 = dtensor4()
@@ -2452,9 +2729,13 @@ class TestInferShape(utt.InferShapeTester):
         aivec_val = [2, 3]
         self._compile_and_check(
             [adtens4, bdtens4],
-            [advanced_set_subtensor1(adtens4, bdtens4, aivec_val)],
+            [
+                advanced_set_subtensor1(
+                    adtens4, specify_broadcastable(bdtens4, 1, 2), aivec_val
+                )
+            ],
             [adtens4_val, [[[[1, 2, 3, 4, 5]]], [[[6, 7, 8, 9, 10]]]]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
             warn=False,
         )
 
@@ -2463,7 +2744,7 @@ class TestInferShape(utt.InferShapeTester):
             [adtens4, advec],
             [advanced_set_subtensor1(adtens4, advec, aivec_val)],
             [adtens4_val, [1, 2, 3, 4, 5]],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
         aivec_val = [0, 3, 0]
@@ -2471,7 +2752,7 @@ class TestInferShape(utt.InferShapeTester):
             [adtens4, adscal],
             [advanced_set_subtensor1(adtens4, adscal, aivec_val)],
             [adtens4_val, 2],
-            AdvancedIncSubtensor1,
+            AdvancedIncSubtensor,
         )
 
     def test_AdvancedIncSubtensor(self):
@@ -2515,18 +2796,12 @@ class TestInferShape(utt.InferShapeTester):
             AdvancedSubtensor,
         )
 
-        admat.tag.test_value = admat_val
-        aivec.tag.test_value = aivec_val
-        bivec.tag.test_value = bivec_val
-
-        # Make sure it doesn't complain about test values
-        with config.change_flags(compute_test_value="raise"):
-            self._compile_and_check(
-                [admat, aivec],
-                [admat[1:3, aivec]],
-                [admat_val, aivec_val],
-                AdvancedSubtensor,
-            )
+        self._compile_and_check(
+            [admat, aivec],
+            [admat[1:3, aivec]],
+            [admat_val, aivec_val],
+            AdvancedSubtensor,
+        )
 
     def test_AdvancedSubtensor_bool(self):
         n = dmatrix()
@@ -2611,13 +2886,20 @@ class TestInferShape(utt.InferShapeTester):
             AdvancedSubtensor,
         )
 
+    def test_advanced_subtensor_constant_slice(self):
+        x = dmatrix("x")
+        # Use Python slice directly instead of as_symbolic(slice())
+        constant_slice = slice(1, None, None)
+        adv_indices = ptb.constant(np.zeros((2, 3)), dtype="int")
+        y = advanced_subtensor(x, constant_slice, adv_indices)
+        assert tuple(y.shape.eval({x: np.zeros((10, 10))})) == (9, 2, 3)
 
-@config.change_flags(compute_test_value="raise")
+
 def test_basic_shape():
     test_shape = (5, 4)
-    test_indices = (make_slice(1, 3, None),)
+    test_indices = (slice(1, 3, None),)  # Python slice instead of make_slice()
     res = basic_shape(test_shape, test_indices)
-    assert get_test_value(res) == (2,)
+    assert tuple(r.eval() for r in res) == (2,)
 
 
 def idx_as_tensor(x):
@@ -2647,35 +2929,19 @@ test_idx = np.ix_(np.array([True, True]), np.array([True]), np.array([True, True
         (np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)), test_idx[:2]),
         (
             np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            test_idx[:2] + (slice(None, None),),
+            (*test_idx[:2], slice(None, None)),
         ),
         (
             np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            (slice(None, None),) + test_idx[:1],
+            (slice(None, None), *test_idx[:1]),
         ),
         (
             np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            (slice(None, None), None) + test_idx[1:2],
+            (*test_idx[:1], slice(None, None), *test_idx[1:2]),
         ),
         (
             np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            (np.array(1), slice(None, None), None),
-        ),
-        (
-            np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            (slice(None, None), None, np.array(1)),
-        ),
-        (
-            np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            test_idx[:1] + (slice(None, None),) + test_idx[1:2],
-        ),
-        (
-            np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            test_idx[:1] + (slice(None, None),) + test_idx[1:2] + (slice(None, None),),
-        ),
-        (
-            np.arange(np.prod((5, 6, 7, 8))).reshape((5, 6, 7, 8)),
-            test_idx[:1] + (None,) + test_idx[1:2],
+            (*test_idx[:1], slice(None, None), *test_idx[1:2], slice(None, None)),
         ),
         (np.arange(np.prod((5, 4))).reshape((5, 4)), ([1, 3, 2], slice(1, 3))),
         (np.arange(np.prod((5, 4))).reshape((5, 4)), (slice(1, 3), [1, 3, 2])),
@@ -2685,13 +2951,12 @@ test_idx = np.ix_(np.array([True, True]), np.array([True]), np.array([True, True
         ),
     ],
 )
-@config.change_flags(compute_test_value="raise")
 def test_indexed_result_shape(test_array, test_idx):
     res = indexed_result_shape(
         ptb.as_tensor(test_array).shape, [idx_as_tensor(i) for i in test_idx]
     )
     exp_res = test_array[test_idx].shape
-    assert np.array_equal(tuple(get_test_value(r) for r in res), exp_res)
+    assert np.array_equal(tuple(r.eval() for r in res), exp_res)
 
     # Test shape-only version
     res = indexed_result_shape(
@@ -2700,12 +2965,12 @@ def test_indexed_result_shape(test_array, test_idx):
         indices_are_shapes=True,
     )
     exp_res = test_array[test_idx].shape
-    assert np.array_equal(tuple(get_test_value(r) for r in res), exp_res)
+    assert np.array_equal(tuple(r.eval() for r in res), exp_res)
 
 
 def test_symbolic_slice():
     x = tensor4("x")
-    a, b = x.shape[:2]
+    a, _b = x.shape[:2]
     output = a.eval({x: np.zeros((5, 4, 3, 2), dtype=config.floatX)})
     assert output == np.array(5)
 
@@ -2728,7 +2993,7 @@ def test_get_vector_length():
     assert get_vector_length(lvector()[1:1]) == 0
     assert get_vector_length(lvector()[-1:-1:3]) == 0
 
-    with pytest.raises(ValueError, match="^Length of .*"):
+    with pytest.raises(ValueError, match=r"^Length of .*"):
         get_vector_length(x[lscalar() :])
 
 
@@ -2736,12 +3001,11 @@ def test_get_vector_length():
     "indices, exp_res",
     [
         ((0,), "x[0]"),
-        # TODO: The numbers should be printed
-        ((slice(None, 2),), "x[:int64]"),
-        ((slice(0, None),), "x[int64:]"),
-        ((slice(0, 2),), "x[int64:int64]"),
-        ((slice(0, 2, 2),), "x[int64:int64:int64]"),
-        ((slice(0, 2), 0, slice(0, 2)), "x[int64:int64, 2, int64:int64]"),
+        ((slice(None, 2),), "x[:2]"),
+        ((slice(0, None),), "x[0:]"),
+        ((slice(0, 2),), "x[0:2]"),
+        ((slice(0, 2, 2),), "x[0:2:2]"),
+        ((slice(0, 2), 0, slice(0, 2)), "x[0:2, 0, 0:2]"),
     ],
 )
 def test_pprint_Subtensor(indices, exp_res):
@@ -2755,7 +3019,7 @@ def test_pprint_Subtensor(indices, exp_res):
     [
         ((0,), False, "inc_subtensor(x[0], z)"),
         ((0,), True, "set_subtensor(x[0], z)"),
-        ((slice(0, 2),), True, "set_subtensor(x[int64:int64], z)"),
+        ((slice(0, 2),), True, "set_subtensor(x[0:2], z)"),
     ],
 )
 def test_pprint_IncSubtensor(indices, set_instead_of_inc, exp_res):
@@ -2765,22 +3029,38 @@ def test_pprint_IncSubtensor(indices, set_instead_of_inc, exp_res):
     assert pprint(y) == exp_res
 
 
-def test_index_vars_to_types():
-    x = ptb.as_tensor_variable(np.array([True, False]))
+@pytest.mark.parametrize(
+    "indices, exp_res",
+    [
+        # Vector index
+        ((ivector("idx"),), "x[idx]"),
+        # Two vector indices
+        ((ivector("idx"), ivector("idx2")), "x[idx, idx2]"),
+        # Vector index with scalar (triggers advanced indexing)
+        ((ivector("idx"), 0), "x[idx, 0]"),
+        # Vector index with constant slice
+        ((ivector("idx"), slice(0, 5)), "x[idx, 0:5]"),
+    ],
+)
+def test_pprint_AdvancedSubtensor(indices, exp_res):
+    x = tensor4("x")
+    y = advanced_subtensor(x, *indices)
+    assert pprint(y) == exp_res
 
-    with pytest.raises(AdvancedIndexingError):
-        index_vars_to_types(x)
 
-    with pytest.raises(TypeError):
-        index_vars_to_types(1)
-
-    res = index_vars_to_types(iscalar)
-    assert isinstance(res, scal.ScalarType)
-
-    x = scal.constant(1, dtype=np.uint8)
-    assert isinstance(x.type, scal.ScalarType)
-    res = index_vars_to_types(x)
-    assert res == x.type
+@pytest.mark.parametrize(
+    "indices, set_instead_of_inc, exp_res",
+    [
+        ((ivector("idx"),), False, "inc_subtensor(x[idx], z)"),
+        ((ivector("idx"),), True, "set_subtensor(x[idx], z)"),
+        ((ivector("idx"), slice(None, 5)), True, "set_subtensor(x[idx, :5], z)"),
+    ],
+)
+def test_pprint_AdvancedIncSubtensor(indices, set_instead_of_inc, exp_res):
+    x = tensor4("x")
+    z = tensor3("z")
+    y = advanced_inc_subtensor(x, z, *indices, set_instead_of_inc=set_instead_of_inc)
+    assert pprint(y) == exp_res
 
 
 @pytest.mark.parametrize(
@@ -2841,7 +3121,8 @@ def test_vectorize_subtensor_without_batch_indices():
         [x, start], vectorize(core_fn, signature=signature)(x, start)
     )
     assert any(
-        isinstance(node.op, Blockwise) for node in vectorize_pt.maker.fgraph.apply_nodes
+        isinstance(node.op, Blockwise | BlockwiseWithCoreShape)
+        for node in vectorize_pt.maker.fgraph.apply_nodes
     )
     x_test = np.random.normal(size=x.type.shape).astype(x.type.dtype)
     start_test = np.random.randint(0, x.type.shape[-2], size=start.type.shape[0])
@@ -2872,15 +3153,12 @@ def test_vectorize_subtensor_without_batch_indices():
             (2,),
             False,
         ),
-        # (this is currently failing because PyTensor tries to vectorize the slice(None) operation,
-        # due to the exact same None constant being used there and in the np.newaxis)
         pytest.param(
             (lambda x, idx: x[:, idx, None]),
             "(7,5,3),(2)->(7,2,1,3)",
             (11, 7, 5, 3),
             (2,),
             False,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
         ),
         (
             (lambda x, idx: x[:, idx, idx, :]),
@@ -2889,27 +3167,23 @@ def test_vectorize_subtensor_without_batch_indices():
             (2,),
             False,
         ),
-        # (not supported, because fallback Blocwise can't handle slices)
         pytest.param(
             (lambda x, idx: x[:, idx, :, idx]),
             "(7,5,3,5),(2)->(2,7,3)",
             (11, 7, 5, 3, 5),
             (2,),
             True,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
         ),
         # Core x, batched idx
         ((lambda x, idx: x[idx]), "(t1),(idx)->(tx)", (7,), (11, 2), True),
         # Batched x, batched idx
         ((lambda x, idx: x[idx]), "(t1),(idx)->(tx)", (11, 7), (11, 2), True),
-        # (not supported, because fallback Blocwise can't handle slices)
         pytest.param(
             (lambda x, idx: x[:, idx, :]),
             "(t1,t2,t3),(idx)->(t1,tx,t3)",
             (11, 7, 5, 3),
             (11, 2),
             True,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
         ),
     ],
 )
@@ -2923,7 +3197,8 @@ def test_vectorize_adv_subtensor(
     )
 
     has_blockwise = any(
-        isinstance(node.op, Blockwise) for node in vectorize_pt.maker.fgraph.apply_nodes
+        isinstance(node.op, Blockwise | BlockwiseWithCoreShape)
+        for node in vectorize_pt.maker.fgraph.apply_nodes
     )
     assert has_blockwise == uses_blockwise
 
@@ -2971,3 +3246,58 @@ def test_flip(size: tuple[int]):
         z = flip(x_pt, axis=list(axes))
         f = pytensor.function([x_pt], z, mode="FAST_COMPILE")
         np.testing.assert_allclose(expected, f(x), atol=ATOL, rtol=RTOL)
+
+    # Test single negative axis
+    for axis in range(-x.ndim, 0):
+        expected = np.flip(x, axis=axis)
+        z = flip(x_pt, axis=axis)
+        f = pytensor.function([x_pt], z, mode="FAST_COMPILE")
+        np.testing.assert_allclose(expected, f(x), atol=ATOL, rtol=RTOL)
+
+    # Test tuple with negative axes
+    if x.ndim > 1:
+        expected = np.flip(x, axis=(-1, -2))
+        z = flip(x_pt, axis=(-1, -2))
+        f = pytensor.function([x_pt], z, mode="FAST_COMPILE")
+        np.testing.assert_allclose(expected, f(x), atol=ATOL, rtol=RTOL)
+
+    # Test mixed positive and negative axes
+    if x.ndim >= 2:
+        expected = np.flip(x, axis=(0, -1))
+        z = flip(x_pt, axis=(0, -1))
+        f = pytensor.function([x_pt], z, mode="FAST_COMPILE")
+        np.testing.assert_allclose(expected, f(x), atol=ATOL, rtol=RTOL)
+
+
+def test_subtensor_hash_and_eq():
+    s1 = Subtensor(idx_list=[slice(None, None, None), 0])
+    s2 = Subtensor(idx_list=[slice(None, None, None), 0])
+    assert s1 == s2
+    assert hash(s1) == hash(s2)
+
+    s3 = AdvancedSubtensor(idx_list=[slice(None, None, None), 0])
+    s4 = AdvancedIncSubtensor(idx_list=[slice(0, 1, None), 2])
+    assert s3 != s4
+    assert hash(s3) != hash(s4)
+    assert s1 != s3
+
+    inc1 = IncSubtensor(
+        idx_list=[slice(None)], inplace=True, destroyhandler_tolerate_aliased=[(0, 1)]
+    )
+    inc2 = IncSubtensor(
+        idx_list=[slice(None)], inplace=True, destroyhandler_tolerate_aliased=[(0, 1)]
+    )
+    inc3 = IncSubtensor(
+        idx_list=[slice(None)], inplace=True, destroyhandler_tolerate_aliased=[(0, 2)]
+    )
+
+    assert inc1 == inc2
+    assert hash(inc1) == hash(inc2)
+    assert inc1 != inc3
+    if hash(inc1) == hash(inc3):
+        assert inc1 == inc3
+
+    s_mix1 = Subtensor(idx_list=[0, slice(None), slice(None, 1)])
+    s_mix2 = Subtensor(idx_list=[0, slice(None), slice(None, 1)])
+    assert s_mix1 == s_mix2
+    assert hash(s_mix1) == hash(s_mix2)

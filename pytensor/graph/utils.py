@@ -73,7 +73,7 @@ def simple_extract_stack(
     return trace
 
 
-def add_tag_trace(thing: T, user_line: int | None = None) -> T:
+def add_tag_trace[T: "Apply" | "Variable"](thing: T, user_line: int | None = None) -> T:
     """Add tag.trace to a node or variable.
 
     The argument is returned after being affected (inplace).
@@ -107,8 +107,6 @@ def add_tag_trace(thing: T, user_line: int | None = None) -> T:
         "pytensor\\graph\\",
         "pytensor/scalar/basic.py",
         "pytensor\\scalar\\basic.py",
-        "pytensor/sandbox/",
-        "pytensor\\sandbox\\",
         "pytensor/scan/",
         "pytensor\\scan\\",
         "pytensor/sparse/",
@@ -121,7 +119,7 @@ def add_tag_trace(thing: T, user_line: int | None = None) -> T:
         skips = []
 
     tr = simple_extract_stack(limit=user_line, skips=skips)
-    # Different python version use different sementic for
+    # Different python version use different semantic for
     # limit. python 2.7 include the call to extrack_stack. The -1 get
     # rid of it.
 
@@ -176,10 +174,6 @@ class MissingInputError(Exception):
         super().__init__(s)
 
 
-class TestValueError(Exception):
-    """Base exception class for all test value errors."""
-
-
 class MethodNotDefined(Exception):
     """
     To be raised by functions defined as part of an interface.
@@ -229,9 +223,11 @@ class MetaType(ABCMeta):
             if "__eq__" not in dct:
 
                 def __eq__(self, other):
-                    return type(self) is type(other) and tuple(
-                        getattr(self, a) for a in props
-                    ) == tuple(getattr(other, a) for a in props)
+                    return self is other or (
+                        type(self) is type(other)
+                        and tuple(getattr(self, a) for a in props)
+                        == tuple(getattr(other, a) for a in props)
+                    )
 
                 dct["__eq__"] = __eq__
 
@@ -276,9 +272,9 @@ class Scratchpad:
         return "scratchpad" + str(self.__dict__)
 
     def info(self):
-        print(f"<pytensor.graph.utils.scratchpad instance at {id(self)}>")
+        print(f"<pytensor.graph.utils.scratchpad instance at {id(self)}>")  # noqa: T201
         for k, v in self.__dict__.items():
-            print(f"  {k}: {v}")
+            print(f"  {k}: {v}")  # noqa: T201
 
     # These two methods have been added to help Mypy
     def __getattribute__(self, name):
@@ -286,22 +282,6 @@ class Scratchpad:
 
     def __setattr__(self, name: str, value: Any) -> None:
         self.__dict__[name] = value
-
-
-class ValidatingScratchpad(Scratchpad):
-    """This `Scratchpad` validates attribute values."""
-
-    def __init__(self, attr, attr_filter):
-        super().__init__()
-
-        object.__setattr__(self, "attr", attr)
-        object.__setattr__(self, "attr_filter", attr_filter)
-
-    def __setattr__(self, attr, obj):
-        if getattr(self, "attr", None) == attr:
-            obj = self.attr_filter(obj)
-
-        return object.__setattr__(self, attr, obj)
 
 
 class AssocList:

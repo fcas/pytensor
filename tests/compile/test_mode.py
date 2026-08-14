@@ -1,18 +1,17 @@
 import copy
 
-import pytest
-
-from pytensor.compile.function import function
+from pytensor.compile.maker import function
 from pytensor.compile.mode import (
     AddFeatureOptimizer,
     Mode,
     get_default_mode,
-    get_target_language,
 )
 from pytensor.configdefaults import config
 from pytensor.graph.features import NoOutputFromInplace
+from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.rewriting.basic import get_active_mode, graph_rewriter
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery, SequenceDB
-from pytensor.link.basic import LocalLinker
+from pytensor.link.jax import JAXLinker
 from pytensor.tensor.math import dot, tanh
 from pytensor.tensor.type import matrix, vector
 
@@ -54,11 +53,16 @@ def test_NoOutputFromInplace():
 
 
 def test_including():
-    mode = Mode(optimizer="merge")
-    assert set(mode._optimizer.include) == {"merge"}
+    mode = Mode(linker="py", optimizer="merge")
+    assert set(mode._optimizer.include) == {"minimum_compile", "py_only", "merge"}
 
     new_mode = mode.including("fast_compile")
-    assert set(new_mode._optimizer.include) == {"merge", "fast_compile"}
+    assert set(new_mode._optimizer.include) == {
+        "minimum_compile",
+        "py_only",
+        "merge",
+        "fast_compile",
+    }
 
 
 class TestBunchOfModes:
@@ -71,9 +75,18 @@ class TestBunchOfModes:
 
         # Linkers to use with regular Mode
         if config.cxx:
-            linkers = ["py", "c|py", "c|py_nogc", "vm", "vm_nogc", "cvm", "cvm_nogc"]
+            linkers = [
+                "py",
+                "c|py",
+                "c|py_nogc",
+                "vm",
+                "vm_nogc",
+                "cvm",
+                "cvm_nogc",
+                "numba",
+            ]
         else:
-            linkers = ["py", "c|py", "c|py_nogc", "vm", "vm_nogc"]
+            linkers = ["py", "c|py", "c|py_nogc", "vm", "vm_nogc", "numba"]
         modes = predef_modes + [Mode(linker, "fast_run") for linker in linkers]
 
         for mode in modes:
@@ -87,11 +100,12 @@ class TestBunchOfModes:
 
         # regression check:
         # there should be
+        # - NumbaLinker
         # - `VMLinker`
         # - OpWiseCLinker (FAST_RUN)
         # - PerformLinker (FAST_COMPILE)
         # - DebugMode's Linker  (DEBUG_MODE)
-        assert 4 == len(set(linker_classes_involved))
+        assert 5 == len(set(linker_classes_involved))
 
 
 class TestOldModesProblem:
@@ -109,36 +123,34 @@ class TestOldModesProblem:
         assert not hasattr(linker, "fgraph") or linker.fgraph is None
 
 
-def test_get_target_language():
-    with config.change_flags(mode=Mode(linker="py")):
-        res = get_target_language()
-        assert res == ("py",)
+def test_predefined_modes_respected():
+    default_mode = get_default_mode()
+    assert not isinstance(default_mode.linker, JAXLinker)
 
-    res = get_target_language(Mode(linker="py"))
-    assert res == ("py",)
+    with config.change_flags(mode="JAX"):
+        jax_mode = get_default_mode()
+        assert isinstance(jax_mode.linker, JAXLinker)
 
-    res = get_target_language(Mode(linker="c"))
-    assert res == ("c",)
+    default_mode_again = get_default_mode()
+    assert not isinstance(default_mode_again.linker, JAXLinker)
 
-    res = get_target_language(Mode(linker="c|py"))
-    assert res == ("c", "py")
 
-    res = get_target_language(Mode(linker="vm"))
-    assert res == ("c", "py")
+def test_optimizer_sets_active_compile_mode():
+    """``mode.optimizer.rewrite(fgraph)`` must expose ``mode`` as the active compile
+    mode (via ``get_active_mode``) while it runs, even outside ``FunctionMaker``, so
+    inner-graph rewrites recover the right backend. The mode is stamped only when
+    unset and restored afterwards.
+    """
+    seen = []
 
-    with config.change_flags(cxx=""):
-        res = get_target_language(Mode(linker="vm"))
-        assert res == ("py",)
+    @graph_rewriter
+    def record_active_mode(fgraph):
+        seen.append(get_active_mode(fgraph))
 
-    res = get_target_language(Mode(linker="jax"))
-    assert res == ("jax",)
+    mode = Mode(linker="py", optimizer=record_active_mode)
+    x = vector("x")
+    fg = FunctionGraph([x], [x])
 
-    res = get_target_language(Mode(linker="numba"))
-    assert res == ("numba",)
-
-    class MyLinker(LocalLinker):
-        pass
-
-    test_mode = Mode(linker=MyLinker())
-    with pytest.raises(Exception):
-        get_target_language(test_mode)
+    mode.optimizer.rewrite(fg)
+    assert seen == [mode]
+    assert getattr(fg, "_compile_mode", None) is None

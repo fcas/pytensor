@@ -1,6 +1,10 @@
+import gc
+import operator
+
 import pytest
 
 from pytensor.configdefaults import config
+from pytensor.graph import rewrite_graph
 from pytensor.graph.basic import Apply, Constant, equal_computations
 from pytensor.graph.features import Feature
 from pytensor.graph.fg import FunctionGraph
@@ -8,11 +12,9 @@ from pytensor.graph.op import Op
 from pytensor.graph.rewriting.basic import (
     EquilibriumGraphRewriter,
     MergeOptimizer,
-    OpKeyGraphRewriter,
     OpToRewriterTracker,
     PatternNodeRewriter,
     SequentialNodeRewriter,
-    SubstitutionNodeRewriter,
     WalkingGraphRewriter,
     in2out,
     logging,
@@ -20,12 +22,11 @@ from pytensor.graph.rewriting.basic import (
     pre_constant_merge,
     pre_greedy_node_rewriter,
 )
+from pytensor.graph.rewriting.unify import LiteralString, OpPattern
 from pytensor.raise_op import assert_op
 from pytensor.tensor.math import Dot, add, dot, exp
 from pytensor.tensor.rewriting.basic import constant_folding
-from pytensor.tensor.subtensor import AdvancedSubtensor
 from pytensor.tensor.type import matrix, values_eq_approx_always_true, vector
-from pytensor.tensor.type_other import MakeSlice, SliceConstant, slicetype
 from tests.graph.utils import (
     MyOp,
     MyType,
@@ -41,6 +42,7 @@ from tests.graph.utils import (
     op_y,
     op_z,
 )
+from tests.unittest_tools import assert_equal_computations
 
 
 class AssertNoChanges(Feature):
@@ -50,15 +52,11 @@ class AssertNoChanges(Feature):
         raise AssertionError()
 
 
-def OpKeyPatternNodeRewriter(p1, p2, allow_multiple_clients=False, ign=False):
-    return OpKeyGraphRewriter(
+def WalkingPatternNodeRewriter(p1, p2, allow_multiple_clients=False, ign=False):
+    return WalkingGraphRewriter(
         PatternNodeRewriter(p1, p2, allow_multiple_clients=allow_multiple_clients),
         ignore_newtrees=ign,
     )
-
-
-def WalkingPatternNodeRewriter(p1, p2, ign=True):
-    return WalkingGraphRewriter(PatternNodeRewriter(p1, p2), ignore_newtrees=ign)
 
 
 class TestPatternNodeRewriter:
@@ -67,16 +65,16 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, y), z)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, (op2, "1", "2"), "3"), (op4, "3", "2")).rewrite(
-            g
-        )
+        WalkingPatternNodeRewriter(
+            (op1, (op2, "1", "2"), "3"), (op4, "3", "2")
+        ).rewrite(g)
         assert str(g) == "FunctionGraph(Op4(z, y))"
 
     def test_nested_out_pattern(self):
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(x, y)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op1, "1", "2"), (op4, (op1, "1"), (op2, "2"), (op3, "1", "2"))
         ).rewrite(g)
         assert str(g) == "FunctionGraph(Op4(Op1(x), Op2(y), Op3(x, y)))"
@@ -85,7 +83,7 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, x), z)  # the arguments to op2 are the same
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op1, (op2, "1", "1"), "2"),  # they are the same in the pattern
             (op4, "2", "1"),
         ).rewrite(g)
@@ -96,7 +94,7 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, y), z)  # the arguments to op2 are different
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op1, (op2, "1", "1"), "2"),  # they are the same in the pattern
             (op4, "2", "1"),
         ).rewrite(g)
@@ -108,7 +106,7 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, y), z)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op2, "1", "2"), (op1, "2", "1")).rewrite(g)
+        WalkingPatternNodeRewriter((op2, "1", "2"), (op1, "2", "1")).rewrite(g)
         assert str(g) == "FunctionGraph(Op1(Op1(y, x), z))"
 
     def test_no_recurse(self):
@@ -118,7 +116,9 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, y), z)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op2, "1", "2"), (op2, "2", "1"), ign=True).rewrite(g)
+        WalkingPatternNodeRewriter((op2, "1", "2"), (op2, "2", "1"), ign=True).rewrite(
+            g
+        )
         assert str(g) == "FunctionGraph(Op1(Op2(y, x), z))"
 
     def test_multiple(self):
@@ -126,7 +126,7 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op2(x, y), op2(x, y), op2(y, z))
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op2, "1", "2"), (op4, "1")).rewrite(g)
+        WalkingPatternNodeRewriter((op2, "1", "2"), (op4, "1")).rewrite(g)
         assert str(g) == "FunctionGraph(Op1(Op4(x), Op4(x), Op4(y)))"
 
     def test_nested_even(self):
@@ -135,21 +135,21 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op1(op1(op1(x))))
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, (op1, "1")), "1").rewrite(g)
+        WalkingPatternNodeRewriter((op1, (op1, "1")), "1").rewrite(g)
         assert str(g) == "FunctionGraph(x)"
 
     def test_nested_odd(self):
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op1(op1(op1(op1(x)))))
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, (op1, "1")), "1").rewrite(g)
+        WalkingPatternNodeRewriter((op1, (op1, "1")), "1").rewrite(g)
         assert str(g) == "FunctionGraph(Op1(x))"
 
     def test_expand(self):
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op1(op1(x)))
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, "1"), (op2, (op1, "1")), ign=True).rewrite(g)
+        WalkingPatternNodeRewriter((op1, "1"), (op2, (op1, "1")), ign=True).rewrite(g)
         assert str(g) == "FunctionGraph(Op2(Op1(Op2(Op1(Op2(Op1(x)))))))"
 
     def test_ambiguous(self):
@@ -168,7 +168,7 @@ class TestPatternNodeRewriter:
         z = Constant(MyType(), 2, name="z")
         e = op1(op1(x, y), y)
         g = FunctionGraph([y], [e])
-        OpKeyPatternNodeRewriter((op1, z, "1"), (op2, "1", z)).rewrite(g)
+        WalkingPatternNodeRewriter((op1, z, "1"), (op2, "1", z)).rewrite(g)
         assert str(g) == "FunctionGraph(Op1(Op2(y, z{2}), y))"
 
     def test_constraints(self):
@@ -180,7 +180,7 @@ class TestPatternNodeRewriter:
             # Only replacing if the input is an instance of Op2
             return r.owner.op == op2
 
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op1, {"pattern": "1", "constraint": constraint}), (op3, "1")
         ).rewrite(g)
         assert str(g) == "FunctionGraph(Op4(Op3(Op2(x, y)), Op1(Op1(x, y))))"
@@ -189,7 +189,7 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(x, x)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, "x", "y"), (op3, "x", "y")).rewrite(g)
+        WalkingPatternNodeRewriter((op1, "x", "y"), (op3, "x", "y")).rewrite(g)
         assert str(g) == "FunctionGraph(Op3(x, x))"
 
     @pytest.mark.xfail(
@@ -201,10 +201,10 @@ class TestPatternNodeRewriter:
         g = FunctionGraph([x, y, z], [e])
 
         def constraint(r):
-            # Only replacing if the input is an instance of Op2
+            # Only replacing if the inputs are not identical
             return r.owner.inputs[0] is not r.owner.inputs[1]
 
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             {"pattern": (op1, "x", "y"), "constraint": constraint}, (op3, "x", "y")
         ).rewrite(g)
         assert str(g) == "FunctionGraph(Op2(Op1(x, x), Op3(x, y)))"
@@ -219,7 +219,7 @@ class TestPatternNodeRewriter:
         # So the replacement should fail
         outputs = [e]
         g = FunctionGraph(inputs, outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op4, (op1, "x", "y")),
             (op3, "x", "y"),
         ).rewrite(g)
@@ -227,7 +227,7 @@ class TestPatternNodeRewriter:
 
         # Now it should be fine
         g = FunctionGraph(inputs, outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op4, (op1, "x", "y")),
             (op3, "x", "y"),
             allow_multiple_clients=True,
@@ -236,7 +236,7 @@ class TestPatternNodeRewriter:
 
         # The fact that the inputs of the pattern have multiple clients should not matter
         g = FunctionGraph(inputs, outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op3, (op4, "w"), "w"),
             (op3, "w", "w"),
             allow_multiple_clients=False,
@@ -251,7 +251,7 @@ class TestPatternNodeRewriter:
 
         outputs = [e1, e2]
         g = FunctionGraph(inputs, outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op4, (op4, "e")),
             "e",
             allow_multiple_clients=False,
@@ -260,7 +260,7 @@ class TestPatternNodeRewriter:
 
         outputs = [e1, e3]
         g = FunctionGraph([x, y, z], outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op4, (op4, "e")),
             "e",
             allow_multiple_clients=False,
@@ -268,7 +268,7 @@ class TestPatternNodeRewriter:
         assert equal_computations(g.outputs, outputs)
 
         g = FunctionGraph(inputs, outputs, copy_inputs=False)
-        OpKeyPatternNodeRewriter(
+        WalkingPatternNodeRewriter(
             (op4, (op4, "e")),
             "e",
             allow_multiple_clients=True,
@@ -280,31 +280,47 @@ class TestPatternNodeRewriter:
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
         e = op1(op_y(x, y), z)
         g = FunctionGraph([x, y, z], [e])
-        OpKeyPatternNodeRewriter((op1, (op_z, "1", "2"), "3"), (op4, "3", "2")).rewrite(
-            g
-        )
+        WalkingPatternNodeRewriter(
+            (op1, (op_z, "1", "2"), "3"), (op4, "3", "2")
+        ).rewrite(g)
         str_g = str(g)
         assert str_g == "FunctionGraph(Op4(z, y))"
 
+    def test_op_pattern(self):
+        a = MyVariable("a")
+        e1 = MyOp(name="MyOp(x=1)", x=1)(a)
+        e2 = MyOp(name="MyOp(x=2)", x=2)(a)
+        e_hello = MyOp(name="MyOp(x='hello')", x="hello")(a)
+        op_x3 = MyOp(name="MyOp(x=3)", x=3)
+        assert not equal_computations([e1], [op_x3(a)])
+        assert not equal_computations([e2], [op_x3(a)])
 
-def KeyedSubstitutionNodeRewriter(op1, op2):
-    return OpKeyGraphRewriter(SubstitutionNodeRewriter(op1, op2))
+        rewriter = WalkingPatternNodeRewriter(
+            (OpPattern(MyOp, x=1), "a"),
+            "a",
+        )
+        g = FunctionGraph([a], [e1, e2, e1], copy_inputs=False)
+        rewriter.rewrite(g)
+        assert equal_computations(g.outputs, [a, e2, a])
 
+        rewriter = WalkingPatternNodeRewriter(
+            (OpPattern(MyOp, x="x"), "a"),
+            lambda fgraph, node, subs: (
+                MyOp(name="MyOp(x+=10)", x=subs["x"] + 10)(subs["a"])
+                if subs["x"] < 10
+                else False
+            ),
+        )
+        g = FunctionGraph([a], [e1], copy_inputs=False)
+        rewriter.rewrite(g)
+        assert equal_computations(g.outputs, [MyOp(name="x=11", x=11)(a)])
 
-class TestSubstitutionNodeRewriter:
-    def test_straightforward(self):
-        x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
-        e = op1(op1(op1(op1(op1(x)))))
-        g = FunctionGraph([x, y, z], [e])
-        KeyedSubstitutionNodeRewriter(op1, op2).rewrite(g)
-        assert str(g) == "FunctionGraph(Op2(Op2(Op2(Op2(Op2(x))))))"
-
-    def test_straightforward_2(self):
-        x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")
-        e = op1(op2(x), op3(y), op4(z))
-        g = FunctionGraph([x, y, z], [e])
-        KeyedSubstitutionNodeRewriter(op3, op4).rewrite(g)
-        assert str(g) == "FunctionGraph(Op1(Op2(x), Op4(y), Op4(z)))"
+        rewriter = WalkingPatternNodeRewriter(
+            (OpPattern(MyOp, x=LiteralString("hello")), "a"), "a"
+        )
+        g = FunctionGraph([a], [e1, e_hello], copy_inputs=False)
+        rewriter.rewrite(g)
+        assert equal_computations(g.outputs, [e1, a])
 
 
 class NoInputOp(Op):
@@ -611,21 +627,6 @@ def test_pre_constant_merge():
     assert res == [o2]
     assert o2.owner.inputs[2] is c2
 
-    # What is this supposed to test?
-    ms = MakeSlice()(1)
-    res = pre_constant_merge(empty_fgraph, [ms])
-
-    assert res == [ms]
-
-    const_slice = SliceConstant(type=slicetype, data=slice(1, None, 2))
-
-    assert isinstance(const_slice, Constant)
-
-    adv = AdvancedSubtensor()(matrix(), [2, 3], const_slice)
-
-    res = pre_constant_merge(empty_fgraph, adv)
-    assert res == [adv]
-
 
 def test_pre_greedy_node_rewriter():
     empty_fgraph = FunctionGraph([], [])
@@ -660,15 +661,6 @@ def test_pre_greedy_node_rewriter():
 
     assert cst.owner.inputs[0] is o1
     assert cst.owner.inputs[4] is cst.owner.inputs[0]
-
-    # What exactly is this supposed to test?
-    ms = MakeSlice()(1)
-    cst = pre_greedy_node_rewriter(empty_fgraph, [constant_folding], ms)
-
-    assert isinstance(cst, SliceConstant)
-
-    # Make sure constant of slice signature is hashable.
-    assert isinstance(hash(cst.signature()), int)
 
 
 @pytest.mark.parametrize("tracks", [True, False])
@@ -725,22 +717,35 @@ def test_patternsub_invalid_dtype(out_pattern):
     assert e.type.is_super(fg.outputs[0].type)
 
 
-def test_patternsub_different_output_lengths():
-    # Test that PatternNodeRewriter won't replace nodes with different numbers of outputs
-    ps = PatternNodeRewriter(
-        (op1, "x"),
-        ("x"),
+def test_patternsub_multi_output_nodes():
+    # Test that PatternNodeRewriter won't attempt to replace multi-output nodes
+    multiple_op_ps = PatternNodeRewriter(
+        (op_multiple_outputs, "x"),
+        "x",
         name="ps",
     )
-    rewriter = in2out(ps)
+
+    single_op_ps = PatternNodeRewriter(
+        (op_y, "x"),
+        "x",
+        name="ps",
+    )
+
+    rewriter = in2out(multiple_op_ps, single_op_ps)
 
     x = MyVariable("x")
     e1, e2 = op_multiple_outputs(x)
-    o = op1(e1)
+    o1, o2 = op_y(e1), op_y(e2)
 
-    fgraph = FunctionGraph(inputs=[x], outputs=[o])
+    fgraph = FunctionGraph(inputs=[x], outputs=[e2, e1], copy_inputs=False)
     rewriter.rewrite(fgraph)
-    assert fgraph.outputs[0].owner.op == op1
+    # This shouldn't rewrite because PatternNodeRewriter has no way of specifying which output(s) are being matched
+    assert_equal_computations(fgraph.outputs, [e2, e1])
+
+    fgraph = FunctionGraph(inputs=[x], outputs=[o2, o1], copy_inputs=False)
+    rewriter.rewrite(fgraph)
+    # Having a variable that comes out of a multi-output node should be fine
+    assert_equal_computations(fgraph.outputs, [e2, e1])
 
 
 class TestSequentialNodeRewriter:
@@ -903,3 +908,44 @@ def test_OpToRewriterTracker():
         local_rewriter_2,
         local_rewriter_1,
     ]
+
+
+def test_rewrite_weakref_leak():
+    """Check we don't have weakref leak on our rewrites"""
+
+    def _growth(limit=10, peak_stats={}):
+        """Vendoring of objgraph.growth
+
+        Source: https://github.com/mgedmin/objgraph/blob/94b1ca61a11109547442701800292dcfc7f59fc8/objgraph.py#L253
+        """
+        gc.collect()
+        objects = gc.get_objects()
+
+        stats = {}
+        for o in objects:
+            n = type(o).__name__
+            stats[n] = stats.get(n, 0) + 1
+
+        deltas = {}
+        for name, count in stats.items():
+            old_count = peak_stats.get(name, 0)
+            if count > old_count:
+                deltas[name] = count - old_count
+                peak_stats[name] = count
+
+        deltas = sorted(deltas.items(), key=operator.itemgetter(1), reverse=True)
+
+        if limit:
+            deltas = deltas[:limit]
+
+        return [(name, stats[name], delta) for name, delta in deltas]
+
+    x = vector("x")
+    y = exp(x)
+
+    for i in range(20):
+        rewrite_graph(y, clone=False)
+        res = _growth()
+        # Only start checking after warmup
+        if i > 15:
+            assert not res, "Object counts are still growing"

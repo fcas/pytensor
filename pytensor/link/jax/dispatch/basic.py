@@ -6,14 +6,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pytensor.compile import JAX
 from pytensor.compile.builders import OpFromGraph
-from pytensor.compile.ops import DeepCopyOp, ViewOp
+from pytensor.compile.ops import DeepCopyOp, TypeCastingOp
 from pytensor.configdefaults import config
-from pytensor.graph.fg import FunctionGraph
+from pytensor.graph import Constant
+from pytensor.graph.fg import AbstractFunctionGraph
 from pytensor.ifelse import IfElse
+from pytensor.link.jax.ops import JAXOp
 from pytensor.link.utils import fgraph_to_python
-from pytensor.raise_op import Assert, CheckAndRaise
+from pytensor.raise_op import CheckAndRaise
 
 
 if config.floatX == "float64":
@@ -44,7 +45,7 @@ def jax_funcify(op, node=None, storage_map=None, **kwargs):
     raise NotImplementedError(f"No JAX conversion for the given `Op`: {op}")
 
 
-@jax_funcify.register(FunctionGraph)
+@jax_funcify.register(AbstractFunctionGraph)
 def jax_funcify_FunctionGraph(
     fgraph,
     node=None,
@@ -73,11 +74,14 @@ def jax_funcify_IfElse(op, **kwargs):
     return ifelse
 
 
-@jax_funcify.register(Assert)
 @jax_funcify.register(CheckAndRaise)
-def jax_funcify_CheckAndRaise(op, **kwargs):
+def jax_funcify_CheckAndRaise(op, node, **kwargs):
+    conds = node.inputs[1:]
+    if any(isinstance(cond, Constant) and not bool(cond.data) for cond in conds):
+        raise op.exc_type(op.msg)
+
     warnings.warn(
-        f"""Skipping `CheckAndRaise` Op (assertion: {op.msg}) as JAX tracing would remove it.""",
+        f"""Skipping {op} Op (assertion: {op.msg}) as JAX tracing would remove it.""",
         stacklevel=2,
     )
 
@@ -111,20 +115,18 @@ def jax_funcify_DeepCopyOp(op, **kwargs):
     return deepcopyop
 
 
-@jax_funcify.register(ViewOp)
-def jax_funcify_ViewOp(op, **kwargs):
-    def viewop(x):
+@jax_funcify.register(TypeCastingOp)
+def jax_funcify_TypeCastingOp(op, **kwargs):
+    def type_cast(x):
         return x
 
-    return viewop
+    return type_cast
 
 
 @jax_funcify.register(OpFromGraph)
 def jax_funcify_OpFromGraph(ofg: OpFromGraph, node=None, **kwargs) -> Callable:
     _ = kwargs.pop("storage_map", None)
 
-    # Apply inner rewrites
-    JAX.optimizer(ofg.fgraph)
     fgraph_fn = jax_funcify(ofg.fgraph, **kwargs)
 
     if len(ofg.fgraph.outputs) == 1:
@@ -138,3 +140,8 @@ def jax_funcify_OpFromGraph(ofg: OpFromGraph, node=None, **kwargs) -> Callable:
             return fgraph_fn(*inputs)
 
     return opfromgraph
+
+
+@jax_funcify.register(JAXOp)
+def jax_op_funcify(op, **kwargs):
+    return op.perform_jax

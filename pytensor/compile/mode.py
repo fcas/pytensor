@@ -4,10 +4,11 @@ WRITEME
 """
 
 import logging
+import sys
 import warnings
-from typing import Literal
+from typing import Any
 
-from pytensor.compile.function.types import Supervisor
+from pytensor.compile.aliasing import Supervisor
 from pytensor.configdefaults import config
 from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.rewriting.basic import (
@@ -27,6 +28,7 @@ from pytensor.graph.rewriting.db import (
 from pytensor.link.basic import Linker, PerformLinker
 from pytensor.link.c.basic import CLinker, OpWiseCLinker
 from pytensor.link.jax.linker import JAXLinker
+from pytensor.link.mlx.linker import MLXLinker
 from pytensor.link.numba.linker import NumbaLinker
 from pytensor.link.pytorch.linker import PytorchLinker
 from pytensor.link.vm import VMLinker
@@ -50,6 +52,7 @@ predefined_linkers = {
     "jax": JAXLinker(),
     "pytorch": PytorchLinker(),
     "numba": NumbaLinker(),
+    "mlx": MLXLinker(),
 }
 
 
@@ -60,23 +63,20 @@ def register_linker(name, linker):
     predefined_linkers[name] = linker
 
 
-# If a string is passed as the optimizer argument in the constructor
-# for Mode, it will be used as the key to retrieve the real optimizer
-# in this dictionary
-exclude = []
-if not config.cxx:
-    exclude = ["cxx_only"]
-OPT_NONE = RewriteDatabaseQuery(include=[], exclude=exclude)
+OPT_NONE = RewriteDatabaseQuery(include=[])
+# Minimum set of rewrites needed to evaluate a function. This is needed for graphs with "dummy" Operations
+OPT_MINIMUM = RewriteDatabaseQuery(include=["minimum_compile"])
 # Even if multiple merge optimizer call will be there, this shouldn't
 # impact performance.
-OPT_MERGE = RewriteDatabaseQuery(include=["merge"], exclude=exclude)
-OPT_FAST_RUN = RewriteDatabaseQuery(include=["fast_run"], exclude=exclude)
+OPT_MERGE = RewriteDatabaseQuery(include=["merge"])
+OPT_FAST_RUN = RewriteDatabaseQuery(include=["fast_run"])
 OPT_FAST_RUN_STABLE = OPT_FAST_RUN.requiring("stable")
 
-OPT_FAST_COMPILE = RewriteDatabaseQuery(include=["fast_compile"], exclude=exclude)
-OPT_STABILIZE = RewriteDatabaseQuery(include=["fast_run"], exclude=exclude)
+OPT_FAST_COMPILE = RewriteDatabaseQuery(include=["fast_compile"])
+OPT_STABILIZE = RewriteDatabaseQuery(include=["fast_run"])
 OPT_STABILIZE.position_cutoff = 1.5000001
 OPT_NONE.name = "OPT_NONE"
+OPT_MINIMUM.name = "OPT_MINIMUM"
 OPT_MERGE.name = "OPT_MERGE"
 OPT_FAST_RUN.name = "OPT_FAST_RUN"
 OPT_FAST_RUN_STABLE.name = "OPT_FAST_RUN_STABLE"
@@ -95,6 +95,7 @@ predefined_optimizers = {
     None: OPT_NONE,
     "None": OPT_NONE,
     "merge": OPT_MERGE,
+    "minimum_compile": OPT_MINIMUM,
     "o4": OPT_FAST_RUN,
     "o3": OPT_O3,
     "o2": OPT_O2,
@@ -138,7 +139,11 @@ class AddDestroyHandler(GraphRewriter):
                 break
         if not supervisor_added:
             warnings.warn(
-                f"A Supervisor feature is missing from {fgraph}.",
+                (
+                    f"A Supervisor feature is missing from {fgraph}.\n"
+                    "This is needed for inplace rewrites. Either exclude inplace rewrites or add a Supervisor feature.\n"
+                    "A Supervisor feature can be added via `pytensor.compile.aliasing.add_supervisor_to_fgraph`."
+                ),
                 stacklevel=3,
             )
 
@@ -178,7 +183,7 @@ class PrintCurrentFunctionGraph(GraphRewriter):
     def apply(self, fgraph):
         import pytensor.printing
 
-        print("PrintCurrentFunctionGraph:", self.header)
+        print("PrintCurrentFunctionGraph:", self.header)  # noqa: T201
         pytensor.printing.debugprint(fgraph.outputs)
 
 
@@ -186,6 +191,7 @@ optdb = SequenceDB()
 optdb.register(
     "merge1", MergeOptimizer(), "fast_run", "fast_compile", "merge", position=0
 )
+
 
 # After scan1 opt at 0.5 and before ShapeOpt at 1
 # This should only remove nodes.
@@ -236,7 +242,9 @@ optdb.register(
 )  # 'fast_run', 'fast_compile')
 
 # replace unstable subgraphs
-optdb.register("stabilize", EquilibriumDB(), "fast_run", position=1.5)
+# In fast_compile only the rewrites tagged "fast_compile" are included: those needed for the
+# scipy/numpy look-alike helpers to be stable. Naive forms get no such promise.
+optdb.register("stabilize", EquilibriumDB(), "fast_run", "fast_compile", position=1.5)
 
 optdb.register(
     "Print1.51",
@@ -274,6 +282,53 @@ optdb.register("CheckStackTrace", CheckStackTraceRewriter(), *_tags, position=-1
 del _tags
 
 
+class _ActiveModeGraphRewriter(GraphRewriter):
+    """Wrap a mode's optimizer so applying it records the active compile mode.
+
+    Exposes the compile mode as ``fgraph._compile_mode`` (see ``get_active_mode``)
+    so rewrites can make decisions based on the compile target (fusion split rules,
+    inner graph specialization, ...). Stamps the mode when the fgraph does not already carry one, and
+    restores the previous state after.
+    """
+
+    def __init__(self, rewriter: GraphRewriter, mode: "Mode"):
+        self._rewriter = rewriter
+        self._mode = mode
+
+    def add_requirements(self, fgraph):
+        return self._rewriter.add_requirements(fgraph)
+
+    def apply(self, fgraph, *args, **kwargs):
+        # Only stamp when unset, so a mode already established by an outer
+        # optimizer run (the outermost compilation, or a nested inner-graph
+        # rewrite) wins.
+        stamped = getattr(fgraph, "_compile_mode", None) is None
+        if stamped:
+            fgraph._compile_mode = self._mode
+        try:
+            return self._rewriter.apply(fgraph, *args, **kwargs)
+        finally:
+            if stamped:
+                del fgraph._compile_mode
+
+    def print_summary(self, stream=sys.stdout, level=0, depth=-1):
+        return self._rewriter.print_summary(stream=stream, level=level, depth=depth)
+
+    def print_profile(self, stream, prof, level=0):
+        # ``GraphRewriter.print_profile`` is a classmethod that raises unless
+        # overridden, so delegate to the wrapped rewriter's implementation.
+        return self._rewriter.print_profile(stream, prof, level=level)
+
+    def __getattr__(self, name):
+        # Delegate everything else (profiling helpers, query metadata, ...) to the
+        # wrapped rewriter. ``__getattr__`` only fires for names not found normally,
+        # so the overrides above take precedence. Guard ``_rewriter`` itself to avoid
+        # infinite recursion before ``__init__`` has run.
+        if name == "_rewriter":
+            raise AttributeError(name)
+        return getattr(self._rewriter, name)
+
+
 class Mode:
     """A class that specifies the rewrites/optimizations used during function compilation.
 
@@ -300,11 +355,13 @@ class Mode:
     def __init__(
         self,
         linker: str | Linker | None = None,
-        optimizer: str | RewriteDatabaseQuery = "default",
+        optimizer: str | RewriteDatabaseQuery | GraphRewriter = "default",
         db: RewriteDatabase = None,
     ):
         if linker is None:
             linker = config.linker
+        if isinstance(linker, str) and linker == "auto":
+            linker = "numba"
         if isinstance(optimizer, str) and optimizer == "default":
             optimizer = config.optimizer
 
@@ -341,7 +398,14 @@ class Mode:
         if isinstance(optimizer, str) or optimizer is None:
             optimizer = predefined_optimizers[optimizer]
         if isinstance(optimizer, RewriteDatabaseQuery):
+            # TODO: From the __init__ signature this should always be the case
+            # But some tests and internal logic allow passing a GraphRewriter directly as optimizer
+            # Cleanup!
             self.provided_optimizer = optimizer
+            if r := linker.required_rewrites:
+                optimizer = optimizer.including(*r)
+            if r := linker.incompatible_rewrites:
+                optimizer = optimizer.excluding(*r)
         self._optimizer = optimizer
         self.call_time = 0
         self.fn_time = 0
@@ -354,13 +418,22 @@ class Mode:
             f"optdb={self.optdb})"
         )
 
-    def __get_optimizer(self):
-        if isinstance(self._optimizer, RewriteDatabaseQuery):
-            return self.optdb.query(self._optimizer)
-        else:
-            return self._optimizer
+    @property
+    def function_maker(self):
+        from pytensor.compile.maker import FunctionMaker
 
-    optimizer = property(__get_optimizer)
+        return FunctionMaker
+
+    @property
+    def optimizer(self):
+        if isinstance(self._optimizer, RewriteDatabaseQuery):
+            rewriter = self.optdb.query(self._optimizer)
+        else:
+            rewriter = self._optimizer
+        # Stamp this mode as the fgraph's active compile mode while rewriting, so
+        # inner-graph rewrites can recover the right linker even when the optimizer
+        # is run directly (outside ``FunctionMaker``, e.g. ``mode.optimizer.rewrite(fgraph)``).
+        return _ActiveModeGraphRewriter(rewriter, self)
 
     def get_linker_optimizer(self, linker, optimizer):
         if isinstance(linker, str) or linker is None:
@@ -398,7 +471,7 @@ class Mode:
             optimizations.
         """
 
-        link, opt = self.get_linker_optimizer(
+        _link, opt = self.get_linker_optimizer(
             self.provided_linker, self.provided_optimizer
         )
         return self.clone(optimizer=opt.register(*optimizations))
@@ -434,116 +507,112 @@ class Mode:
         return new_mode
 
 
-# If a string is passed as the mode argument in function or
-# FunctionMaker, the Mode will be taken from this dictionary using the
-# string as the key
-# Use VM_linker to allow lazy evaluation by default.
+C = Mode("c", "fast_run")
+CVM = Mode("cvm", "fast_run")
+VM = Mode("vm", "fast_run")
+
+NUMBA = Mode(
+    NumbaLinker(),
+    RewriteDatabaseQuery(include=["fast_run", "numba"]),
+)
+
+JAX = Mode(
+    JAXLinker(),
+    # `fusion` is not incompatible with JAX (it can run `Composite`), just not desired:
+    # XLA does its own fusion, so building `Composite` only adds graph-translation overhead.
+    RewriteDatabaseQuery(include=["fast_run", "jax"], exclude=["fusion"]),
+)
+PYTORCH = Mode(
+    PytorchLinker(),
+    # `Composite` has no PyTorch dispatch (it has no `nfunc_spec` to look up in torch),
+    # and torch fuses its own kernels anyway.
+    RewriteDatabaseQuery(include=["fast_run"], exclude=["fusion"]),
+)
+
+MLX = Mode(
+    MLXLinker(),
+    RewriteDatabaseQuery(include=["fast_run", "mlx"], exclude=["fusion"]),
+)
+
 FAST_COMPILE = Mode(
     VMLinker(use_cloop=False, c_thunks=False),
     RewriteDatabaseQuery(include=["fast_compile", "py_only"]),
 )
-if config.cxx:
-    FAST_RUN = Mode("cvm", "fast_run")
-else:
-    FAST_RUN = Mode(
-        "vm",
-        RewriteDatabaseQuery(include=["fast_run", "py_only"]),
-    )
 
-JAX = Mode(
-    JAXLinker(),
-    RewriteDatabaseQuery(
-        include=["fast_run", "jax"],
-        exclude=[
-            "cxx_only",
-            "BlasOpt",
-            "fusion",
-            "inplace",
-        ],
-    ),
-)
-PYTORCH = Mode(
-    PytorchLinker(),
-    RewriteDatabaseQuery(
-        include=["fast_run"],
-        exclude=[
-            "cxx_only",
-            "BlasOpt",
-            "fusion",
-            "inplace",
-            "local_uint_constant_indices",
-        ],
-    ),
-)
-NUMBA = Mode(
-    NumbaLinker(),
-    RewriteDatabaseQuery(
-        include=["fast_run", "numba"],
-        exclude=["cxx_only", "BlasOpt", "local_careduce_fusion"],
-    ),
-)
-
+fast_run_linkers_to_mode = {
+    "cvm": CVM,
+    "vm": VM,
+    "numba": NUMBA,
+}
 
 predefined_modes = {
     "FAST_COMPILE": FAST_COMPILE,
-    "FAST_RUN": FAST_RUN,
+    "C": C,
+    "CVM": CVM,
     "JAX": JAX,
     "NUMBA": NUMBA,
     "PYTORCH": PYTORCH,
+    "MLX": MLX,
 }
 
-instantiated_default_mode = None
+_CACHED_RUNTIME_MODES: dict[Any, Mode] = {}
 
 
-def get_mode(orig_string):
+def get_mode(orig_string=None):
     if orig_string is None:
         string = config.mode
     else:
         string = orig_string
+
     if not isinstance(string, str):
         return string  # it is hopefully already a mode...
 
-    global instantiated_default_mode
-    # The default mode is cached. However, config.mode can change
-    # If instantiated_default_mode has the right class, use it.
-    if orig_string is None and instantiated_default_mode:
-        if string in predefined_modes:
-            default_mode_class = predefined_modes[string].__class__.__name__
-        else:
-            default_mode_class = string
-        if instantiated_default_mode.__class__.__name__ == default_mode_class:
-            return instantiated_default_mode
+    # Keep the original string for error messages
+    upper_string = string.upper()
 
-    if string in ("Mode", "DebugMode", "NanGuardMode"):
-        if string == "DebugMode":
-            # need to import later to break circular dependency.
-            from .debugmode import DebugMode
+    if upper_string in predefined_modes:
+        return predefined_modes[upper_string]
 
-            # DebugMode use its own linker.
-            ret = DebugMode(optimizer=config.optimizer)
-        elif string == "NanGuardMode":
-            # need to import later to break circular dependency.
-            from .nanguardmode import NanGuardMode
+    if upper_string == "FAST_RUN":
+        linker = config.linker
+        if linker == "auto":
+            return NUMBA
+        return fast_run_linkers_to_mode[linker]
 
-            # NanGuardMode use its own linker.
-            ret = NanGuardMode(True, True, True, optimizer=config.optimizer)
-        else:
-            # TODO: Can't we look up the name and invoke it rather than using eval here?
-            ret = eval(string + "(linker=config.linker, optimizer=config.optimizer)")
-    elif string in predefined_modes:
-        ret = predefined_modes[string]
+    global _CACHED_RUNTIME_MODES
+
+    cache_key = ("MODE", config.linker) if upper_string == "MODE" else upper_string
+
+    try:
+        return _CACHED_RUNTIME_MODES[cache_key]
+    except KeyError:
+        pass
+
+    # Need to define the mode for the first time
+    if upper_string == "MODE":
+        ret = Mode(linker=config.linker, optimizer=config.optimizer)
+    elif upper_string in ("DEBUGMODE", "DEBUG_MODE"):
+        from pytensor.compile.debug.debugmode import DebugMode
+
+        # DebugMode use its own linker.
+        ret = DebugMode(optimizer=config.optimizer)
+    elif upper_string == "NANGUARDMODE":
+        from pytensor.compile.debug.nanguardmode import NanGuardMode
+
+        # NanGuardMode use its own linker.
+        ret = NanGuardMode(True, True, True, optimizer=config.optimizer)
+
     else:
-        raise Exception(f"No predefined mode exist for string: {string}")
+        raise ValueError(f"No predefined mode exist for string: {string}")
 
-    if orig_string is None:
-        # Build and cache the default mode
-        if config.optimizer_excluding:
-            ret = ret.excluding(*config.optimizer_excluding.split(":"))
-        if config.optimizer_including:
-            ret = ret.including(*config.optimizer_including.split(":"))
-        if config.optimizer_requiring:
-            ret = ret.requiring(*config.optimizer_requiring.split(":"))
-        instantiated_default_mode = ret
+    if config.optimizer_excluding:
+        ret = ret.excluding(*config.optimizer_excluding.split(":"))
+    if config.optimizer_including:
+        ret = ret.including(*config.optimizer_including.split(":"))
+    if config.optimizer_requiring:
+        ret = ret.requiring(*config.optimizer_requiring.split(":"))
+    # Cache the mode for next time
+    _CACHED_RUNTIME_MODES[cache_key] = ret
 
     return ret
 
@@ -560,26 +629,3 @@ def register_mode(name, mode):
     if name in predefined_modes:
         raise ValueError(f"Mode name already taken: {name}")
     predefined_modes[name] = mode
-
-
-def get_target_language(mode=None) -> tuple[Literal["py", "c", "numba", "jax"], ...]:
-    """Get the compilation target language."""
-
-    if mode is None:
-        mode = get_default_mode()
-
-    linker = mode.linker
-
-    if isinstance(linker, NumbaLinker):
-        return ("numba",)
-    if isinstance(linker, JAXLinker):
-        return ("jax",)
-    if isinstance(linker, PerformLinker):
-        return ("py",)
-    if isinstance(linker, CLinker):
-        return ("c",)
-
-    if isinstance(linker, VMLinker | OpWiseCLinker):
-        return ("c", "py") if config.cxx else ("py",)
-
-    raise Exception(f"Unsupported Linker: {linker}")

@@ -35,6 +35,7 @@ class RewriteDatabase:
         rewriter: Union["RewriteDatabase", RewritesType],
         *tags: str,
         use_db_name_as_tag=True,
+        overwrite_existing=False,
     ):
         """Register a new rewriter to the database.
 
@@ -56,7 +57,8 @@ class RewriteDatabase:
             ``local_remove_all_assert``. Setting `use_db_name_as_tag` to
             ``False`` removes that behavior. This means that only the rewrite's name
             and/or its tags will enable it.
-
+        overwrite_existing:
+            Overwrite the existing rewriter with a new one having the same name
         """
         if not isinstance(
             rewriter,
@@ -66,22 +68,27 @@ class RewriteDatabase:
         ):
             raise TypeError(f"{rewriter} is not a valid rewrite type.")
 
-        if name in self.__db__:
-            raise ValueError(f"The tag '{name}' is already present in the database.")
-
         if use_db_name_as_tag:
             if self.name is not None:
                 tags = (*tags, self.name)
 
         rewriter.name = name
-        # This restriction is there because in many place we suppose that
-        # something in the RewriteDatabase is there only once.
-        if rewriter.name in self.__db__:
-            raise ValueError(
-                f"Tried to register {rewriter.name} again under the new name {name}. "
-                "The same rewrite cannot be registered multiple times in"
-                " an `RewriteDatabase`; use `ProxyDB` instead."
-            )
+
+        # if tag collides with name
+        if name in self.__db__ and name not in self._names:
+            raise ValueError(f"The tag '{name}' is already present in the database.")
+
+        if name in self.__db__ or rewriter.name in self.__db__:
+            if overwrite_existing:
+                self.remove_tags(name, *tags)
+                old_rewriter = self.__db__[name].pop()
+                self._names.remove(name)
+                self.__db__[old_rewriter.__class__.__name__].remove(old_rewriter)
+            else:
+                raise ValueError(
+                    f"The tag '{name}' is already present in the database."
+                )
+
         self.__db__[name] = OrderedSet([rewriter])
         self._names.add(name)
         self.__db__[rewriter.__class__.__name__].add(rewriter)
@@ -303,18 +310,21 @@ class EquilibriumDB(RewriteDatabase):
     """
 
     def __init__(
-        self, ignore_newtrees: bool = True, tracks_on_change_inputs: bool = False
+        self,
+        ignore_newtrees: bool = True,
+        tracks_on_change_inputs: bool = False,
+        eq_rewriter_class=pytensor_rewriting.EquilibriumGraphRewriter,
     ):
         """
 
         Parameters
         ----------
         ignore_newtrees
-            If ``False``, apply rewrites to new nodes introduced during
-            rewriting.
-
+            If ``False``, apply rewrites to new nodes introduced during rewritings.
         tracks_on_change_inputs
             If ``True``, re-apply rewrites on nodes with changed inputs.
+        eq_rewriter_class: EquilibriumGraphRewriter class, optional
+            The class used to create the equilibrium rewriter. Defaults to EquilibriumGraphRewriter.
 
         """
         super().__init__()
@@ -322,6 +332,7 @@ class EquilibriumDB(RewriteDatabase):
         self.tracks_on_change_inputs = tracks_on_change_inputs
         self.__final__: dict[str, bool] = {}
         self.__cleanup__: dict[str, bool] = {}
+        self.eq_rewriter_class = eq_rewriter_class
 
     def register(
         self,
@@ -353,7 +364,7 @@ class EquilibriumDB(RewriteDatabase):
             final_rewriters = None
         if len(cleanup_rewriters) == 0:
             cleanup_rewriters = None
-        return pytensor_rewriting.EquilibriumGraphRewriter(
+        return self.eq_rewriter_class(
             rewriters,
             max_use_ratio=config.optdb__max_use_ratio,
             ignore_newtrees=self.ignore_newtrees,
@@ -453,7 +464,7 @@ class SequenceDB(RewriteDatabase):
         return ret
 
     def print_summary(self, stream=sys.stdout):
-        print(f"{self.__class__.__name__ } (id {id(self)})", file=stream)
+        print(f"{self.__class__.__name__} (id {id(self)})", file=stream)
         positions = list(self.__position__.items())
 
         def c(a, b):

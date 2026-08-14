@@ -1,5 +1,5 @@
 Adding JAX, Numba and Pytorch support for `Op`\s
-=======================================
+================================================
 
 PyTensor is able to convert its graphs into JAX, Numba and Pytorch compiled functions. In order to do
 this, each :class:`Op` in an PyTensor graph must have an equivalent JAX/Numba/Pytorch implementation function.
@@ -7,7 +7,7 @@ this, each :class:`Op` in an PyTensor graph must have an equivalent JAX/Numba/Py
 This tutorial will explain how JAX, Numba and Pytorch implementations are created for an :class:`Op`.
 
 Step 1: Identify the PyTensor :class:`Op` you'd like to implement
-------------------------------------------------------------------------
+-----------------------------------------------------------------
 
 Find the source for the PyTensor :class:`Op` you'd like to be supported and
 identify the function signature and return values. These can be determined by
@@ -98,7 +98,7 @@ how the inputs and outputs are used to compute the outputs for an :class:`Op`
 in Python. This method is effectively what needs to be implemented.
 
 Step 2: Find the relevant method in JAX/Numba/Pytorch (or something close)
----------------------------------------------------------
+--------------------------------------------------------------------------
 
 With a precise idea of what the PyTensor :class:`Op` does we need to figure out how
 to implement it in JAX, Numba or Pytorch. In the best case scenario, there is a similarly named
@@ -228,7 +228,7 @@ Here's an example for :class:`DimShuffle`:
                     # E       No match.
                     # ...(on this line)...
                     # E           shuffle_shape = res.shape[: len(shuffle)]
-                    @numba_basic.numba_njit(inline="always")
+                    @numba_basic.numba_njit
                     def dimshuffle(x):
                         return dimshuffle_inner(np.asarray(x), shuffle)
 
@@ -269,7 +269,7 @@ and :func:`torch.cumprod`
             z[0] = np.cumprod(x, axis=self.axis)
 
 Step 3: Register the function with the respective dispatcher
----------------------------------------------------------------
+------------------------------------------------------------
 
 With the PyTensor `Op` replicated, we'll need to register the
 function with the backends `Linker`. This is done through the use of
@@ -358,13 +358,13 @@ Here's an example for the `CumOp`\ `Op`:
                 if mode == "add":
                     if axis is None or ndim == 1:
 
-                        @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+                        @numba_basic.numba_njit()
                         def cumop(x):
                             return np.cumsum(x)
 
                     else:
 
-                        @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+                        @numba_basic.numba_njit(boundscheck=False)
                         def cumop(x):
                             out_dtype = x.dtype
                             if x.shape[axis] < 2:
@@ -382,13 +382,13 @@ Here's an example for the `CumOp`\ `Op`:
                 else:
                     if axis is None or ndim == 1:
 
-                        @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+                        @numba_basic.numba_njit()
                         def cumop(x):
                             return np.cumprod(x)
 
                     else:
 
-                        @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+                        @numba_basic.numba_njit(boundscheck=False)
                         def cumop(x):
                             out_dtype = x.dtype
                             if x.shape[axis] < 2:
@@ -484,7 +484,6 @@ Step 4: Write tests
             from pytensor.configdefaults import config
             from tests.link.jax.test_basic import compare_jax_and_py
             from pytensor.graph import FunctionGraph
-            from pytensor.graph.op import get_test_value
 
             def test_jax_CumOp():
                 """Test JAX conversion of the `CumOp` `Op`."""
@@ -492,8 +491,7 @@ Step 4: Write tests
                 # Create a symbolic input for the first input of `CumOp`
                 a = pt.matrix("a")
 
-                # Create test value tag for a
-                a.tag.test_value = np.arange(9, dtype=config.floatX).reshape((3, 3))
+                test_value = np.arange(9, dtype=config.floatX).reshape((3, 3))
 
                 # Create the output variable
                 out = pt.cumsum(a, axis=0)
@@ -502,12 +500,12 @@ Step 4: Write tests
                 fgraph = FunctionGraph([a], [out])
 
                 # Pass the graph and inputs to the testing function
-                compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])
+                compare_jax_and_py(fgraph, [test_value])
 
                 # For the second mode of CumOp
                 out = pt.cumprod(a, axis=1)
                 fgraph = FunctionGraph([a], [out])
-                compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])
+                compare_jax_and_py(fgraph, [test_value])
 
         If the variant :class:`CumprodOp` is not implemented, we can add a test for it as follows:
 
@@ -518,12 +516,12 @@ Step 4: Write tests
             def test_jax_CumOp():
                 """Test JAX conversion of the `CumOp` `Op`."""
                 a = pt.matrix("a")
-                a.tag.test_value = np.arange(9, dtype=config.floatX).reshape((3, 3))
+                test_value = np.arange(9, dtype=config.floatX).reshape((3, 3))
 
                 with pytest.raises(NotImplementedError):
                     out = pt.cumprod(a, axis=1)
                     fgraph = FunctionGraph([a], [out])
-                    compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])
+                    compare_jax_and_py(fgraph, [test_value])
 
 
     .. tab-item:: Numba
@@ -543,23 +541,23 @@ Step 4: Write tests
 
         .. code:: python
 
+            import numpy as np
+            from pytensor.configdefaults import config
             from tests.link.numba.test_basic import compare_numba_and_py
             from pytensor.graph import FunctionGraph
-            from pytensor.compile.sharedvalue import SharedVariable
-            from pytensor.graph.basic import Constant
             from pytensor.tensor import extra_ops
+            import pytensor.tensor as pt
 
-            def test_CumOp(val, axis, mode):
+            def test_CumOp(axis, mode):
+                val = pt.matrix("val")
+                test_value = np.arange(9, dtype=config.floatX).reshape((3, 3))
+
                 g = extra_ops.CumOp(axis=axis, mode=mode)(val)
                 g_fg = FunctionGraph(outputs=[g])
 
                 compare_numba_and_py(
                     g_fg,
-                    [
-                        i.tag.test_value
-                        for i in g_fg.inputs
-                        if not isinstance(i, SharedVariable | Constant)
-                    ],
+                    [test_value],
                 )
 
 
@@ -601,7 +599,6 @@ Step 4: Write tests
                 # Create a symbolic input for the first input of `CumOp`
                 a = pt.matrix("a", dtype=dtype)
 
-                # Create test value
                 test_value = np.arange(9, dtype=dtype).reshape((3, 3))
 
                 # Create the output variable

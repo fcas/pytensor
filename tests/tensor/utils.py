@@ -152,7 +152,7 @@ def upcast_float16_ufunc(fn):
     """
 
     def ret(*args, **kwargs):
-        out_dtype = np.find_common_type([a.dtype for a in args], [np.float16])
+        out_dtype = np.result_type(np.float16, *args)
         if out_dtype == "float16":
             # Force everything to float32
             sig = "f" * fn.nin + "->" + "f" * fn.nout
@@ -339,6 +339,7 @@ def makeTester(
     good=None,
     bad_build=None,
     bad_runtime=None,
+    bad_compile=None,
     grad=None,
     mode=None,
     grad_rtol=None,
@@ -373,6 +374,7 @@ def makeTester(
     _test_memmap = test_memmap
     _check_name = check_name
     _grad_eps = grad_eps
+    _bad_compile = bad_compile or {}
 
     class Checker:
         op = staticmethod(_op)
@@ -382,6 +384,7 @@ def makeTester(
         good = _good
         bad_build = _bad_build
         bad_runtime = _bad_runtime
+        bad_compile = _bad_compile
         grad = _grad
         mode = _mode
         skip = skip_
@@ -539,7 +542,23 @@ def makeTester(
                 # instantiated on the following bad inputs: %s"
                 # % (self.op, testname, node, inputs))
 
-        @config.change_flags(compute_test_value="off")
+        @pytest.mark.skipif(skip, reason="Skipped")
+        def test_bad_compile(self):
+            for testname, inputs in self.bad_compile.items():
+                inputrs = [shared(input) for input in inputs]
+                try:
+                    node = safe_make_node(self.op, *inputrs)
+                except Exception as exc:
+                    err_msg = (
+                        f"Test {self.op}::{testname}: Error occurred while trying"
+                        f" to make a node with inputs {inputs}"
+                    )
+                    exc.args += (err_msg,)
+                    raise
+
+                with pytest.raises(Exception):
+                    inplace_func([], node.outputs, mode=mode, name="test_bad_runtime")
+
         @pytest.mark.skipif(skip, reason="Skipped")
         def test_bad_runtime(self):
             for testname, inputs in self.bad_runtime.items():
@@ -651,7 +670,9 @@ def makeTester(
     return Checker
 
 
-def makeBroadcastTester(op, expected, checks=None, name=None, **kwargs):
+def makeBroadcastTester(
+    op, expected, checks=None, name=None, *, inplace=False, **kwargs
+):
     if checks is None:
         checks = {}
     if name is None:
@@ -674,22 +695,20 @@ def makeBroadcastTester(op, expected, checks=None, name=None, **kwargs):
     # cases we need to add it manually.
     if not name.endswith("Tester"):
         name += "Tester"
-    if "inplace" in kwargs:
-        if kwargs["inplace"]:
-            _expected = expected
-            if not isinstance(_expected, dict):
+    if inplace:
+        _expected = expected
+        if not isinstance(_expected, dict):
 
-                def expected(*inputs):
-                    return np.array(_expected(*inputs), dtype=inputs[0].dtype)
+            def expected(*inputs):
+                return np.array(_expected(*inputs), dtype=inputs[0].dtype)
 
-            def inplace_check(inputs, outputs):
-                # this used to be inputs[0] is output[0]
-                # I changed it so that it was easier to satisfy by the
-                # DebugMode
-                return np.all(inputs[0] == outputs[0])
+        def inplace_check(inputs, outputs):
+            # this used to be inputs[0] is output[0]
+            # I changed it so that it was easier to satisfy by the
+            # DebugMode
+            return np.all(inputs[0] == outputs[0])
 
-            checks = dict(checks, inplace_check=inplace_check)
-        del kwargs["inplace"]
+        checks = dict(checks, inplace_check=inplace_check)
     return makeTester(name, op, expected, checks, **kwargs)
 
 
@@ -794,6 +813,7 @@ _good_broadcast_unary_normal_no_complex = dict(
     big_scalar=[np.arange(17.0, 29.0, 0.5, dtype=config.floatX)],
 )
 
+# FIXME: Why is this empty?
 _bad_build_broadcast_binary_normal = dict()
 
 _bad_runtime_broadcast_binary_normal = dict(

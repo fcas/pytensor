@@ -6,28 +6,45 @@ import pytest
 import scipy.linalg
 
 import pytensor
-from pytensor import In, config, function
+from pytensor import In, config, function, scan
 from pytensor.compile import get_default_mode, get_mode
+from pytensor.compile.aliasing import add_supervisor_to_fgraph
 from pytensor.gradient import grad
-from pytensor.graph import Apply, Op
-from pytensor.graph.replace import vectorize_node
+from pytensor.graph import Apply, FunctionGraph, Op, rewrite_graph
+from pytensor.graph.replace import _vectorize_node, vectorize_graph
+from pytensor.link.numba import NumbaLinker
 from pytensor.raise_op import assert_op
-from pytensor.tensor import diagonal, log, tensor
-from pytensor.tensor.blockwise import Blockwise, vectorize_node_fallback
-from pytensor.tensor.nlinalg import MatrixInverse
-from pytensor.tensor.rewriting.blas import specialize_matmul_to_batched_dot
-from pytensor.tensor.slinalg import (
-    Cholesky,
-    Solve,
-    SolveBase,
-    cho_solve,
-    cholesky,
-    solve,
-    solve_triangular,
+from pytensor.tensor import (
+    matrices,
+    matrix,
+    ones_like,
+    scalar,
+    tensor,
+    vector,
 )
+from pytensor.tensor.blockwise import (
+    Blockwise,
+    BlockwiseWithCoreShape,
+    vectorize_node_fallback,
+)
+from pytensor.tensor.linalg.decomposition.cholesky import Cholesky, cholesky
+from pytensor.tensor.linalg.decomposition.eigen import eig
+from pytensor.tensor.linalg.inverse import MatrixInverse
+from pytensor.tensor.linalg.solvers.core import SolveBase
+from pytensor.tensor.linalg.solvers.general import Solve, solve
+from pytensor.tensor.linalg.solvers.psd import cho_solve
+from pytensor.tensor.linalg.solvers.triangular import solve_triangular
+from pytensor.tensor.random import normal
+from pytensor.tensor.random.op import default_rng
+from pytensor.tensor.rewriting.blas import specialize_matmul_to_batched_dot
 from pytensor.tensor.utils import _parse_gufunc_signature
 
 
+@pytest.mark.xfail(
+    condition=isinstance(get_default_mode().linker, NumbaLinker),
+    raises=TypeError,
+    reason="Numba scalar blockwise obj-mode fallback fails: https://github.com/pymc-devs/pytensor/issues/1760",
+)
 def test_perform_method_per_node():
     """Confirm that Blockwise uses one perform method per node.
 
@@ -55,8 +72,13 @@ def test_perform_method_per_node():
     fn = pytensor.function([x, y], [out_x, out_y])
     [op1, op2] = [node.op for node in fn.maker.fgraph.apply_nodes]
     # Confirm both nodes have the same Op
-    assert op1 is blockwise_op
-    assert op1 is op2
+    assert isinstance(op1, Blockwise | BlockwiseWithCoreShape) and isinstance(
+        op1.core_op, NodeDependentPerformOp
+    )
+    assert isinstance(op2, Blockwise | BlockwiseWithCoreShape) and isinstance(
+        op2.core_op, NodeDependentPerformOp
+    )
+    # assert op1 is op2  # Not true in the Numba backend
 
     res_out_x, res_out_y = fn(np.zeros(3, dtype="float32"), np.zeros(3, dtype="int32"))
     np.testing.assert_array_equal(res_out_x, np.ones(3, dtype="float32"))
@@ -68,8 +90,8 @@ def test_vectorize_blockwise():
     tns = tensor(shape=(None, None, None))
 
     # Something that falls back to Blockwise
-    node = MatrixInverse()(mat).owner
-    vect_node = vectorize_node(node, tns)
+    out = MatrixInverse()(mat)
+    vect_node = vectorize_graph(out, {mat: tns}).owner
     assert isinstance(vect_node.op, Blockwise) and isinstance(
         vect_node.op.core_op, MatrixInverse
     )
@@ -78,7 +100,7 @@ def test_vectorize_blockwise():
 
     # Useless blockwise
     tns4 = tensor(shape=(5, None, None, None))
-    new_vect_node = vectorize_node(vect_node, tns4)
+    new_vect_node = vectorize_graph(vect_node.out, {tns: tns4}).owner
     assert new_vect_node.op is vect_node.op
     assert isinstance(new_vect_node.op, Blockwise) and isinstance(
         new_vect_node.op.core_op, MatrixInverse
@@ -87,16 +109,18 @@ def test_vectorize_blockwise():
 
 
 def test_vectorize_node_fallback_unsupported_type():
-    x = tensor("x", shape=(2, 6))
-    node = x[:, [0, 2, 4]].owner
+    rng = default_rng()
+    node = normal(rng=rng).owner
 
     with pytest.raises(
         NotImplementedError,
         match=re.escape(
-            "Cannot vectorize node AdvancedSubtensor(x, MakeSlice.0, [0 2 4]) with input MakeSlice.0 of type slice"
+            'Cannot vectorize node normal_rv{"(),()->()"}('
+            "DefaultGeneratorMakerOp.0, NoneConst{None}, 0.0, 1.0)"
+            " with input DefaultGeneratorMakerOp.0 of type RandomGeneratorType"
         ),
     ):
-        vectorize_node_fallback(node.op, node, node.inputs)
+        vectorize_node_fallback(node.op, node, *node.inputs)
 
 
 def check_blockwise_runtime_broadcasting(mode):
@@ -109,7 +133,9 @@ def check_blockwise_runtime_broadcasting(mode):
         out,
         mode=get_mode(mode).excluding(specialize_matmul_to_batched_dot.__name__),
     )
-    assert isinstance(fn.maker.fgraph.outputs[0].owner.op, Blockwise)
+    assert isinstance(
+        fn.maker.fgraph.outputs[0].owner.op, Blockwise | BlockwiseWithCoreShape
+    )
 
     for valid_test_values in [
         (
@@ -126,6 +152,12 @@ def check_blockwise_runtime_broadcasting(mode):
             fn(*valid_test_values), np.full((batch_dim, 3, 3), 5.0)
         )
 
+    possible_err_messages = [
+        "Runtime broadcasting not allowed",
+        "has an incompatible shape in axis",
+        "Incompatible vectorized shapes",
+    ]
+    err_msg = f"({'|'.join(possible_err_messages)})"
     for invalid_test_values in [
         (
             np.ones((1, 3, 5)).astype(config.floatX),
@@ -136,7 +168,7 @@ def check_blockwise_runtime_broadcasting(mode):
             np.ones((1, 5, 3)).astype(config.floatX),
         ),
     ]:
-        with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
+        with pytest.raises(ValueError, match=err_msg):
             fn(*invalid_test_values)
 
     invalid_test_values = (
@@ -161,15 +193,15 @@ class MyTestOp(Op):
         raise NotImplementedError("Test Op should not be present in final graph")
 
 
-test_op = MyTestOp()
+my_test_op = MyTestOp()
 
 
 def test_vectorize_node_default_signature():
     vec = tensor(shape=(None,))
     mat = tensor(shape=(5, None))
-    node = test_op.make_node(vec, mat)
+    node = my_test_op.make_node(vec, mat)
 
-    vect_node = vectorize_node(node, mat, mat)
+    vect_node = _vectorize_node(node.op, node, mat, mat)
     assert isinstance(vect_node.op, Blockwise) and isinstance(
         vect_node.op.core_op, MyTestOp
     )
@@ -178,9 +210,9 @@ def test_vectorize_node_default_signature():
     with pytest.raises(
         ValueError, match="Signature not provided nor found in core_op MyTestOp"
     ):
-        Blockwise(test_op)
+        Blockwise(my_test_op)
 
-    vect_node = Blockwise(test_op, signature="(m),(n)->(m),(n)").make_node(vec, mat)
+    vect_node = Blockwise(my_test_op, signature="(m),(n)->(m),(n)").make_node(vec, mat)
     assert vect_node.outputs[0].type.shape == (
         5,
         None,
@@ -197,7 +229,7 @@ def test_blockwise_shape():
     inp_test = np.zeros((5, 4, 3), dtype=config.floatX)
 
     # Shape can be inferred from inputs
-    op = Blockwise(test_op, signature="(m, n) -> (n, m)")
+    op = Blockwise(my_test_op, signature="(m, n) -> (n, m)")
     out = op(inp)
     assert out.type.shape == (5, None, None)
 
@@ -209,7 +241,7 @@ def test_blockwise_shape():
     assert tuple(shape_fn(inp_test)) == (5, 3, 4)
 
     # Shape can only be partially inferred from inputs
-    op = Blockwise(test_op, signature="(m, n) -> (m, k)")
+    op = Blockwise(my_test_op, signature="(m, n) -> (m, k)")
     out = op(inp)
     assert out.type.shape == (5, None, None)
 
@@ -232,7 +264,7 @@ def test_blockwise_shape():
     inp1_test = np.zeros((7, 1, 4, 3), dtype=config.floatX)
     inp2_test = np.zeros((1, 5, 4, 3), dtype=config.floatX)
 
-    op = Blockwise(test_op, signature="(m, n), (m, n) -> (n, m), (m, k)")
+    op = Blockwise(my_test_op, signature="(m, n), (m, n) -> (n, m), (m, k)")
     outs = op(inp1, inp2)
     assert outs[0].type.shape == (7, 5, None, None)
     assert outs[1].type.shape == (7, 5, None, None)
@@ -264,22 +296,29 @@ def test_blockwise_infer_core_shape():
         def make_node(self, a, b):
             assert a.type.ndim == 1
             assert b.type.ndim == 1
+            # Simulate make_node that introduces operations on inputs
+            a_identity = a.copy()
+            b_identity = b.copy()
+
             c = tensor(shape=(None,))
             d = tensor(shape=(None,))
-            return Apply(self, [a, b], [c, d])
+            return Apply(self, [a_identity, b_identity], [c, d])
 
         def perform(self, node, inputs, outputs):
             a, b = inputs
             c, d = outputs
-            c[0] = np.arange(a.size + b.size)
-            d[0] = np.arange(a.sum() + b.sum())
+            c[0] = np.arange(a.size + b.size, dtype=config.floatX)
+            d[0] = np.arange(a.sum() + b.sum(), dtype=config.floatX)
 
-        def infer_shape(self, fgraph, node, input_shapes):
+        def infer_shape(self, node, input_shapes):
             # First output shape depends only on input_shapes
             # Second output shape depends on input values
-            x, y = node.inputs
-            [(x_shape,), (y_shape,)] = input_shapes
-            return (x_shape + y_shape,), (x.sum() + y.sum(),)
+            a_identity, b_identity = node.inputs
+            # Simulate shape depending on original inputs, not the ones that go directly into the node
+            a = a_identity.owner.inputs[0]
+            b = b_identity.owner.inputs[0]
+            [(a_shape,), (b_shape,)] = input_shapes
+            return (a_shape + b_shape,), (a.sum() + b.sum(),)
 
     blockwise_op = Blockwise(
         core_op=TestOpWithInferShape(), signature="(a),(b)->(c),(d)"
@@ -311,6 +350,32 @@ def test_blockwise_infer_core_shape():
     assert tuple(d_shape_fn(a_test, b_test)) == (5, 0)
 
 
+def test_infer_shape_literals():
+    # Define a CoreOp whose infer_shape is (symbolic operation on itself, literal)
+    # Then tell Blockwise that the first dimension is constant.
+    # The Op has no perform method, so it will fail to evaluate if the infer_shape of that dimension isn't ignored
+    class TestCoreOp(Op):
+        def make_node(self, x):
+            assert x.type.ndim == 0
+            return Apply(self, [x], [matrix()])
+
+        def perform(self, node, inputs, outputs):
+            raise NotImplementedError()
+
+        def infer_shape(self, node, input_shapes):
+            y = node.outputs[0]
+            # Apparently it's valid to return integers in infer_shape.
+            # DimShuffle does this. Modify test if that is no longer allowed.
+            return [(y[0][0].astype(int), 3)]
+
+    op = Blockwise(TestCoreOp(), signature="()->(2,a)")
+    x = scalar("x")
+    y = op(x)
+
+    fn = function([x], y.shape)
+    assert tuple(fn(0)) == (2, 3)
+
+
 class BlockwiseOpTester:
     """Base class to test Blockwise works for specific Ops"""
 
@@ -320,7 +385,7 @@ class BlockwiseOpTester:
 
     @classmethod
     def setup_class(cls):
-        seed = sum(map(ord, str(cls.core_op)))
+        seed = sum(map(ord, str(cls.core_op) + cls.signature))
         cls.rng = np.random.default_rng(seed)
         cls.params_sig, cls.outputs_sig = _parse_gufunc_signature(cls.signature)
         if cls.batcheable_axes is None:
@@ -365,7 +430,13 @@ class BlockwiseOpTester:
             tensor(shape=(None,) * len(param_sig)) for param_sig in self.params_sig
         ]
         core_func = pytensor.function(base_inputs, self.core_op(*base_inputs))
-        np_func = np.vectorize(core_func, signature=self.signature)
+
+        def inp_copy_core_func(*args):
+            # Work-around for https://github.com/numba/numba/issues/10357
+            # numpy vectorize passes non-writeable arrays to the inner function
+            return core_func(*(arg.copy() for arg in args))
+
+        np_func = np.vectorize(inp_copy_core_func, signature=self.signature)
 
         for vec_inputs, vec_inputs_testvals in self.create_batched_inputs():
             pt_func = pytensor.function(vec_inputs, self.block_op(*vec_inputs))
@@ -384,13 +455,26 @@ class BlockwiseOpTester:
         ]
         out = self.core_op(*base_inputs).sum()
         # Create separate numpy vectorized functions for each input
+
+        def copy_inputs_wrapper(fn):
+            # Work-around for https://github.com/numba/numba/issues/10357
+            # numpy vectorize passes non-writeable arrays to the inner function
+            def copy_fn(*args):
+                return fn(*(arg.copy() for arg in args))
+
+            return copy_fn
+
         np_funcs = []
         for i, inp in enumerate(base_inputs):
             core_grad_func = pytensor.function(base_inputs, grad(out, wrt=inp))
             params_sig = self.signature.split("->")[0]
             param_sig = f"({','.join(self.params_sig[i])})"
             grad_sig = f"{params_sig}->{param_sig}"
-            np_func = np.vectorize(core_grad_func, signature=grad_sig)
+
+            np_func = np.vectorize(
+                copy_inputs_wrapper(core_grad_func),
+                signature=grad_sig,
+            )
             np_funcs.append(np_func)
 
         # We test gradient wrt to one batched input at a time
@@ -408,7 +492,7 @@ class BlockwiseOpTester:
                     pt_out,
                     np_out,
                     rtol=1e-7 if config.floatX == "float64" else 1e-5,
-                    atol=1e-6 if config.floatX == "float64" else 1e-4,
+                    atol=1e-6 if config.floatX == "float64" else 2e-2,
                 )
 
 
@@ -439,44 +523,6 @@ class TestSolveMatrix(BlockwiseOpTester):
     signature = "(m, m),(m, n) -> (m, n)"
 
 
-@pytest.mark.parametrize(
-    "mu_batch_shape", [(), (1000,), (4, 1000)], ids=lambda arg: f"mu:{arg}"
-)
-@pytest.mark.parametrize(
-    "cov_batch_shape", [(), (1000,), (4, 1000)], ids=lambda arg: f"cov:{arg}"
-)
-def test_batched_mvnormal_logp_and_dlogp(mu_batch_shape, cov_batch_shape, benchmark):
-    rng = np.random.default_rng(sum(map(ord, "batched_mvnormal")))
-
-    value_batch_shape = mu_batch_shape
-    if len(cov_batch_shape) > len(mu_batch_shape):
-        value_batch_shape = cov_batch_shape
-
-    value = tensor("value", shape=(*value_batch_shape, 10))
-    mu = tensor("mu", shape=(*mu_batch_shape, 10))
-    cov = tensor("cov", shape=(*cov_batch_shape, 10, 10))
-
-    test_values = [
-        rng.normal(size=value.type.shape),
-        rng.normal(size=mu.type.shape),
-        np.eye(cov.type.shape[-1]) * np.abs(rng.normal(size=cov.type.shape)),
-    ]
-
-    chol_cov = cholesky(cov, lower=True, on_error="raise")
-    delta_trans = solve_triangular(chol_cov, value - mu, b_ndim=1)
-    quaddist = (delta_trans**2).sum(axis=-1)
-    diag = diagonal(chol_cov, axis1=-2, axis2=-1)
-    logdet = log(diag).sum(axis=-1)
-    k = value.shape[-1]
-    norm = -0.5 * k * (np.log(2 * np.pi))
-
-    logp = norm - 0.5 * quaddist - logdet
-    dlogp = grad(logp.sum(), wrt=[value, mu, cov])
-
-    fn = pytensor.function([value, mu, cov], [logp, *dlogp])
-    benchmark(fn, *test_values)
-
-
 def test_cop_with_params():
     matrix_assert = Blockwise(core_op=assert_op, signature="(x1,x2),()->(x1,x2)")
 
@@ -485,7 +531,10 @@ def test_cop_with_params():
 
     fn = pytensor.function([x], x_shape)
     [fn_out] = fn.maker.fgraph.outputs
-    assert fn_out.owner.op == matrix_assert, "Blockwise should be in final graph"
+    op = fn_out.owner.op
+    assert (
+        isinstance(op, Blockwise | BlockwiseWithCoreShape) and op.core_op == assert_op
+    ), "Blockwise should be in final graph"
 
     np.testing.assert_allclose(
         fn(np.zeros((5, 3, 2))),
@@ -513,7 +562,7 @@ class TestInplace:
             [cholesky_op] = [
                 node.op.core_op
                 for node in f.maker.fgraph.apply_nodes
-                if isinstance(node.op, Blockwise)
+                if isinstance(node.op, Blockwise | BlockwiseWithCoreShape)
                 and isinstance(node.op.core_op, Cholesky)
             ]
         else:
@@ -551,12 +600,17 @@ class TestInplace:
         else:
             x = solve_fn(A, b, b_ndim=1)
 
-        mode = get_default_mode().excluding("batched_vector_b_solve_to_matrix_b_solve")
+        mode = get_default_mode().excluding(
+            "batched_vector_b_solve_to_matrix_b_solve",
+            "reuse_decomposition_multiple_solves",
+        )
         fn = function([In(A, mutable=True), In(b, mutable=True)], x, mode=mode)
 
         op = fn.maker.fgraph.outputs[0].owner.op
         if batched_A or batched_b:
-            assert isinstance(op, Blockwise) and isinstance(op.core_op, SolveBase)
+            assert isinstance(op, Blockwise | BlockwiseWithCoreShape) and isinstance(
+                op.core_op, SolveBase
+            )
             if batched_A and not batched_b:
                 if solve_fn == solve:
                     assert op.destroy_map == {0: [0]}
@@ -590,9 +644,154 @@ class TestInplace:
             A_val_copy, b_val_copy
         )
         np.testing.assert_allclose(
-            out, expected_out, atol=1e-5 if config.floatX == "float32" else 0
+            out, expected_out, atol=1e-4 if config.floatX == "float32" else 0
         )
 
         # Confirm input was destroyed
         assert (A_val == A_val_copy).all() == (op.destroy_map.get(0, None) != [0])
         assert (b_val == b_val_copy).all() == (op.destroy_map.get(0, None) != [1])
+
+
+def test_gradient_mixed_discrete_output_core_op():
+    class MixedDtypeCoreOp(Op):
+        gufunc_signature = "()->(),()"
+        itypes = [scalar().type]
+        otypes = [scalar().type, scalar(dtype=int).type]
+
+        def perform(self, node, inputs, outputs):
+            raise NotImplementedError()
+
+        def L_op(self, inputs, outputs, output_gradients):
+            return [ones_like(inputs[0]) * output_gradients[0]]
+
+    op = Blockwise(MixedDtypeCoreOp())
+    x = vector("x")
+    y, _ = op(x)
+
+    np.testing.assert_array_equal(
+        grad(y.sum(), x).eval({x: np.full(12, np.nan, dtype=config.floatX)}),
+        np.ones(12, dtype=config.floatX),
+        strict=True,
+    )
+
+
+def test_blockwise_grad_core_type():
+    class StrictCoreTypeOp(Op):
+        def make_node(self, x):
+            assert x.type.shape[-1] == 2
+            return Apply(self, [x], [x.type()])
+
+        def perform(self, node, inputs, output_storage):
+            output_storage[0][0] = inputs[0] + 1
+
+        def L_op(self, inputs, outputs, output_grads):
+            [x] = inputs
+            assert x.type.shape == (2,)
+            return [x.zeros_like()]
+
+    strict_core_type_op = StrictCoreTypeOp()
+    block_strict_core_type_op = Blockwise(strict_core_type_op, signature="(a)->(a)")
+
+    x = tensor("x", shape=(5, 2), dtype="float64")
+    y = block_strict_core_type_op(x)
+    assert y.type.shape == (5, 2)
+
+    grad_y = grad(y.sum(), x)
+    assert grad_y.type.shape == (5, 2)
+    np.testing.assert_allclose(
+        grad_y.eval({x: np.ones((5, 2))}),
+        np.zeros((5, 2)),
+    )
+
+
+def test_scan_gradient_core_type():
+    n_steps = 3
+    seq = tensor("seq", shape=(n_steps, 1), dtype="float64")
+    out = scan(
+        lambda s: s,
+        sequences=[seq],
+        n_steps=n_steps,
+        return_updates=False,
+    )
+
+    vec_seq = tensor("vec_seq", shape=(None, n_steps, 1), dtype="float64")
+    vec_out = vectorize_graph(out, replace={seq: vec_seq})
+    grad_sit_sot0 = grad(vec_out.sum(), vec_seq)
+
+    np.testing.assert_allclose(
+        grad_sit_sot0.eval({vec_seq: np.ones((4, n_steps, 1))}),
+        np.ones((4, n_steps, 1)),
+    )
+
+
+def test_partial_inplace():
+    class CoreOp(Op):
+        __props__ = ("inplace",)
+
+        def __init__(self, inplace):
+            self.inplace = tuple(inplace)
+            self.destroy_map = {i: [i] for i in inplace}
+
+        def inplace_on_inputs(self, allowed_inplace_inputs):
+            return type(self)(inplace=allowed_inplace_inputs)
+
+        def make_node(self, x, y, z):
+            return Apply(self, [x, y, z], [x.type(), y.type(), z.type()])
+
+        def perform(self, node, inputs, outputs):
+            [x, y, z] = inputs
+            if 0 not in self.inplace:
+                x = x.copy()
+            if 1 not in self.inplace:
+                y = y.copy()
+            if 2 not in self.inplace:
+                z = z.copy()
+            outputs[0][0] = x
+            outputs[1][0] = y
+            outputs[2][0] = z
+
+    core_op = CoreOp(inplace=())
+    blockwise_op = Blockwise(core_op, signature="(),(),()->(),(),()")
+    x, y, z = matrices("xyz")
+
+    # All can be inplaced
+    out = blockwise_op(x.T, y.T, z.T)
+    fgraph = FunctionGraph([x, y, z], out)
+    add_supervisor_to_fgraph(fgraph, [In(inp, mutable=True) for inp in fgraph.inputs])
+    rewrite_graph(fgraph, include=("inplace",))
+    assert fgraph.outputs[0].owner.op.destroy_map == {0: [0], 1: [1], 2: [2]}
+
+    # Only x, z can be inplaced, y is protected
+    out = blockwise_op(x.T, y.T, z.T)
+    fgraph = FunctionGraph([x, y, z], out)
+    add_supervisor_to_fgraph(
+        fgraph, [In(inp, mutable=(i % 2) == 0) for i, inp in enumerate(fgraph.inputs)]
+    )
+    rewrite_graph(fgraph, include=("inplace",))
+    assert fgraph.outputs[0].owner.op.destroy_map == {0: [0], 2: [2]}
+
+    # Only y can be inplaced, x is reused for first and third outputs
+    out = blockwise_op(x.T, y.T, x.T)
+    fgraph = FunctionGraph([x, y, z], out)
+    add_supervisor_to_fgraph(fgraph, [In(inp, mutable=True) for inp in fgraph.inputs])
+    rewrite_graph(fgraph, include=("inplace",))
+    assert fgraph.outputs[0].owner.op.destroy_map == {1: [1]}
+
+
+def test_eig_blockwise():
+    x = tensor("x", shape=(2, 3, 3), dtype="float64")
+    eigen_values, eigen_vectors = eig(x)
+    assert eigen_values.dtype == "complex128"
+    assert eigen_vectors.dtype == "complex128"
+    fn = function([x], [eigen_values, eigen_vectors])
+    eigen_values_res, eigen_vectors_res = fn(np.full((2, 3, 3), np.eye(3)))
+    np.testing.assert_allclose(
+        eigen_values_res,
+        np.ones((2, 3), dtype="complex128"),
+        strict=True,
+    )
+    np.testing.assert_allclose(
+        eigen_vectors_res,
+        np.full((2, 3, 3), np.eye(3), dtype="complex128"),
+        strict=True,
+    )

@@ -1,0 +1,373 @@
+import numpy as np
+import pytest
+
+from pytensor import In, Mode, OpFromGraph, Out, config, function, ifelse, scan
+from pytensor import tensor as pt
+from pytensor.compile.ops import ViewOp
+from pytensor.graph import vectorize_graph
+from pytensor.ifelse import IfElse
+from pytensor.raise_op import assert_op
+from pytensor.scalar import Add
+from pytensor.scan.op import Scan
+from pytensor.tensor import dmatrix, dtensor3, matrix
+from pytensor.tensor.blockwise import Blockwise, BlockwiseWithCoreShape
+from pytensor.tensor.elemwise import Elemwise
+from pytensor.tensor.linalg.decomposition.cholesky import Cholesky, cholesky
+from tests import unittest_tools as utt
+from tests.link.numba.test_basic import compare_numba_and_py
+
+
+def test_ViewOp():
+    v = pt.vector()
+    v_test_value = np.arange(4, dtype=config.floatX)
+    g = ViewOp()(v)
+
+    compare_numba_and_py(
+        [v],
+        [g],
+        [v_test_value],
+    )
+
+
+# We were seeing some weird results in CI where the following two almost
+# sign-swapped results were being return from Numba and Python, respectively.
+# The issue might be related to https://github.com/numba/numba/issues/4519.
+# Regardless, I was not able to reproduce anything like it locally after
+# extensive testing.
+x = np.array(
+    [
+        [-0.60407637, -0.71177603, -0.35842241],
+        [-0.07735968, 0.50000561, -0.86256007],
+        [-0.7931628, 0.49332471, 0.35710434],
+    ],
+    dtype=np.float64,
+)
+
+y = np.array(
+    [
+        [0.60407637, 0.71177603, -0.35842241],
+        [0.07735968, -0.50000561, -0.86256007],
+        [0.7931628, -0.49332471, 0.35710434],
+    ],
+    dtype=np.float64,
+)
+
+
+@pytest.mark.parametrize(
+    "inputs, cond_fn, true_vals, false_vals",
+    [
+        ([], lambda: np.array(True), np.r_[1, 2, 3], np.r_[-1, -2, -3]),
+        (
+            [(pt.dscalar(), np.array(0.2, dtype=np.float64))],
+            lambda x: x < 0.5,
+            np.r_[1, 2, 3],
+            np.r_[-1, -2, -3],
+        ),
+        (
+            [
+                (pt.dscalar(), np.array(0.3, dtype=np.float64)),
+                (pt.dscalar(), np.array(0.5, dtype=np.float64)),
+            ],
+            lambda x, y: x > y,
+            x,
+            y,
+        ),
+        (
+            [
+                (pt.dvector(), np.array([0.3, 0.1], dtype=np.float64)),
+                (pt.dvector(), np.array([0.5, 0.9], dtype=np.float64)),
+            ],
+            lambda x, y: pt.all(x > y),
+            x,
+            y,
+        ),
+        (
+            [
+                (pt.dvector(), np.array([0.3, 0.1], dtype=np.float64)),
+                (pt.dvector(), np.array([0.5, 0.9], dtype=np.float64)),
+            ],
+            lambda x, y: pt.all(x > y),
+            [x, 2 * x],
+            [y, 3 * y],
+        ),
+        (
+            [
+                (pt.dvector(), np.array([0.5, 0.9], dtype=np.float64)),
+                (pt.dvector(), np.array([0.3, 0.1], dtype=np.float64)),
+            ],
+            lambda x, y: pt.all(x > y),
+            [x, 2 * x],
+            [y, 3 * y],
+        ),
+    ],
+)
+def test_IfElse(inputs, cond_fn, true_vals, false_vals):
+    inputs, test_values = zip(*inputs, strict=True) if inputs else ([], [])
+    out = ifelse(cond_fn(*inputs), true_vals, false_vals)
+    compare_numba_and_py(inputs, out, test_values)
+
+
+def test_OpFromGraph():
+    x, y, z = pt.matrices("xyz")
+    ofg_1 = OpFromGraph([x, y], [x + y], inline=False)
+    ofg_2 = OpFromGraph([x, y], [x * y, x - y], inline=False)
+
+    o1, o2 = ofg_2(y, z)
+    out = ofg_1(x, o1) + o2
+
+    xv = np.ones((2, 2), dtype=config.floatX)
+    yv = np.ones((2, 2), dtype=config.floatX) * 3
+    zv = np.ones((2, 2), dtype=config.floatX) * 5
+
+    compare_numba_and_py([x, y, z], [out], [xv, yv, zv])
+
+
+def test_ofg_inner_compilation_reused(monkeypatch):
+    from pytensor.link.numba.dispatch import compile_ops
+
+    n_inner_compiles = 0
+    inner_funcify = compile_ops.numba_funcify_and_cache_key
+
+    def counting_funcify(*args, **kwargs):
+        nonlocal n_inner_compiles
+        n_inner_compiles += 1
+        return inner_funcify(*args, **kwargs)
+
+    monkeypatch.setattr(compile_ops, "numba_funcify_and_cache_key", counting_funcify)
+
+    x = pt.vector("x")
+    inner = OpFromGraph([x], [pt.exp(x) + 1])
+    inner_equiv = OpFromGraph([x], [pt.exp(x) + 1])
+    outer = OpFromGraph([x], [inner(x) * 2])
+
+    y = pt.vector("y")
+    out = outer(inner(y)) + inner_equiv(y)
+    fn = function([y], out, mode="NUMBA")
+    # Only two distinct OpFromGraphs: `inner` (used directly, nested inside
+    # `outer`, and via the equivalent `inner_equiv`) and `outer`
+    assert n_inner_compiles == 2
+
+    y_test = np.array([0.0, 1.0], dtype=config.floatX)
+    inner_res = np.exp(y_test) + 1
+    expected = (np.exp(inner_res) + 1) * 2 + inner_res
+    np.testing.assert_allclose(fn(y_test), expected, rtol=1e-6)
+
+
+@pytest.mark.filterwarnings("error")
+def test_ofg_inner_inplace():
+    x = pt.vector("x")
+    set0 = x[0].set(1)  # SetSubtensor should not inplace on x
+    exp_x = pt.exp(x)
+    set1 = exp_x[0].set(1)  # SetSubtensor should inplace on exp_x
+    ofg0 = OpFromGraph([x], [set0])
+    ofg1 = OpFromGraph([x], [set1])
+
+    y, z = pt.vectors("y", "z")
+    fn = function([y, z], [ofg0(y), ofg1(z)], mode="NUMBA")
+
+    fn_ofg0 = fn.maker.fgraph.outputs[0].owner.op
+    assert isinstance(fn_ofg0, OpFromGraph)
+    fn_set0 = fn_ofg0.fgraph.outputs[0]
+    assert fn_set0.owner.op.destroy_map == {}
+
+    fn_ofg1 = fn.maker.fgraph.outputs[1].owner.op
+    assert isinstance(fn_ofg1, OpFromGraph)
+    fn_set1 = fn_ofg1.fgraph.outputs[0]
+    assert fn_set1.owner.op.destroy_map == {0: [0]}
+
+    x_test = np.array([0, 1, 1], dtype=config.floatX)
+    y_test = np.array([0, 1, 1], dtype=config.floatX)
+    res0, res1 = fn(x_test, y_test)
+    # Check inputs were not mutated
+    np.testing.assert_allclose(x_test, [0, 1, 1])
+    np.testing.assert_allclose(y_test, [0, 1, 1])
+    # Check outputs are correct
+    np.testing.assert_allclose(res0, [1, 1, 1])
+    np.testing.assert_allclose(res1, [1, np.e, np.e])
+
+
+def test_ofg_aliased_outputs():
+    x = matrix("x")
+    # Create multiple views of x
+    outs = OpFromGraph([x], [x, x.T, x[::-1]])(x)
+    # Add one to each x, which when inplace shouldn't propagate across outputs
+    bumped_outs = [o + 1 for o in outs]
+    fn = function([x], bumped_outs, mode="NUMBA")
+    fn.dprint(print_destroy_map=True)
+    # Check our outputs are indeed inplace adds
+    assert all(
+        (
+            isinstance(o.owner.op, Elemwise)
+            and isinstance(o.owner.op.scalar_op, Add)
+            and o.owner.op.destroy_map
+        )
+        for o in fn.maker.fgraph.outputs
+    )
+    x_test = np.zeros((2, 2))
+    for res in fn(x_test):
+        np.testing.assert_allclose(res, np.ones((2, 2)))
+
+
+def test_ofg_elemwise_regression():
+    # Regression bug for https://github.com/pymc-devs/pytensor/issues/1507
+    x = dmatrix("x", shape=(None, None))
+    z = OpFromGraph(
+        inputs=[x],
+        outputs=[x + 1],
+    )(x)
+
+    x_batched = dtensor3("X_batched", shape=(None, None, None))
+    z_batched = vectorize_graph(z, {x: x_batched})
+    compare_numba_and_py(
+        [x_batched],
+        [z_batched],
+        [np.random.normal(size=(3, 2, 4))],
+        eval_obj_mode=False,
+    )
+
+
+def test_check_and_raise():
+    x = pt.vector()
+    x_test_value = np.array([1.0, 2.0], dtype=config.floatX)
+
+    out = assert_op(x.sum(), np.array(True))
+
+    compare_numba_and_py([x], out, [x_test_value])
+
+
+def test_ofg_with_inner_scan_rewrite():
+    # Regression test where inner scan would be mutated when compiling outer OFG.
+    # The inner cholesky is *batched* (over the size-4 axis) so the Blockwise
+    # survives optimization and is wrapped as BlockwiseWithCoreShape for numba.
+    ys = pt.tensor("ys", shape=(5, 4, 3, 3))
+    xs = scan(
+        lambda y: cholesky(y),
+        sequences=[ys],
+        return_updates=False,
+    )
+    xs_ofg = OpFromGraph([ys], [xs])(ys)
+    fn = function([ys], xs_ofg, mode="NUMBA")
+
+    # Check that we have a BlockwiseWithCoreShape in the inner Scan
+    fn_ofg_op = fn.maker.fgraph.outputs[0].owner.op
+    assert isinstance(fn_ofg_op, OpFromGraph)
+    fn_scan_op = fn_ofg_op.fgraph.outputs[0].owner.op
+    assert isinstance(fn_scan_op, Scan)
+    fn_cholesky_op = fn_scan_op.fgraph.outputs[0].owner.op
+    assert isinstance(fn_cholesky_op, BlockwiseWithCoreShape)
+    assert isinstance(fn_cholesky_op.core_op, Cholesky)
+
+    # Check original Ops aren't modified
+    ofg_op = xs_ofg.owner.op
+    assert isinstance(ofg_op, OpFromGraph)
+    scan_op = ofg_op.fgraph.outputs[0].owner.op
+    assert isinstance(scan_op, Scan)
+    cholesky_op = scan_op.fgraph.outputs[0].owner.op
+    assert isinstance(cholesky_op, Blockwise)
+    assert isinstance(cholesky_op.core_op, Cholesky)
+
+
+def test_compiling_does_not_mutate_canonical_inner_graph():
+    # Regression test: compiling an op with an inner graph must NOT mutate the
+    # canonical (shared) inner FunctionGraph. Backend specialization (e.g. the
+    # numba ``BlockwiseWithCoreShape`` wrapping) must happen on per-compilation
+    # copies, never on the op the user holds -- otherwise a second use of the
+    # same op (here: deriving something from it after an ``.eval()``) sees a
+    # corrupted inner graph. This is what tripped scan-based pymc CustomDists.
+    ys = pt.tensor("ys", shape=(5, 4, 3, 3))
+    xs = scan(lambda y: cholesky(y), sequences=[ys], return_updates=False)
+    ofg_out = OpFromGraph([ys], [xs])(ys)
+
+    scan_op = ofg_out.owner.op.fgraph.outputs[0].owner.op
+    assert isinstance(scan_op, Scan)
+
+    # Compile (and run) under numba: this used to mutate the inner graph above.
+    fn = function([ys], ofg_out, mode="NUMBA")
+    fn(np.eye(3)[None, None].repeat(5, 0).repeat(4, 1))
+
+    # The compiled function carries a different scan op whose inner cholesky was
+    # wrapped for the backend...
+    fn_scan_op = fn.maker.fgraph.outputs[0].owner.op.fgraph.outputs[0].owner.op
+    assert isinstance(fn_scan_op, Scan)
+    assert fn_scan_op is not scan_op
+    assert isinstance(fn_scan_op.fgraph.outputs[0].owner.op, BlockwiseWithCoreShape)
+    # ...while the canonical op still computes a bare batched cholesky.
+    y_t = pt.tensor("y_t", shape=(4, 3, 3))
+    utt.assert_equal_computations(
+        list(scan_op.fgraph.outputs),
+        [cholesky(y_t)],
+        in_xs=list(scan_op.fgraph.inputs),
+        in_ys=[y_t],
+    )
+
+
+def test_blockwise_inner_graph_optimized_for_backend():
+    # Regression test for https://github.com/pymc-devs/pytensor/issues/2028.
+    # An OpFromGraph wrapped in a Blockwise must still have its inner graph lowered
+    # for the backend -- otherwise numba falls back to object mode (here the inner
+    # cholesky stays a degenerate Blockwise instead of collapsing to a bare
+    # Cholesky). And, the original #2028 concern, that lowering must happen on a
+    # per-compilation copy and never mutate the canonical (shared) inner graph.
+    yy = pt.matrix("yy")
+    core = OpFromGraph([yy], [cholesky(yy) + 1.0])
+    xs = pt.tensor("xs", shape=(4, 3, 3))
+    out = Blockwise(core, signature="(m,m)->(m,m)")(xs)
+    canonical = out.owner.op.core_op
+
+    val = (np.eye(3)[None] * 2.0).repeat(4, 0).astype(config.floatX)
+    fn = function([xs], out, mode="NUMBA")
+    np.testing.assert_allclose(fn(val), np.linalg.cholesky(val) + 1.0)
+
+    # The compiled op carries its own, backend-lowered inner graph: the degenerate
+    # Blockwise(Cholesky) collapsed to a bare Cholesky (so numba does not object-mode).
+    compiled = fn.maker.fgraph.outputs[0].owner.op.core_op
+    assert compiled is not canonical
+    assert not any(isinstance(n.op, Blockwise) for n in compiled.fgraph.apply_nodes)
+    # The canonical inner graph must be untouched by compilation.
+    yy2 = pt.matrix("yy2")
+    utt.assert_equal_computations(
+        list(canonical.fgraph.outputs),
+        [cholesky(yy2) + 1.0],
+        in_xs=list(canonical.fgraph.inputs),
+        in_ys=[yy2],
+    )
+
+
+@pytest.mark.parametrize("as_view", [True, False])
+def test_ifelse_single_output(as_view, single_out=True):
+    x = pt.vector("x")
+    y = pt.vector("y")
+    if single_out:
+        outs = [x]
+    else:
+        outs = [x, y]
+
+    op = IfElse(as_view=as_view, n_outs=len(outs))
+    outs = op(x.sum() > 0, *outs, *outs, return_list=True)
+
+    fn = function(
+        [In(x, borrow=True), In(y, borrow=True)],
+        [Out(out, borrow=True) for out in outs],
+        mode=Mode("numba", optimizer=None),
+        accept_inplace=True,
+        on_unused_input="ignore",
+    )
+
+    # FALSE branch
+    test_x = np.zeros(3)
+    test_y = np.ones(5)
+    res_false = fn(test_x, test_y)
+    for test_inp, res_out in zip([test_x, test_y], res_false, strict=False):
+        np.testing.assert_array_equal(test_inp, res_out)
+        # IfElse only views on the true branch variates
+        assert res_out is not test_inp
+
+    # TRUE branch
+    test_x = np.ones(3)
+    res_true = fn(test_x, test_y)
+    for test_inp, res_out in zip([test_x, test_y], res_true, strict=False):
+        np.testing.assert_array_equal(test_inp, res_out)
+        if as_view:
+            assert res_out is test_inp
+        else:
+            assert res_out is not test_inp

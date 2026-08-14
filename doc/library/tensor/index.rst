@@ -19,11 +19,12 @@ symbolic expressions using calls that look just like numpy calls, such as
     :maxdepth: 1
 
     basic
-    random/index
+    random
     utils
     elemwise
     extra_ops
     io
+    linalg
     slinalg
     nlinalg
     fft
@@ -31,3 +32,4 @@ symbolic expressions using calls that look just like numpy calls, such as
     math_opt
     basic_opt
     functional
+    optimize

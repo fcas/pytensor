@@ -24,7 +24,7 @@ import numpy as np
 
 from pytensor import config, utils
 from pytensor.graph.basic import Apply, Constant, Variable
-from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.fg import AbstractFunctionGraph, FunctionGraph
 
 
 if TYPE_CHECKING:
@@ -145,9 +145,11 @@ def streamline(
     fgraph: FunctionGraph,
     thunks: Sequence[Callable[[], None]],
     order: Sequence[Apply],
+    *,
     post_thunk_old_storage: list["StorageCellType"] | None = None,
     no_recycling: list["StorageCellType"] | None = None,
     nice_errors: bool = True,
+    output_storage: list["StorageCellType"],
 ) -> "BasicThunkType":
     """Construct a single thunk that runs a list of thunks.
 
@@ -197,6 +199,7 @@ def streamline(
                     thunk()
                     for old_s in old_storage:
                         old_s[0] = None
+                return [out[0] for out in output_storage]
             except Exception:
                 raise_with_op(fgraph, node, thunk)
 
@@ -207,11 +210,12 @@ def streamline(
             for x in no_recycling:
                 x[0] = None
             try:
-                # strict=False because we are in a hot loop
-                for thunk, node in zip(thunks, order, strict=False):
+                # zip strict not specified because we are in a hot loop
+                for thunk, node in zip(thunks, order):
                     thunk()
             except Exception:
                 raise_with_op(fgraph, node, thunk)
+            return [out[0] for out in output_storage]
 
         f = streamline_nice_errors_f
     else:
@@ -222,6 +226,7 @@ def streamline(
                 x[0] = None
             for thunk in thunks:
                 thunk()
+            return [out[0] for out in output_storage]
 
         f = streamline_fast_f
     return f
@@ -311,6 +316,12 @@ def raise_with_op(
     exc_type, exc_value, exc_trace = exc_info
     if exc_type is KeyboardInterrupt:
         # print a simple traceback from KeyboardInterrupt
+        raise exc_value.with_traceback(exc_trace)
+
+    if verbosity == "low":
+        exc_value.add_note(
+            "\nHINT: Set PyTensor `config.exception_verbosity` to `medium` or `high` for more information about the source of the error."
+        )
         raise exc_value.with_traceback(exc_trace)
 
     trace = getattr(node.outputs[0].tag, "trace", ())
@@ -664,11 +675,11 @@ def unique_name_generator(
 
 
 def fgraph_to_python(
-    fgraph: FunctionGraph,
+    fgraph: AbstractFunctionGraph,
     op_conversion_fn: Callable,
     *,
     type_conversion_fn: Callable = lambda x, **kwargs: x,
-    order: list[Apply] | None = None,
+    order: Sequence[Apply] | None = None,
     storage_map: Optional["StorageMapType"] = None,
     fgraph_name: str = "fgraph_to_python",
     global_env: dict[Any, Any] | None = None,
@@ -731,32 +742,41 @@ def fgraph_to_python(
     if global_env is None:
         global_env = {}
 
+    tipifiyed_vars = set()
+
     body_assigns = []
     for node in order:
-        compiled_func = op_conversion_fn(
-            node.op, node=node, storage_map=storage_map, **kwargs
-        )
-
-        # Create a local alias with a unique name
-        local_compiled_func_name = unique_name(compiled_func)
-        global_env[local_compiled_func_name] = compiled_func
-
         node_input_names = []
-        for i in node.inputs:
-            local_input_name = unique_name(i)
+        for inp in node.inputs:
+            local_input_name = unique_name(inp)
+            is_constant = isinstance(inp, Constant)
             input_storage = storage_map.setdefault(
-                i, [None if not isinstance(i, Constant) else i.data]
+                inp,
+                [inp.data if isinstance(inp, Constant) else None],
             )
-            if input_storage[0] is not None or isinstance(i, Constant):
+            if (
+                is_constant or input_storage[0] is not None
+            ) and inp not in tipifiyed_vars:
                 # Constants need to be assigned locally and referenced
+                # FIXME: This is converting shared variables, but these may change later,
+                #  so this one-time conversion is wasteful / not robust
                 global_env[local_input_name] = type_conversion_fn(
-                    input_storage[0], variable=i, storage=input_storage, **kwargs
+                    input_storage[0], variable=inp, storage=input_storage, **kwargs
                 )
+                tipifiyed_vars.add(inp)
                 # TODO: We could attempt to use the storage arrays directly
+                #  Otherwise we're doubling the memory footprint of constants
                 # E.g. `local_input_name = f"{local_input_name}[0]"`
             node_input_names.append(local_input_name)
 
         node_output_names = [unique_name(v) for v in node.outputs]
+
+        compiled_func = op_conversion_fn(
+            node.op, node=node, storage_map=storage_map, **kwargs
+        )
+        # Create a local alias with a unique name
+        local_compiled_func_name = unique_name(compiled_func)
+        global_env[local_compiled_func_name] = compiled_func
 
         assign_str = f"{', '.join(node_output_names)} = {local_compiled_func_name}({', '.join(node_input_names)})"
         assign_comment_str = f"{indent(str(node), '# ')}"

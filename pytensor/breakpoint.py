@@ -1,6 +1,6 @@
 import numpy as np
 
-from pytensor.gradient import DisconnectedType
+from pytensor.gradient import disconnected_type
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import Op
 from pytensor.tensor.basic import as_tensor_variable
@@ -108,14 +108,14 @@ class PdbBreakpoint(Op):
                     f"'{self.name}' could not be casted to NumPy arrays"
                 )
 
-            print("\n")
-            print("-------------------------------------------------")
-            print(f"Conditional breakpoint '{self.name}' activated\n")
-            print("The monitored variables are stored, in order,")
-            print("in the list variable 'monitored' as NumPy arrays.\n")
-            print("Their contents can be altered and, when execution")
-            print("resumes, the updated values will be used.")
-            print("-------------------------------------------------")
+            print("\n")  # noqa: T201
+            print("-------------------------------------------------")  # noqa: T201
+            print(f"Conditional breakpoint '{self.name}' activated\n")  # noqa: T201
+            print("The monitored variables are stored, in order,")  # noqa: T201
+            print("in the list variable 'monitored' as NumPy arrays.\n")  # noqa: T201
+            print("Their contents can be altered and, when execution")  # noqa: T201
+            print("resumes, the updated values will be used.")  # noqa: T201
+            print("-------------------------------------------------")  # noqa: T201
 
             try:
                 import pudb
@@ -141,10 +141,10 @@ class PdbBreakpoint(Op):
             for i in range(len(output_storage)):
                 output_storage[i][0] = inputs[i + 1]
 
-    def grad(self, inputs, output_gradients):
-        return [DisconnectedType()(), *output_gradients]
+    def pullback(self, inputs, outputs, output_gradients):
+        return [disconnected_type(), *output_gradients]
 
-    def infer_shape(self, fgraph, inputs, input_shapes):
+    def infer_shape(self, inputs, input_shapes):
         # Return the shape of every input but the condition (first input)
         return input_shapes[1:]
 

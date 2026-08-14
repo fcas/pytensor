@@ -39,7 +39,7 @@ class COp(Op, CLinkerOp):
         self,
         node: Apply,
         storage_map: StorageMapType,
-        compute_map: ComputeMapType,
+        compute_map: ComputeMapType | None,
         no_recycling: Collection[Variable],
     ) -> CThunkWrapperType:
         """Create a thunk for a C implementation.
@@ -79,18 +79,24 @@ class COp(Op, CLinkerOp):
                 # that don't implement c code. In those cases, we
                 # don't want to print a warning.
                 cl.get_dynamic_module()
-                print(f"Disabling C code for {self} due to unsupported float16")
+                warnings.warn(f"Disabling C code for {self} due to unsupported float16")
                 raise NotImplementedError("float16")
         outputs = cl.make_thunk(
             input_storage=node_input_storage, output_storage=node_output_storage
         )
-        thunk, node_input_filters, node_output_filters = outputs
+        thunk, _node_input_filters, _node_output_filters = outputs
 
-        @is_cthunk_wrapper_type
-        def rval():
-            thunk()
-            for o in node.outputs:
-                compute_map[o][0] = True
+        if compute_map is None:
+            rval = is_cthunk_wrapper_type(thunk)
+
+        else:
+            cm_entries = [compute_map[o] for o in node.outputs]
+
+            @is_cthunk_wrapper_type
+            def rval(thunk=thunk, cm_entries=cm_entries):
+                thunk()
+                for entry in cm_entries:
+                    entry[0] = True
 
         rval.thunk = thunk
         rval.cthunk = thunk.cthunk
@@ -211,7 +217,6 @@ int main( int argc, const char* argv[] )
                     )
             if OpenMPOp.gxx_support_openmp is False:
                 self.openmp = False
-                config.openmp = False
 
     def prepare_node(self, node, storage_map, compute_map, impl):
         if impl == "c":
@@ -250,6 +255,10 @@ def get_io_macros(inputs: list[str], outputs: list[str]) -> tuple[str, str]:
 
 class ExternalCOp(COp):
     """Class for an `Op` with an external C implementation.
+
+    .. deprecated::
+        Inherit from `COp` and return the C code directly from `c_code` and
+        related methods instead.
 
     One can inherit from this class, provide its constructor with a path to
     an external C source file and the name of a function within it, and define
@@ -301,6 +310,13 @@ class ExternalCOp(COp):
         files overriding sections in previous files.
 
         """
+        warnings.warn(
+            "ExternalCOp is deprecated and will be removed in a future release. "
+            "Inherit from COp and return the C code directly from `c_code` and "
+            "related methods instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
         if not isinstance(func_files, list):
             self.func_files = [Path(func_files)]
         else:
@@ -582,7 +598,7 @@ class ExternalCOp(COp):
                 {define_macros}
                 {{
                   if ({self.func_name}({self.format_c_function_args(inp, out)}{params}) != 0) {{
-                    {sub['fail']}
+                    {sub["fail"]}
                   }}
                 }}
                 {undef_macros}
@@ -628,16 +644,3 @@ class _NoPythonCOp(COp):
 
     def perform(self, node, inputs, output_storage):
         raise NotImplementedError("No Python implementation is provided by this COp.")
-
-
-class _NoPythonExternalCOp(ExternalCOp):
-    """A class used to indicate that an `ExternalCOp` does not provide a Python implementation.
-
-    XXX: Do not use this class; it's only for tracking bad implementations internally.
-
-    """
-
-    def perform(self, node, inputs, output_storage):
-        raise NotImplementedError(
-            "No Python implementation is provided by this ExternalCOp."
-        )

@@ -1,16 +1,18 @@
 import numpy as np
 import pytest
+import scipy
 
 import pytensor.scalar as ps
 import pytensor.scalar.basic as psb
+import pytensor.scalar.math as psm
 import pytensor.tensor as pt
-from pytensor import config
-from pytensor.compile.sharedvalue import SharedVariable
-from pytensor.graph.basic import Constant
-from pytensor.graph.fg import FunctionGraph
+from pytensor import config, function
+from pytensor.graph import Apply
+from pytensor.scalar import ScalarLoop, UnaryScalarOp
 from pytensor.scalar.basic import Composite
+from pytensor.tensor import tensor
 from pytensor.tensor.elemwise import Elemwise
-from tests.link.numba.test_basic import compare_numba_and_py, set_test_value
+from tests.link.numba.test_basic import compare_numba_and_py, numba_mode, py_mode
 
 
 rng = np.random.default_rng(42849)
@@ -20,48 +22,43 @@ rng = np.random.default_rng(42849)
     "x, y",
     [
         (
-            set_test_value(pt.lvector(), np.arange(4, dtype="int64")),
-            set_test_value(pt.dvector(), np.arange(4, dtype="float64")),
+            (pt.lvector(), np.arange(4, dtype="int64")),
+            (pt.dvector(), np.arange(4, dtype="float64")),
         ),
         (
-            set_test_value(pt.dmatrix(), np.arange(4, dtype="float64").reshape((2, 2))),
-            set_test_value(pt.lscalar(), np.array(4, dtype="int64")),
+            (pt.dmatrix(), np.arange(4, dtype="float64").reshape((2, 2))),
+            (pt.lscalar(), np.array(4, dtype="int64")),
         ),
     ],
 )
 def test_Second(x, y):
+    x, x_test = x
+    y, y_test = y
     # We use the `Elemwise`-wrapped version of `Second`
     g = pt.second(x, y)
-    g_fg = FunctionGraph(outputs=[g])
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [x, y],
+        g,
+        [x_test, y_test],
     )
 
 
 @pytest.mark.parametrize(
     "v, min, max",
     [
-        (set_test_value(pt.scalar(), np.array(10, dtype=config.floatX)), 3.0, 7.0),
-        (set_test_value(pt.scalar(), np.array(1, dtype=config.floatX)), 3.0, 7.0),
-        (set_test_value(pt.scalar(), np.array(10, dtype=config.floatX)), 7.0, 3.0),
+        ((pt.scalar(), np.array(10, dtype=config.floatX)), 3.0, 7.0),
+        ((pt.scalar(), np.array(1, dtype=config.floatX)), 3.0, 7.0),
+        ((pt.scalar(), np.array(10, dtype=config.floatX)), 7.0, 3.0),
     ],
 )
 def test_Clip(v, min, max):
+    v, v_test = v
     g = ps.clip(v, min, max)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [v],
+        [g],
+        [v_test],
     )
 
 
@@ -99,44 +96,288 @@ def test_Clip(v, min, max):
 def test_Composite(inputs, input_values, scalar_fn):
     composite_inputs = [ps.ScalarType(config.floatX)(name=i.name) for i in inputs]
     comp_op = Elemwise(Composite(composite_inputs, [scalar_fn(*composite_inputs)]))
-    out_fg = FunctionGraph(inputs, [comp_op(*inputs)])
-    compare_numba_and_py(out_fg, input_values)
+    compare_numba_and_py(inputs, [comp_op(*inputs)], input_values)
 
 
 @pytest.mark.parametrize(
     "v, dtype",
     [
-        (set_test_value(pt.fscalar(), np.array(1.0, dtype="float32")), psb.float64),
-        (set_test_value(pt.dscalar(), np.array(1.0, dtype="float64")), psb.float32),
+        ((pt.fscalar(), np.array(1.0, dtype="float32")), psb.float64),
+        pytest.param(
+            (pt.dscalar(), np.array(1.0, dtype="float64")),
+            psb.float32,
+            marks=pytest.mark.xfail(reason="Scalar downcasting not supported in numba"),
+        ),
     ],
 )
 def test_Cast(v, dtype):
+    v, v_test = v
     g = psb.Cast(dtype)(v)
-    g_fg = FunctionGraph(outputs=[g])
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [v],
+        [g],
+        [v_test],
     )
 
 
 @pytest.mark.parametrize(
     "v, dtype",
     [
-        (set_test_value(pt.iscalar(), np.array(10, dtype="int32")), psb.float64),
+        ((pt.iscalar(), np.array(10, dtype="int32")), psb.float64),
     ],
 )
 def test_reciprocal(v, dtype):
+    v, v_test = v
     g = psb.reciprocal(v)
-    g_fg = FunctionGraph(outputs=[g])
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [v],
+        [g],
+        [v_test],
     )
+
+
+@pytest.mark.parametrize("composite", (False, True))
+def test_isnan(composite):
+    # Testing with tensor just to make sure Elemwise does not revert the scalar behavior of fastmath
+    x = tensor(shape=(2,), dtype="float64")
+
+    if composite:
+        x_scalar = psb.float64()
+        scalar_out = ~psb.isnan(x_scalar)
+        out = Elemwise(Composite([x_scalar], [scalar_out]))(x)
+    else:
+        out = pt.isnan(x)
+
+    compare_numba_and_py(
+        [x],
+        [out],
+        [np.array([1, 0], dtype="float64")],
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "float32",
+        "float64",
+        "int16",
+        "int64",
+        "uint32",
+    ],
+)
+def test_Softplus(dtype):
+    x = ps.get_scalar_type(dtype)("x")
+    g = psm.softplus(x)
+
+    py_fn = function([x], g, mode=py_mode)
+    numba_fn = function([x], g, mode=numba_mode)
+    for value in (-40, -32, 0, 32, 40):
+        if value < 0 and dtype.startswith("u"):
+            continue
+        test_x = np.dtype(dtype).type(value)
+        np.testing.assert_allclose(
+            py_fn(test_x),
+            getattr(np, g.dtype)(numba_fn(test_x)),
+            strict=True,
+            err_msg=f"Failed for value {value}",
+        )
+
+
+@pytest.mark.parametrize(
+    "test_base",
+    [np.bool(True), np.int16(3), np.uint16(3), np.float32(0.5), np.float64(0.5)],
+)
+@pytest.mark.parametrize(
+    "test_exponent",
+    [np.bool(True), np.int16(2), np.uint16(2), np.float32(2.0), np.float64(2.0)],
+)
+def test_power_fastmath_bug(test_base, test_exponent):
+    # Test we don't fail to compile power with discrete exponents due to https://github.com/numba/numba/issues/9554
+    base = pt.scalar("base", dtype=test_base.dtype)
+    exponent = pt.scalar("exponent", dtype=test_exponent.dtype)
+    out = pt.power(base, exponent)
+    compare_numba_and_py(
+        [base, exponent],
+        [out],
+        [test_base, test_exponent],
+    )
+
+
+def test_cython_obj_mode_fallback():
+    """Test that unsupported cython signatures fallback to obj-mode"""
+
+    # Create a ScalarOp with a non-standard dtype
+    class IntegerGamma(UnaryScalarOp):
+        # We'll try to check for scipy cython impl
+        nfunc_spec = ("scipy.special.gamma", 1, 1)
+
+        def make_node(self, x):
+            x = psb.as_scalar(x)
+            assert x.dtype == "int64"
+            out = x.type()
+            return Apply(self, [x], [out])
+
+        def impl(self, x):
+            return scipy.special.gamma(x).astype("int64")
+
+    x = pt.scalar("x", dtype="int64")
+    g = Elemwise(IntegerGamma())(x)
+    assert g.type.dtype == "int64"
+
+    with pytest.warns(UserWarning, match="Numba will use object mode"):
+        compare_numba_and_py(
+            [x],
+            [g],
+            [np.array(5, dtype="int64")],
+        )
+
+
+def test_erf_complex():
+    x = pt.scalar("x", dtype="complex128")
+    g = pt.erf(x)
+
+    compare_numba_and_py(
+        [x],
+        [g],
+        [np.array(0.5 + 1j, dtype="complex128")],
+    )
+
+
+CYTHON_SPECIAL_CASES = [
+    (pt.erfcx, [np.array([-1.0, 0.0, 1.0, 3.0])]),
+    (pt.erfinv, [np.array([-0.5, 0.0, 0.3, 0.9])]),
+    (pt.erfcinv, [np.array([0.2, 0.7, 1.0, 1.5])]),
+    (pt.ndtri_exp, [np.array([-745.0, -100.0, -5.0, -0.5])]),
+    (pt.psi, [np.array([0.5, 1.0, 3.7, 12.3])]),
+    (pt.gamma, [np.array([0.5, 1.0, 3.7, 5.2])]),
+    (pt.j0, [np.array([0.1, 1.0, 5.0, 9.0])]),
+    (pt.j1, [np.array([0.1, 1.0, 5.0, 9.0])]),
+    (pt.i0, [np.array([0.1, 1.0, 3.0, 5.0])]),
+    (pt.i1, [np.array([0.1, 1.0, 3.0, 5.0])]),
+    (pt.owens_t, [np.array([0.5, 1.0, 2.0]), np.array([0.3, 0.7, 1.2])]),
+    (pt.gammainc, [np.array([1.0, 2.0, 3.0]), np.array([0.5, 2.0, 4.0])]),
+    (pt.gammaincc, [np.array([1.0, 2.0, 3.0]), np.array([0.5, 2.0, 4.0])]),
+    (pt.gammaincinv, [np.array([1.0, 2.0, 3.0]), np.array([0.2, 0.5, 0.8])]),
+    (pt.gammainccinv, [np.array([1.0, 2.0, 3.0]), np.array([0.2, 0.5, 0.8])]),
+    (pt.jv, [np.array([0.0, 1.0, 2.0]), np.array([1.0, 3.0, 5.0])]),
+    (pt.ive, [np.array([0.0, 1.0, 2.0]), np.array([1.0, 3.0, 5.0])]),
+    (pt.kve, [np.array([0.0, 1.0, 2.0]), np.array([1.0, 3.0, 5.0])]),
+    (pt.betainc, [np.array([1.0, 2.0]), np.array([2.0, 3.0]), np.array([0.3, 0.6])]),
+    (pt.betaincinv, [np.array([1.0, 2.0]), np.array([2.0, 3.0]), np.array([0.3, 0.6])]),
+    (
+        pt.hyp2f1,
+        [
+            np.array([0.5, 1.0]),
+            np.array([0.5, 1.0]),
+            np.array([1.5, 2.0]),
+            np.array([0.2, 0.4]),
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "op_fn, test_values",
+    CYTHON_SPECIAL_CASES,
+    ids=[
+        "erfcx",
+        "erfinv",
+        "erfcinv",
+        "ndtri_exp",
+        "psi",
+        "gamma",
+        "j0",
+        "j1",
+        "i0",
+        "i1",
+        "owens_t",
+        "gammainc",
+        "gammaincc",
+        "gammaincinv",
+        "gammainccinv",
+        "jv",
+        "ive",
+        "kve",
+        "betainc",
+        "betaincinv",
+        "hyp2f1",
+    ],
+)
+def test_cython_special_funcs(op_fn, test_values):
+    """Scalar ops backed by ``scipy.special.cython_special`` resolve their C function pointer at
+    runtime (see ``numba_funcify_ScalarOp``), so the funcified kernel is njit-only. Skip the
+    object-mode eval path, as is done for the LAPACK wrappers."""
+    inputs = [pt.vector(f"x{i}", dtype="float64") for i in range(len(test_values))]
+    out = op_fn(*inputs)
+    compare_numba_and_py(inputs, [out], test_values, eval_obj_mode=False)
+
+
+class TestScalarLoop:
+    def test_scalar_for_loop_single_out(self):
+        n_steps = ps.int64("n_steps")
+        x0 = ps.float64("x0")
+        const = ps.float64("const")
+        x = x0 + const
+
+        op = ScalarLoop(init=[x0], constant=[const], update=[x])
+        x = op(n_steps, x0, const)
+
+        fn = function([n_steps, x0, const], [x], mode=numba_mode)
+
+        res_x = fn(n_steps=5, x0=0, const=1)
+        np.testing.assert_allclose(res_x, 5)
+
+        res_x = fn(n_steps=5, x0=0, const=2)
+        np.testing.assert_allclose(res_x, 10)
+
+        res_x = fn(n_steps=4, x0=3, const=-1)
+        np.testing.assert_allclose(res_x, -1)
+
+    def test_scalar_for_loop_multiple_outs(self):
+        n_steps = ps.int64("n_steps")
+        x0 = ps.float64("x0")
+        y0 = ps.int64("y0")
+        const = ps.float64("const")
+        x = x0 + const
+        y = y0 + 1
+
+        op = ScalarLoop(init=[x0, y0], constant=[const], update=[x, y])
+        x, y = op(n_steps, x0, y0, const)
+
+        fn = function([n_steps, x0, y0, const], [x, y], mode=numba_mode)
+
+        res_x, res_y = fn(n_steps=5, x0=0, y0=0, const=1)
+        np.testing.assert_allclose(res_x, 5)
+        np.testing.assert_allclose(res_y, 5)
+
+        res_x, res_y = fn(n_steps=5, x0=0, y0=0, const=2)
+        np.testing.assert_allclose(res_x, 10)
+        np.testing.assert_allclose(res_y, 5)
+
+        res_x, res_y = fn(n_steps=4, x0=3, y0=2, const=-1)
+        np.testing.assert_allclose(res_x, -1)
+        np.testing.assert_allclose(res_y, 6)
+
+    def test_scalar_while_loop(self):
+        n_steps = ps.int64("n_steps")
+        x0 = ps.float64("x0")
+        x = x0 + 1
+        until = x >= 10
+
+        op = ScalarLoop(init=[x0], update=[x], until=until)
+        fn = function([n_steps, x0], op(n_steps, x0), mode=numba_mode)
+        np.testing.assert_allclose(fn(n_steps=20, x0=0), [10, True])
+        np.testing.assert_allclose(fn(n_steps=20, x0=1), [10, True])
+        np.testing.assert_allclose(fn(n_steps=5, x0=1), [6, False])
+        np.testing.assert_allclose(fn(n_steps=0, x0=1), [1, False])
+
+    def test_loop_with_cython_wrapped_op(self):
+        x = ps.float64("x")
+        op = ScalarLoop(init=[x], update=[ps.psi(x)])
+        out = op(1, x)
+
+        fn = function([x], out, mode=numba_mode)
+        x_test = np.float64(0.5)
+        res = fn(x_test)
+        expected_res = ps.psi(x).eval({x: x_test})
+        np.testing.assert_allclose(res, expected_res)

@@ -1,6 +1,6 @@
 import warnings
 
-from numpy.random import Generator, RandomState
+from numpy.random import Generator
 
 from pytensor.compile.sharedvalue import SharedVariable, shared
 from pytensor.link.basic import JITLinker
@@ -9,8 +9,31 @@ from pytensor.link.basic import JITLinker
 class JAXLinker(JITLinker):
     """A `Linker` that JIT-compiles NumPy-based operations using JAX."""
 
+    required_rewrites = (
+        "minimum_compile",
+        "jax",
+    )  # TODO: Distinguish between optional "jax" and "minimum_compile_jax"
+    incompatible_rewrites = (
+        "cxx_only",
+        "BlasOpt",
+        "local_careduce_fusion",
+        "scan_reduce_trace_prealloc",
+        # JAX does it his own inplace optimization
+        "inplace",
+        # There are specific variants for the LU decompositions supported by JAX
+        "reuse_lu_decomposition_multiple_solves",
+        "scan_split_non_sequence_lu_decomposition_solve",
+    )
+
+    scalar_shape_inputs: tuple[int, ...]
+
+    def __init__(self, *args, **kwargs):
+        self.scalar_shape_inputs = ()
+        super().__init__(*args, **kwargs)
+
     def fgraph_convert(self, fgraph, input_storage, storage_map, **kwargs):
         from pytensor.link.jax.dispatch import jax_funcify
+        from pytensor.link.jax.dispatch.shape import JAXShapeTuple
         from pytensor.tensor.random.type import RandomType
 
         shared_rng_inputs = [
@@ -21,7 +44,7 @@ class JAXLinker(JITLinker):
 
         # Replace any shared RNG inputs so that their values can be updated in place
         # without affecting the original RNG container. This is necessary because
-        # JAX does not accept RandomState/Generators as inputs, and they will have to
+        # JAX does not accept Generators as inputs, and they will have to
         # be tipyfied
         if shared_rng_inputs:
             warnings.warn(
@@ -64,6 +87,23 @@ class JAXLinker(JITLinker):
                 fgraph.inputs.remove(new_inp)
                 fgraph.inputs.insert(old_inp_fgrap_index, new_inp)
 
+        fgraph_inputs = fgraph.inputs
+        clients = fgraph.clients
+        # Detect scalar shape inputs that are used only in JAXShapeTuple nodes
+        scalar_shape_inputs = [
+            inp
+            for node in fgraph.apply_nodes
+            if isinstance(node.op, JAXShapeTuple)
+            for inp in node.inputs
+            if inp in fgraph_inputs
+            and all(
+                isinstance(cl_node.op, JAXShapeTuple) for cl_node, _ in clients[inp]
+            )
+        ]
+        self.scalar_shape_inputs = tuple(
+            fgraph_inputs.index(inp) for inp in scalar_shape_inputs
+        )
+
         return jax_funcify(
             fgraph, input_storage=input_storage, storage_map=storage_map, **kwargs
         )
@@ -71,7 +111,22 @@ class JAXLinker(JITLinker):
     def jit_compile(self, fn):
         import jax
 
-        return jax.jit(fn)
+        jit_fn = jax.jit(fn, static_argnums=self.scalar_shape_inputs)
+
+        if not self.scalar_shape_inputs:
+            return jit_fn
+
+        def convert_scalar_shape_inputs(
+            *args, scalar_shape_inputs=set(self.scalar_shape_inputs)
+        ):
+            return jit_fn(
+                *(
+                    int(arg) if i in scalar_shape_inputs else arg
+                    for i, arg in enumerate(args)
+                )
+            )
+
+        return convert_scalar_shape_inputs
 
     def create_thunk_inputs(self, storage_map):
         from pytensor.link.jax.dispatch import jax_typify
@@ -79,11 +134,9 @@ class JAXLinker(JITLinker):
         thunk_inputs = []
         for n in self.fgraph.inputs:
             sinput = storage_map[n]
-            if isinstance(sinput[0], RandomState | Generator):
-                new_value = jax_typify(
-                    sinput[0], dtype=getattr(sinput[0], "dtype", None)
-                )
-                sinput[0] = new_value
+            if isinstance(sinput[0], Generator):
+                # Need to convert Generator into JAX PRNGkey
+                sinput[0] = jax_typify(sinput[0])
             thunk_inputs.append(sinput)
 
         return thunk_inputs

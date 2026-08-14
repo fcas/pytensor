@@ -1,6 +1,5 @@
 import logging
 import os
-import shlex
 import sys
 import warnings
 from collections.abc import Callable, Sequence
@@ -14,6 +13,7 @@ from configparser import (
 from functools import wraps
 from io import StringIO
 from pathlib import Path
+from shlex import shlex
 
 from pytensor.utils import hash_from_code
 
@@ -68,19 +68,19 @@ class PyTensorConfigParser:
     # add_basic_configvars
     floatX: str
     warn_float64: str
-    pickle_test_value: bool
     cast_policy: str
-    device: str
-    conv__assert_shape: bool
     print_global_stats: bool
     unpickle_function: bool
     # add_compile_configvars
     mode: str
     cxx: str
+    gcc_version_str: str
     linker: str
     allow_gc: bool
     optimizer: str
     optimizer_verbose: bool
+    optimizer_verbose_ignore: str
+    compiler_verbose: bool
     on_opt_error: str
     nocleanup: bool
     on_unused_input: str
@@ -101,12 +101,8 @@ class PyTensorConfigParser:
     traceback__limit: int
     traceback__compile_limit: int
     # add_error_and_warning_configvars
-    warn__ignore_bug_before: int
     exception_verbosity: str
     # add_testvalue_and_checking_configvars
-    print_test_value: bool
-    compute_test_value: str
-    compute_test_value_opt: str
     check_input: bool
     NanGuardMode__nan_is_error: bool
     NanGuardMode__inf_is_error: bool
@@ -141,21 +137,15 @@ class PyTensorConfigParser:
     optdb__max_use_ratio: float
     cycle_detection: str
     check_stack_trace: str
-    # add_metaopt_configvars
-    metaopt__verbose: int
     # add_vm_configvars
     profile: bool
     profile_optimizer: bool
     profile_memory: bool
     vm__lazy: bool | None
-    # add_deprecated_configvars
-    unittests__rseed: str
-    warn__round: bool
     # add_scan_configvars
     scan__allow_gc: bool
     scan__allow_output_prealloc: bool
     # add_numba_configvars
-    numba__vectorize_target: str
     numba__fastmath: bool
     numba__cache: bool
     # add_caching_dir_configvars
@@ -409,7 +399,9 @@ class ConfigParam:
                 f"The config parameter '{self.name}' was registered on a different instance of the PyTensorConfigParser."
                 f" It is not accessible through the instance with id '{id(cls)}' because of safeguarding."
             )
-        if not hasattr(self, "val"):
+        try:
+            return self.val
+        except AttributeError:
             try:
                 val_str = cls.fetch_val_for_key(self.name, delete_key=delete_key)
                 self.is_default = False
@@ -510,30 +502,6 @@ class BoolParam(TypedParam):
         )
 
 
-class DeviceParam(ConfigParam):
-    def __init__(self, default, *options, **kwargs):
-        super().__init__(
-            default, apply=self._apply, mutable=kwargs.get("mutable", True)
-        )
-
-    def _apply(self, val):
-        if val.startswith("opencl") or val.startswith("cuda") or val.startswith("gpu"):
-            raise ValueError(
-                "You are trying to use the old GPU back-end. "
-                "It was removed from PyTensor."
-            )
-        elif val == self.default:
-            return val
-        raise ValueError(
-            f'Invalid value ("{val}") for configuration '
-            f'variable "{self.name}". Valid options start with '
-            'one of "cpu".'
-        )
-
-    def __str__(self):
-        return f"{self.name} ({self.default})"
-
-
 def parse_config_string(
     config_string: str, issue_warnings: bool = True
 ) -> dict[str, str]:
@@ -541,7 +509,7 @@ def parse_config_string(
     Parses a config string (comma-separated key=value components) into a dict.
     """
     config_dict = {}
-    my_splitter = shlex.shlex(config_string, posix=True)
+    my_splitter = shlex(config_string, posix=True)
     my_splitter.whitespace = ","
     my_splitter.whitespace_split = True
     for kv_pair in my_splitter:

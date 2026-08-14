@@ -9,23 +9,24 @@ import numpy as np
 import pytest
 import scipy.special
 from numpy.testing import assert_array_equal
-from scipy.special import logsumexp as scipy_logsumexp
 
 import pytensor
 import pytensor.scalar as ps
-from pytensor.compile.debugmode import DebugMode
-from pytensor.compile.function import function
+from pytensor.compile.debug.debugmode import DebugMode
+from pytensor.compile.maker import function
 from pytensor.compile.mode import get_default_mode
 from pytensor.compile.sharedvalue import shared
 from pytensor.configdefaults import config
 from pytensor.gradient import NullTypeGradError, grad, numeric_grad
-from pytensor.graph.basic import Variable, ancestors, applys_between
+from pytensor.graph.basic import Variable, equal_computations
 from pytensor.graph.fg import FunctionGraph
-from pytensor.graph.replace import vectorize_node
+from pytensor.graph.replace import vectorize_graph
+from pytensor.graph.traversal import ancestors, applys_between
 from pytensor.link.c.basic import DualLinker
+from pytensor.link.numba import NumbaLinker
 from pytensor.printing import pprint
 from pytensor.raise_op import Assert
-from pytensor.tensor import blas, blas_c
+from pytensor.tensor import blas
 from pytensor.tensor.basic import (
     as_tensor_variable,
     constant,
@@ -40,6 +41,7 @@ from pytensor.tensor.math import (
     Argmax,
     Dot,
     Max,
+    Min,
     Prod,
     ProdWithoutZeros,
     Sum,
@@ -75,6 +77,7 @@ from pytensor.tensor.math import (
     expm1,
     floor,
     isclose,
+    isfinite,
     isinf,
     isnan,
     isnan_,
@@ -85,9 +88,8 @@ from pytensor.tensor.math import (
     log1p,
     log2,
     log10,
-    logaddexp,
-    logsumexp,
     matmul,
+    matvec,
     max,
     max_and_argmax,
     maximum,
@@ -122,6 +124,8 @@ from pytensor.tensor.math import (
     true_div,
     trunc,
     var,
+    vecdot,
+    vecmat,
 )
 from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.type import (
@@ -144,7 +148,6 @@ from pytensor.tensor.type import (
     matrices,
     matrix,
     scalar,
-    scalars,
     tensor,
     tensor3,
     tensor4,
@@ -391,11 +394,17 @@ TestAbsBroadcast = makeBroadcastTester(
     grad=_grad_broadcast_unary_normal,
 )
 
+
+# in numpy >= 2.0, negating a uint raises an error
+neg_good = _good_broadcast_unary_normal.copy()
+neg_bad = {"uint8": neg_good.pop("uint8"), "uint16": neg_good.pop("uint16")}
+
 TestNegBroadcast = makeBroadcastTester(
     op=neg,
     expected=lambda x: -x,
-    good=_good_broadcast_unary_normal,
+    good=neg_good,
     grad=_grad_broadcast_unary_normal,
+    bad_compile=neg_bad,
 )
 
 TestSgnBroadcast = makeBroadcastTester(
@@ -760,6 +769,28 @@ def test_isnan():
         f([[0, 1, 2]])
 
 
+def test_isfinite():
+    x_float = matrix(dtype="float32")
+    data_float = np.array(
+        [[1.0, np.nan, np.inf], [-np.inf, 0.0, -2.5]], dtype="float32"
+    )
+    y_float = isfinite(x_float)
+    assert y_float.dtype == "bool"
+    assert_array_equal(y_float.eval({x_float: data_float}), np.isfinite(data_float))
+
+    x_int = imatrix()
+    data_int = np.array([[0, 1, 2], [-1, 5, 10]], dtype="int32")
+    y_int = isfinite(x_int)
+    assert y_int.dtype == "bool"
+    assert_array_equal(y_int.eval({x_int: data_int}), np.isfinite(data_int))
+
+    x_bool = matrix(dtype="bool")
+    data_bool = np.array([[True, False, True], [False, True, False]], dtype="bool")
+    y_bool = isfinite(x_bool)
+    assert y_bool.dtype == "bool"
+    assert_array_equal(y_bool.eval({x_bool: data_bool}), np.isfinite(data_bool))
+
+
 class TestMaxAndArgmax:
     def setup_method(self):
         Max.debug = 0
@@ -847,6 +878,10 @@ class TestMaxAndArgmax:
             ([0, 1], None),
             ([1, 0], None),
         ],
+    )
+    @pytest.mark.xfail(
+        condition=isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Numba does not support float16",
     )
     def test_basic_2_float16(self, axis, np_axis):
         # Test negative values and bigger range to make sure numpy don't do the argmax as on uint16
@@ -1055,11 +1090,10 @@ class TestMaxAndArgmax:
 
         argmax_x = argmax(x, axis=core_axis)
 
-        arg_max_node = argmax_x.owner
-        new_node = vectorize_node(arg_max_node, batch_x)
+        vect_out = vectorize_graph(argmax_x, {x: batch_x})
 
-        assert isinstance(new_node.op, Argmax)
-        assert new_node.op.axis == batch_axis
+        assert isinstance(vect_out.owner.op, Argmax)
+        assert vect_out.owner.op.axis == batch_axis
 
 
 class TestArgminArgmax:
@@ -1104,6 +1138,10 @@ class TestArgminArgmax:
                 v_shape = eval_outputs(fct(n, axis).shape)
                 assert tuple(v_shape) == nfct(data, np_axis).shape
 
+    @pytest.mark.xfail(
+        condition=isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Numba does not support float16",
+    )
     def test2_float16(self):
         # Test negative values and bigger range to make sure numpy don't do the argmax as on uint16
         data = (random(20, 30).astype("float16") - 0.5) * 20
@@ -1381,6 +1419,39 @@ class TestMinMax:
         utt.verify_grad(lambda v: min(v.flatten()), [data])
         check_grad_min(data, eval_outputs(grad(min(n.flatten()), n)))
 
+    def test_grad_Min(self):
+        """Test that the Min Op has a working gradient directly, not just via min()."""
+        data = random(2, 3)
+        n = as_tensor_variable(data)
+
+        def check_grad_Min(data, min_grad_data, axis=None):
+            # This work only for axis in [0, None]
+            assert axis in [0, None]
+            z = np.zeros_like(data)
+            z = z.flatten()
+            argmin = np.argmin(data, axis=axis)
+            if argmin.ndim == 0:
+                z[np.argmin(data, axis=axis)] += 1
+            else:
+                for id, v in enumerate(argmin):
+                    z[v * np.prod(data.shape[data.ndim - 1 : axis : -1]) + id] += 1
+
+            z = z.reshape(data.shape)
+            assert np.all(min_grad_data == z)
+
+        # test grad of Min
+        # axis is the last one
+        utt.verify_grad(lambda v: Min(axis=-1)(v).sum(), [data])
+
+        utt.verify_grad(lambda v: Min(axis=[0])(v).sum(), [data])
+        check_grad_Min(data, eval_outputs(grad(Min(axis=0)(n).sum(), n)), axis=0)
+
+        utt.verify_grad(lambda v: Min(axis=[1])(v).sum(), [data])
+        # check_grad_Min(data,eval_outputs(grad(Min(axis=1)(n).sum(), n)),axis=1)
+
+        utt.verify_grad(lambda v: Min(axis=None)(v.flatten()).sum(), [data])
+        check_grad_Min(data, eval_outputs(grad(Min(axis=None)(n.flatten()).sum(), n)))
+
     def _grad_list(self):
         # Test the gradient when we have multiple axis at the same time.
         #
@@ -1393,18 +1464,51 @@ class TestMinMax:
         # check_grad_max(data, eval_outputs(grad(max_and_argmax(n,
         # axis=1)[0], n)),axis=1)
 
-    @pytest.mark.xfail(reason="Fails due to #770")
-    def test_uint(self):
-        for dtype in ("uint8", "uint16", "uint32", "uint64"):
-            itype = np.iinfo(dtype)
-            data = np.array([itype.min + 3, itype.min, itype.max - 5, itype.max], dtype)
-            n = as_tensor_variable(data)
-            assert min(n).dtype == dtype
-            i = eval_outputs(min(n))
-            assert i == itype.min
-            assert max(n).dtype == dtype
-            i = eval_outputs(max(n))
-            assert i == itype.max
+    @pytest.mark.parametrize(
+        "dtype",
+        (
+            "uint8",
+            "uint16",
+            "uint32",
+            pytest.param(
+                "uint64",
+                marks=pytest.mark.xfail(reason="Fails due to #770"),
+            ),
+        ),
+    )
+    def test_uint(self, dtype):
+        itype = np.iinfo(dtype)
+        data = np.array(
+            [itype.min + 3, itype.min, itype.max - 5, itype.max], dtype=dtype
+        )
+        n = vector("n", shape=(None,), dtype=dtype)
+
+        min_out = min(n)
+        assert min_out.dtype == dtype
+        i_min = function([n], min_out)(data)
+        assert i_min == itype.min
+
+        max_out = max(n)
+        assert max_out.dtype == dtype
+        i_max = function([n], max_out)(data)
+        assert i_max == itype.max
+        if dtype == "uint64":
+            assert (
+                0
+            )  # It's not failing in all the CIs but we have XPASS(strict) enabled
+
+    @pytest.mark.xfail(
+        condition=getattr(get_default_mode().linker, "c_thunks", False),
+        reason="Fails due to #770",
+    )
+    def test_uint64_special_value(self):
+        """Example from issue #770"""
+        dtype = "uint64"
+        data = np.array([0, 9223372036854775], dtype=dtype)
+        n = vector("n", shape=(None,), dtype=dtype)
+
+        i_max = function([n], max(n))(data)
+        assert i_max == data.max()
 
     def test_bool(self):
         data = np.array([True, False], "bool")
@@ -1422,7 +1526,7 @@ class TestMinMax:
 def test_MaxAndArgmax_deprecated():
     with pytest.raises(
         AttributeError,
-        match="The class `MaxandArgmax` has been deprecated. Call `Max` and `Argmax` seperately as an alternative.",
+        match="The class `MaxandArgmax` has been deprecated\\. Call `Max` and `Argmax` seperately as an alternative\\.",
     ):
         pytensor.tensor.math.MaxAndArgmax
 
@@ -1938,6 +2042,10 @@ class TestMean:
         res = mean(np.zeros(1))
         assert res.eval() == 0.0
 
+    @pytest.mark.xfail(
+        condition=isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Numba does not support float16",
+    )
     def test_mean_f16(self):
         x = vector(dtype="float16")
         y = x.mean()
@@ -1955,50 +2063,20 @@ class TestMean:
         assert mean(ll).eval() == 1
 
 
-def test_dot_numpy_inputs():
-    """Test the `PyTensor.tensor.dot` interface function with NumPy inputs."""
-    a = np.ones(2)
-    b = np.ones(2)
-    res = dot(a, b)
-    assert isinstance(res, Variable)
-    assert isinstance(res.owner.op, Dot)
-
-
 class TestDot:
-    def test_Op_dims(self):
+    def test_valid_ndim(self):
         d0 = scalar()
         d1 = vector()
         d2 = matrix()
         d3 = tensor3()
 
         with pytest.raises(TypeError):
-            _dot(d0, d0)
-        with pytest.raises(TypeError):
-            _dot(d0, d1)
-        with pytest.raises(TypeError):
             _dot(d0, d2)
         with pytest.raises(TypeError):
-            _dot(d0, d3)
-        with pytest.raises(TypeError):
-            _dot(d1, d0)
-        _dot(d1, d1)
-        _dot(d1, d2)
-        with pytest.raises(TypeError):
-            _dot(d1, d3)
-        with pytest.raises(TypeError):
-            _dot(d2, d0)
-        _dot(d2, d1)
-        _dot(d2, d2)
-        with pytest.raises(TypeError):
-            _dot(d2, d3)
-        with pytest.raises(TypeError):
-            _dot(d3, d0)
-        with pytest.raises(TypeError):
-            _dot(d3, d1)
+            _dot(d1, d2)
         with pytest.raises(TypeError):
             _dot(d3, d2)
-        with pytest.raises(TypeError):
-            _dot(d3, d3)
+        _dot(d2, d2)  # Fine
 
     def test_grad(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
@@ -2045,6 +2123,78 @@ class TestDot:
                             assert is_super_shape(x, g)
                             g = grad(z.sum(), y)
                             assert is_super_shape(y, g)
+
+    def test_dot_numpy_inputs(self):
+        """Test the `PyTensor.tensor.dot` interface function with NumPy inputs."""
+        a = np.ones((2, 2))
+        b = np.ones((2, 2))
+        res = dot(a, b)
+        assert isinstance(res, Variable)
+        assert isinstance(res.owner.op, Dot)
+
+
+def test_matrix_vector_ops():
+    """Test vecdot, matvec, and vecmat helper functions."""
+    rng = np.random.default_rng(2089)
+
+    atol = 1e-7 if config.floatX == "float32" else 1e-15
+    batch_size = 2
+    dim_k = 4  # Common dimension
+    dim_m = 3  # Matrix rows
+    dim_n = 5  # Matrix columns
+
+    # Create input tensors with appropriate shapes
+    # For matvec: x1(b,m,k) @ x2(b,k) -> out(b,m)
+    # For vecmat: x1(b,k) @ x2(b,k,n) -> out(b,n)
+
+    # Create test values using config.floatX to match PyTensor's default dtype
+    mat_mk_val = random(batch_size, dim_m, dim_k, rng=rng).astype(config.floatX)
+    mat_kn_val = random(batch_size, dim_k, dim_n, rng=rng).astype(config.floatX)
+    vec_k_val = random(batch_size, dim_k, rng=rng).astype(config.floatX)
+
+    mat_mk = tensor(
+        name="mat_mk", shape=(batch_size, dim_m, dim_k), dtype=config.floatX
+    )
+    mat_kn = tensor(
+        name="mat_kn", shape=(batch_size, dim_k, dim_n), dtype=config.floatX
+    )
+    vec_k = tensor(name="vec_k", shape=(batch_size, dim_k), dtype=config.floatX)
+
+    # Test 1: vecdot with matching dimensions
+    vecdot_out = vecdot(vec_k, vec_k, dtype="int32")
+    vecdot_fn = function([vec_k], vecdot_out)
+    result = vecdot_fn(vec_k_val)
+
+    # Check dtype
+    assert result.dtype == np.int32
+
+    # Calculate expected manually
+    expected_vecdot = np.zeros((batch_size,), dtype=np.int32)
+    for i in range(batch_size):
+        expected_vecdot[i] = np.sum(vec_k_val[i] * vec_k_val[i])
+    np.testing.assert_allclose(result, expected_vecdot, atol=atol)
+
+    # Test 2: matvec - matrix-vector product
+    matvec_out = matvec(mat_mk, vec_k)
+    matvec_fn = function([mat_mk, vec_k], matvec_out)
+    result_matvec = matvec_fn(mat_mk_val, vec_k_val)
+
+    # Calculate expected manually
+    expected_matvec = np.zeros((batch_size, dim_m), dtype=config.floatX)
+    for i in range(batch_size):
+        expected_matvec[i] = np.dot(mat_mk_val[i], vec_k_val[i])
+    np.testing.assert_allclose(result_matvec, expected_matvec, atol=atol)
+
+    # Test 3: vecmat - vector-matrix product
+    vecmat_out = vecmat(vec_k, mat_kn)
+    vecmat_fn = function([vec_k, mat_kn], vecmat_out)
+    result_vecmat = vecmat_fn(vec_k_val, mat_kn_val)
+
+    # Calculate expected manually
+    expected_vecmat = np.zeros((batch_size, dim_n), dtype=config.floatX)
+    for i in range(batch_size):
+        expected_vecmat[i] = np.dot(vec_k_val[i], mat_kn_val[i])
+    np.testing.assert_allclose(result_vecmat, expected_vecmat, atol=atol)
 
 
 class TestTensordot:
@@ -2278,7 +2428,7 @@ class TestTensordot:
 
         with pytest.raises(
             ValueError,
-            match="Input arrays have inconsistent broadcastable pattern or type shape",
+            match="Input arrays have inconsistent type shape",
         ):
             tensordot(ones(shape=(7, 4)), ones(shape=(7, 4)), axes=1)
 
@@ -2322,6 +2472,41 @@ class TestTensordot:
                     z.eval({x: xv, y: yv})
         else:
             assert np.allclose(np.tensordot(xv, yv, axes=axes), z.eval({x: xv, y: yv}))
+
+    def test_eager_simplification(self):
+        # Test that cases where tensordot isn't needed, it returns a simple graph
+        scl = tensor(shape=())
+        vec = tensor(shape=(None,))
+        mat = tensor(shape=(None, None))
+
+        # scalar product
+        out = tensordot(scl, scl, axes=[[], []])
+        assert equal_computations([out], [scl * scl])
+
+        # vector-vector product
+        out = tensordot(vec, vec, axes=[[-1], [-1]])
+        assert equal_computations([out], [dot(vec, vec)])
+
+        # matrix-vector product
+        out = tensordot(mat, vec, axes=[[-1], [-1]])
+        assert equal_computations([out], [dot(mat, vec)])
+
+        out = tensordot(mat, vec, axes=[[-2], [-1]])
+        assert equal_computations([out], [dot(mat.T, vec)])
+
+        # vector-matrix product
+        out = tensordot(vec, mat, axes=[[-1], [-2]])
+        assert equal_computations([out], [dot(vec, mat)])
+
+        out = tensordot(vec, mat, axes=[[-1], [-1]])
+        assert equal_computations([out], [dot(vec, mat.T)])
+
+        # matrix-matrix product
+        out = tensordot(mat, mat, axes=[[-1], [-2]])
+        assert equal_computations([out], [dot(mat, mat)])
+
+        out = tensordot(mat, mat, axes=[[-1], [-1]])
+        assert equal_computations([out], [dot(mat, mat.T)])
 
 
 def test_smallest():
@@ -2457,11 +2642,22 @@ class TestArithmeticCast:
         def numpy_i_scalar(dtype):
             return numpy_scalar(dtype)
 
+        pytensor_funcs = {
+            "scalar": pytensor_scalar,
+            "array": pytensor_array,
+            "i_scalar": pytensor_i_scalar,
+        }
+        numpy_funcs = {
+            "scalar": numpy_scalar,
+            "array": numpy_array,
+            "i_scalar": numpy_i_scalar,
+        }
+
         with config.change_flags(cast_policy="numpy+floatX"):
             # We will test all meaningful combinations of
             # scalar and array operations.
-            pytensor_args = [eval(f"pytensor_{c}") for c in combo]
-            numpy_args = [eval(f"numpy_{c}") for c in combo]
+            pytensor_args = [pytensor_funcs[c] for c in combo]
+            numpy_args = [numpy_funcs[c] for c in combo]
             pytensor_arg_1 = pytensor_args[0](a_type)
             pytensor_arg_2 = pytensor_args[1](b_type)
             pytensor_dtype = op(
@@ -2523,9 +2719,8 @@ class TestArithmeticCast:
                     # behavior.
                     return
 
-            if (
-                {a_type, b_type} == {"complex128", "float32"}
-                or {a_type, b_type} == {"complex128", "float16"}
+            if {a_type, b_type} == {"complex128", "float32"} or (
+                {a_type, b_type} == {"complex128", "float16"}
                 and set(combo) == {"scalar", "array"}
                 and pytensor_dtype == "complex128"
                 and numpy_dtype == "complex64"
@@ -2643,9 +2838,9 @@ class TestInferShape(utt.InferShapeTester):
         bdvec_val = random(4, rng=rng)
         self._compile_and_check(
             [advec, bdvec],
-            [Dot()(advec, bdvec)],
+            [dot(advec, bdvec)],
             [advec_val, bdvec_val],
-            (Dot, blas.Dot22, blas.Gemv, blas_c.CGemv),
+            (Dot, blas.Dot22, blas.Gemv, blas.CGemv),
         )
 
         # mat/mat
@@ -2655,7 +2850,7 @@ class TestInferShape(utt.InferShapeTester):
         bdmat_val = random(5, 3, rng=rng)
         self._compile_and_check(
             [admat, bdmat],
-            [Dot()(admat, bdmat)],
+            [dot(admat, bdmat)],
             [admat_val, bdmat_val],
             (Dot, blas.Dot22),
         )
@@ -2664,18 +2859,18 @@ class TestInferShape(utt.InferShapeTester):
         bdmat_val = random(4, 5, rng=rng)
         self._compile_and_check(
             [advec, bdmat],
-            [Dot()(advec, bdmat)],
+            [dot(advec, bdmat)],
             [advec_val, bdmat_val],
-            (Dot, blas.Dot22, blas.Gemv, blas_c.CGemv),
+            (Dot, blas.Dot22, blas.Gemv, blas.CGemv),
         )
 
         # mat/vec
         admat_val = random(5, 4, rng=rng)
         self._compile_and_check(
             [admat, bdvec],
-            [Dot()(admat, bdvec)],
+            [dot(admat, bdvec)],
             [admat_val, bdvec_val],
-            (Dot, blas.Dot22, blas.Gemv, blas_c.CGemv),
+            (Dot, blas.Dot22, blas.Gemv, blas.CGemv),
         )
 
 
@@ -2977,7 +3172,7 @@ class TestProd:
         assert not unpickled_prod.no_zeros_in_input
 
 
-class TestIsInfIsNan:
+class TestIsInfIsNanIsFinite:
     def setup_method(self):
         self.test_vals = [
             np.array(x, dtype=config.floatX)
@@ -3017,13 +3212,18 @@ class TestIsInfIsNan:
     def test_isnan(self):
         self.run_isfunc(isnan, np.isnan)
 
+    def test_isfinite(self):
+        self.run_isfunc(isfinite, np.isfinite)
+
 
 class TestSumProdReduceDtype:
     mode = get_default_mode().excluding("local_cut_useless_reduce")
     op = CAReduce
     axes = [None, 0, 1, [], [0], [1], [0, 1]]
     methods = ["sum", "prod"]
-    dtypes = list(map(str, ps.all_types))
+    dtypes = tuple(map(str, ps.all_types))
+    if isinstance(mode.linker, NumbaLinker):
+        dtypes = tuple(d for d in dtypes if d != "float16")
 
     # Test the default dtype of a method().
     def test_reduce_default_dtype(self):
@@ -3183,10 +3383,13 @@ class TestSumProdReduceDtype:
 class TestMeanDtype:
     def test_mean_default_dtype(self):
         # Test the default dtype of a mean().
+        is_numba = isinstance(get_default_mode().linker, NumbaLinker)
 
         # We try multiple axis combinations even though axis should not matter.
         axes = [None, 0, 1, [], [0], [1], [0, 1]]
         for idx, dtype in enumerate(map(str, ps.all_types)):
+            if is_numba and dtype == "float16":
+                continue
             axis = axes[idx % len(axes)]
             x = matrix(dtype=dtype)
             m = x.mean(axis=axis)
@@ -3281,10 +3484,13 @@ class TestProdWithoutZerosDtype:
 
     def test_prod_without_zeros_default_acc_dtype(self):
         # Test the default dtype of a ProdWithoutZeros().
+        is_numba = isinstance(get_default_mode().linker, NumbaLinker)
 
         # We try multiple axis combinations even though axis should not matter.
         axes = [None, 0, 1, [], [0], [1], [0, 1]]
         for idx, dtype in enumerate(map(str, ps.all_types)):
+            if is_numba and dtype == "float16":
+                continue
             axis = axes[idx % len(axes)]
             x = matrix(dtype=dtype)
             p = ProdWithoutZeros(axis=axis)(x)
@@ -3312,13 +3518,17 @@ class TestProdWithoutZerosDtype:
     @pytest.mark.slow
     def test_prod_without_zeros_custom_dtype(self):
         # Test ability to provide your own output dtype for a ProdWithoutZeros().
-
+        is_numba = isinstance(get_default_mode().linker, NumbaLinker)
         # We try multiple axis combinations even though axis should not matter.
         axes = [None, 0, 1, [], [0], [1], [0, 1]]
         idx = 0
         for input_dtype in map(str, ps.all_types):
+            if is_numba and input_dtype == "float16":
+                continue
             x = matrix(dtype=input_dtype)
             for output_dtype in map(str, ps.all_types):
+                if is_numba and output_dtype == "float16":
+                    continue
                 axis = axes[idx % len(axes)]
                 prod_woz_var = ProdWithoutZeros(axis=axis, dtype=output_dtype)(x)
                 assert prod_woz_var.dtype == output_dtype
@@ -3334,13 +3544,18 @@ class TestProdWithoutZerosDtype:
     @pytest.mark.slow
     def test_prod_without_zeros_custom_acc_dtype(self):
         # Test ability to provide your own acc_dtype for a ProdWithoutZeros().
+        is_numba = isinstance(get_default_mode().linker, NumbaLinker)
 
         # We try multiple axis combinations even though axis should not matter.
         axes = [None, 0, 1, [], [0], [1], [0, 1]]
         idx = 0
         for input_dtype in map(str, ps.all_types):
+            if is_numba and input_dtype == "float16":
+                continue
             x = matrix(dtype=input_dtype)
             for acc_dtype in map(str, ps.all_types):
+                if is_numba and acc_dtype == "float16":
+                    continue
                 axis = axes[idx % len(axes)]
                 # If acc_dtype would force a downcast, we expect a TypeError
                 # We always allow int/uint inputs with float/complex outputs.
@@ -3407,22 +3622,6 @@ class TestSumMeanMaxMinArgMaxVarReduceAxes:
             x = matrix()
             # TODO FIXME: This is a bad test
             x.var(a)
-
-
-def reduce_bitwise_and(x, axis=-1, dtype="int8"):
-    identity = np.array((-1,), dtype=dtype)[0]
-
-    shape_without_axis = tuple(s for i, s in enumerate(x.shape) if i != axis)
-    if 0 in shape_without_axis:
-        return np.empty(shape=shape_without_axis, dtype=x.dtype)
-
-    def custom_reduce(a):
-        out = identity
-        for i in range(a.size):
-            out = np.bitwise_and(a[i], out)
-        return out
-
-    return np.apply_along_axis(custom_reduce, axis, x)
 
 
 def test_clip_grad():
@@ -3498,76 +3697,6 @@ def test_tanh_grad_broadcast():
     grad(tanh(x + y).sum(), [x, y])
 
 
-def test_logaddexp():
-    # Test more than two multidimensional inputs
-    x, y, z = matrices("x", "y", "z")
-    out = logaddexp(x, y, z)
-    f = function([x, y, z], out)
-
-    inp = np.zeros((3, 3), dtype=config.floatX)
-    np.testing.assert_allclose(
-        f(inp, inp, inp),
-        np.full((3, 3), np.log(3)),
-    )
-
-    # Test scalar inputs
-    x, y = scalars("x", "y")
-    out = logaddexp(x, y)
-    f = function([x, y], out)
-
-    res = f(0, 0)
-    assert np.ndim(res) == 0
-    assert np.isclose(res, np.log(2))
-
-    # Test scalar and matrix inputs
-    x = scalar("x")
-    y = matrix("y")
-    out = logaddexp(x, y)
-    f = function([x, y], out)
-
-    res = f(
-        np.array(0, dtype=config.floatX),
-        np.zeros((3, 3), dtype=config.floatX),
-    )
-    assert np.shape(res) == (3, 3)
-    np.testing.assert_allclose(
-        res,
-        np.full((3, 3), np.log(2)),
-    )
-
-
-@pytest.mark.parametrize(
-    ["shape", "axis"],
-    [
-        ((1,), 0),
-        ((3,), 0),
-        ((3, 4), None),
-        ((3, 4), 0),
-        ((3, 4), 1),
-        ((3, 4, 5), None),
-        ((3, 3, 5), 0),
-        ((3, 4, 5), 1),
-        ((3, 4, 5), 2),
-    ],
-)
-@pytest.mark.parametrize(
-    "keepdims",
-    [True, False],
-)
-def test_logsumexp(shape, axis, keepdims):
-    scipy_inp = np.zeros(shape)
-    scipy_out = scipy_logsumexp(scipy_inp, axis=axis, keepdims=keepdims)
-
-    pytensor_inp = as_tensor_variable(scipy_inp)
-    f = function([], logsumexp(pytensor_inp, axis=axis, keepdims=keepdims))
-    pytensor_out = f()
-
-    np.testing.assert_array_almost_equal(
-        pytensor_out,
-        scipy_out,
-    )
-
-
 def test_pprint():
     x = vector("x")
     y = pt_sum(x, axis=0)
@@ -3632,14 +3761,27 @@ class TestMatMul:
         with pytest.raises(ValueError, match="cannot be scalar"):
             self.op(4, [4, 1])
 
-    @pytest.mark.parametrize("dtype", (np.float16, np.float32, np.float64))
+    @pytest.mark.parametrize(
+        "dtype",
+        (
+            pytest.param(
+                np.float16,
+                marks=pytest.mark.xfail(
+                    condition=isinstance(get_default_mode().linker, NumbaLinker),
+                    reason="Numba does not support float16",
+                ),
+            ),
+            np.float32,
+            np.float64,
+        ),
+    )
     def test_dtype_param(self, dtype):
         sol = self.op([1, 2, 3], [3, 2, 1], dtype=dtype)
         assert sol.eval().dtype == dtype
 
     def test_dot22_opt(self):
         x, y = matrices("xy")
-        fn = function([x, y], x @ y, mode="FAST_RUN")
+        fn = function([x, y], x @ y, mode="CVM")
         [node] = fn.maker.fgraph.apply_nodes
         assert isinstance(node.op, Dot22)
 

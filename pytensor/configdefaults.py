@@ -3,19 +3,16 @@ import logging
 import os
 import platform
 import re
-import shutil
-import socket
 import sys
 import textwrap
 from pathlib import Path
+from shutil import which
 
 import numpy as np
 
-import pytensor
 from pytensor.configparser import (
     BoolParam,
     ConfigParam,
-    DeviceParam,
     EnumStr,
     FloatParam,
     IntParam,
@@ -46,8 +43,12 @@ def _filter_mode(val):
         "NanGuardMode",
         "FAST_COMPILE",
         "DEBUG_MODE",
+        "CVM",
+        "C",
         "JAX",
         "NUMBA",
+        "PYTORCH",
+        "MLX",
     ]
     if val in str_options:
         return val
@@ -62,46 +63,6 @@ def _filter_mode(val):
         f"Expected one of {str_options}, or an instance of pytensor.compile.mode.Mode. "
         f"Instead got: {val}."
     )
-
-
-def _warn_cxx(val):
-    """We only support clang++ as otherwise we hit strange g++/OSX bugs."""
-    if sys.platform == "darwin" and val and "clang++" not in val:
-        _logger.warning(
-            "Only clang++ is supported. With g++,"
-            " we end up with strange g++/OSX bugs."
-        )
-    return True
-
-
-def _split_version(version):
-    """
-    Take version as a dot-separated string, return a tuple of int
-    """
-    return tuple(int(i) for i in version.split("."))
-
-
-def _warn_default(version):
-    """
-    Return True iff we should warn about bugs fixed after a given version.
-    """
-    if config.warn__ignore_bug_before == "None":
-        return True
-    if config.warn__ignore_bug_before == "all":
-        return False
-    if _split_version(config.warn__ignore_bug_before) >= _split_version(version):
-        return False
-    return True
-
-
-def _good_seem_param(seed):
-    if seed == "random":
-        return True
-    try:
-        int(seed)
-    except Exception:
-        return False
-    return True
 
 
 def _is_valid_check_preallocated_output_param(param):
@@ -237,14 +198,6 @@ def add_basic_configvars():
     )
 
     config.add(
-        "pickle_test_value",
-        "Dump test values while pickling model. "
-        "If True, test values will be dumped with model.",
-        BoolParam(True),
-        in_c_key=False,
-    )
-
-    config.add(
         "cast_policy",
         "Rules for implicit type casting",
         EnumStr(
@@ -258,22 +211,6 @@ def add_basic_configvars():
             # was expected, so it is currently not available.
             # numpy,
         ),
-        in_c_key=False,
-    )
-
-    config.add(
-        "device",
-        ("Default device for computations. only cpu is supported for now"),
-        DeviceParam("cpu", mutable=False),
-        in_c_key=False,
-    )
-
-    config.add(
-        "conv__assert_shape",
-        "If True, AbstractConv* ops will verify that user-provided"
-        " shapes match the runtime shapes (debugging option,"
-        " may slow down compilation)",
-        BoolParam(False),
         in_c_key=False,
     )
 
@@ -300,8 +237,16 @@ def _is_gt_0(x):
     return x > 0
 
 
-def _is_greater_or_equal_0(x):
+def _is_ge_0(x):
     return x >= 0
+
+
+def _is_valid_012(x):
+    return x in (0, 1, 2)
+
+
+def _default_cxx_bool():
+    return bool(config.cxx)
 
 
 def add_compile_configvars():
@@ -312,83 +257,25 @@ def add_compile_configvars():
         in_c_key=False,
     )
 
-    param = "g++"
+    default_linker = "auto"
 
-    # Test whether or not g++ is present: disable C code if it is not.
-    try:
-        rc = call_subprocess_Popen(["g++", "-v"])
-    except OSError:
-        rc = 1
-
-    # Anaconda on Windows has mingw-w64 packages including GCC, but it may not be on PATH.
-    if rc != 0:
-        if sys.platform == "win32":
-            mingw_w64_gcc = Path(sys.executable).parent / "Library/mingw-w64/bin/g++"
-            try:
-                rc = call_subprocess_Popen([str(mingw_w64_gcc), "-v"])
-                if rc == 0:
-                    maybe_add_to_os_environ_pathlist("PATH", mingw_w64_gcc.parent)
-            except OSError:
-                rc = 1
-            if rc != 0:
-                _logger.warning(
-                    "g++ not available, if using conda: `conda install m2w64-toolchain`"
-                )
-
-    if rc != 0:
-        param = ""
-
-    # On Mac/FreeBSD we test for 'clang++' and use it by default
-    if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
-        try:
-            rc = call_subprocess_Popen(["clang++", "-v"])
-            if rc == 0:
-                param = "clang++"
-        except OSError:
-            pass
-
-    # Try to find the full compiler path from the name
-    if param != "":
-        newp = shutil.which(param)
-        if newp is not None:
-            param = newp
-        del newp
-
-    # to support path that includes spaces, we need to wrap it with double quotes on Windows
-    if param and os.name == "nt":
-        param = f'"{param}"'
-
-    config.add(
-        "cxx",
-        "The C++ compiler to use. Currently only g++ is"
-        " supported, but supporting additional compilers should not be "
-        "too difficult. "
-        "If it is empty, no C++ code is compiled.",
-        StrParam(param, validate=_warn_cxx),
-        in_c_key=False,
-    )
-    del param
-
-    if rc == 0 and config.cxx != "":
-        # Keep the default linker the same as the one for the mode FAST_RUN
-        linker_options = ["c|py", "py", "c", "c|py_nogc", "vm", "vm_nogc", "cvm_nogc"]
-    else:
-        # g++ is not present or the user disabled it,
-        # linker should default to python only.
-        linker_options = ["py", "vm_nogc"]
-        if type(config).cxx.is_default:
-            # If the user provided an empty value for cxx, do not warn.
-            _logger.warning(
-                "g++ not detected!  PyTensor will be unable to compile "
-                "C-implementations and will default to Python. "
-                "Performance may be severely degraded. "
-                "To remove this warning, set PyTensor flags cxx to an empty string."
-            )
+    linker_options = [
+        "cvm",
+        "c|py",
+        "py",
+        "c",
+        "c|py_nogc",
+        "vm",
+        "vm_nogc",
+        "cvm_nogc",
+        "numba",
+        "jax",
+    ]
 
     config.add(
         "linker",
-        "Default linker used if the pytensor flags mode is Mode",
-        EnumStr("cvm", linker_options),
+        "Default linker used if the pytensor flags mode is Mode or FAST_RUN",
+        EnumStr(default_linker, linker_options, mutable=True),
         in_c_key=False,
     )
 
@@ -411,13 +298,28 @@ def add_compile_configvars():
         EnumStr(
             "o4",
             ["o3", "o2", "o1", "unsafe", "fast_run", "fast_compile", "merge", "None"],
+            mutable=False,  # Not mutable because the default mode is cached after the first use.
         ),
         in_c_key=False,
     )
 
     config.add(
         "optimizer_verbose",
-        "If True, we print all optimization being applied",
+        "Print information about rewrites that are applied during a graph transformation.",
+        BoolParam(False),
+        in_c_key=False,
+    )
+
+    config.add(
+        "optimizer_verbose_ignore",
+        "Do not print information for rewrites with these names when `optimizer_verbose` is `True`. Separate names with ','",
+        StrParam(""),
+        in_c_key=False,
+    )
+
+    config.add(
+        "compiler_verbose",
+        "Print information about compilation steps.",
         BoolParam(False),
         in_c_key=False,
     )
@@ -433,17 +335,101 @@ def add_compile_configvars():
     )
 
     config.add(
-        "nocleanup",
-        "Suppress the deletion of code files that did not compile cleanly",
-        BoolParam(False),
-        in_c_key=False,
-    )
-
-    config.add(
         "on_unused_input",
         "What to do if a variable in the 'inputs' list of "
         " pytensor.function() is not used in the graph.",
         EnumStr("raise", ["warn", "ignore"]),
+        in_c_key=False,
+    )
+
+
+def _get_cxx_default():
+    param = "g++"
+
+    # Test whether or not g++ is present: disable C code if it is not.
+    try:
+        rc = call_subprocess_Popen(["g++", "-v"])
+    except OSError:
+        rc = 1
+
+    # Anaconda on Windows has mingw-w64 packages including GCC, but it may not be on PATH.
+    if rc != 0:
+        if sys.platform == "win32":
+            mingw_w64_gcc = Path(sys.executable).parent / "Library/mingw-w64/bin/g++"
+            try:
+                rc = call_subprocess_Popen([str(mingw_w64_gcc), "-v"])
+                if rc == 0:
+                    maybe_add_to_os_environ_pathlist("PATH", mingw_w64_gcc.parent)
+            except OSError:
+                rc = 1
+            if rc != 0:
+                _logger.warning(
+                    "g++ not available, if using conda: `conda install gxx`"
+                )
+
+    if rc != 0:
+        param = ""
+
+    # On Mac/FreeBSD we test for 'clang++' and use it by default
+    if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
+        try:
+            rc = call_subprocess_Popen(["clang++", "-v"])
+            if rc == 0:
+                param = "clang++"
+        except OSError:
+            pass
+
+    # Try to find the full compiler path from the name
+    if param != "":
+        newp = which(param)
+        if newp is not None:
+            param = newp
+        del newp
+
+    # to support path that includes spaces, we need to wrap it with double quotes on Windows
+    if param and os.name == "nt":
+        param = f'"{param}"'
+
+    return param
+
+
+def _warn_cxx(val):
+    """We only support clang++ as otherwise we hit strange g++/OSX bugs."""
+    if sys.platform == "darwin" and val and "clang++" not in val:
+        _logger.warning(
+            "Only clang++ is supported. With g++, we end up with strange g++/OSX bugs."
+        )
+    return True
+
+
+def _default_gcc_version_str():
+    if config.cxx != "":
+        try:
+            p_out = output_subprocess_Popen([config.cxx, "-dumpversion"])
+            gcc_version_str = p_out[0].strip().decode()
+        except OSError:
+            # Typically means gcc cannot be found.
+            gcc_version_str = "GCC_NOT_FOUND"
+    else:
+        gcc_version_str = "GCC_NOT_FOUND"
+    return gcc_version_str
+
+
+def add_c_compile_configvars():
+    config.add(
+        "cxx",
+        "The C++ compiler to use. Currently only g++ is"
+        " supported, but supporting additional compilers should not be "
+        "too difficult. "
+        "If it is empty, no C++ code is compiled.",
+        StrParam(_get_cxx_default, validate=_warn_cxx),
+        in_c_key=False,
+    )
+
+    config.add(
+        "gcc_version_str",
+        "",
+        StrParam(_default_gcc_version_str, mutable=False),
         in_c_key=False,
     )
 
@@ -452,6 +438,13 @@ def add_compile_configvars():
         "Extra compiler flags for gcc",
         StrParam(""),
         # Added elsewhere in the c key only when needed.
+        in_c_key=False,
+    )
+
+    config.add(
+        "nocleanup",
+        "Suppress the deletion of code files that did not compile cleanly",
+        BoolParam(False),
         in_c_key=False,
     )
 
@@ -519,13 +512,9 @@ def add_compile_configvars():
     lock is held by the same owner *and* has not been 'refreshed' by this
     owner for more than this period. Refreshes are done every half timeout
     period for running processes.""",
-        IntParam(_timeout_default, validate=_is_greater_or_equal_0, mutable=False),
+        IntParam(_timeout_default, validate=_is_ge_0, mutable=False),
         in_c_key=False,
     )
-
-
-def _is_valid_cmp_sloppy(v):
-    return v in (0, 1, 2)
 
 
 def add_tensor_configvars():
@@ -536,7 +525,7 @@ def add_tensor_configvars():
     config.add(
         "tensor__cmp_sloppy",
         "Relax pytensor.tensor.math._allclose (0) not at all, (1) a bit, (2) more",
-        IntParam(0, _is_valid_cmp_sloppy, mutable=False),
+        IntParam(0, validate=_is_valid_012, mutable=False),
         in_c_key=False,
     )
 
@@ -582,47 +571,6 @@ def add_traceback_configvars():
 
 
 def add_error_and_warning_configvars():
-    ###
-    # To disable some warning about old bug that are fixed now.
-    ###
-    config.add(
-        "warn__ignore_bug_before",
-        (
-            "If 'None', we warn about all PyTensor bugs found by default. "
-            "If 'all', we don't warn about PyTensor bugs found by default. "
-            "If a version, we print only the warnings relative to PyTensor "
-            "bugs found after that version. "
-            "Warning for specific bugs can be configured with specific "
-            "[warn] flags."
-        ),
-        EnumStr(
-            "0.9",
-            [
-                "None",
-                "all",
-                "0.3",
-                "0.4",
-                "0.4.1",
-                "0.5",
-                "0.6",
-                "0.7",
-                "0.8",
-                "0.8.1",
-                "0.8.2",
-                "0.9",
-                "0.10",
-                "1.0",
-                "1.0.1",
-                "1.0.2",
-                "1.0.3",
-                "1.0.4",
-                "1.0.5",
-            ],
-            mutable=False,
-        ),
-        in_c_key=False,
-    )
-
     # Note to developers:
     # Generally your exceptions should use an apply node's __str__
     # method when exception_verbosity == 'low'. When exception_verbosity
@@ -630,62 +578,13 @@ def add_error_and_warning_configvars():
     # on all important apply nodes.
     config.add(
         "exception_verbosity",
-        "If 'low', the text of exceptions will generally refer "
-        "to apply nodes with short names such as "
-        "Elemwise{add_no_inplace}. If 'high', some exceptions "
-        "will also refer to apply nodes with long descriptions "
-        """ like:
-        A. Elemwise{add_no_inplace}
-                B. log_likelihood_v_given_h
-                C. log_likelihood_h""",
-        EnumStr("low", ["high"]),
+        "Verbosity of exceptions generated by PyTensor functions.",
+        EnumStr("low", ["medium", "high"]),
         in_c_key=False,
     )
-
-
-def _has_cxx():
-    return bool(config.cxx)
-
-
-def _is_valid_check_strides(v):
-    return v in (0, 1, 2)
 
 
 def add_testvalue_and_checking_configvars():
-    config.add(
-        "print_test_value",
-        (
-            "If 'True', the __eval__ of an PyTensor variable will return its test_value "
-            "when this is available. This has the practical consequence that, e.g., "
-            "in debugging `my_var` will print the same as `my_var.tag.test_value` "
-            "when a test value is defined."
-        ),
-        BoolParam(False),
-        in_c_key=False,
-    )
-
-    config.add(
-        "compute_test_value",
-        (
-            "If 'True', PyTensor will run each op at graph build time, using "
-            "Constants, SharedVariables and the tag 'test_value' as inputs "
-            "to the function. This helps the user track down problems in the "
-            "graph before it gets optimized."
-        ),
-        EnumStr("off", ["ignore", "warn", "raise", "pdb"]),
-        in_c_key=False,
-    )
-
-    config.add(
-        "compute_test_value_opt",
-        (
-            "For debugging PyTensor optimization only."
-            " Same as compute_test_value, but is used"
-            " during PyTensor optimization"
-        ),
-        EnumStr("off", ["ignore", "warn", "raise", "pdb"]),
-        in_c_key=False,
-    )
     config.add(
         "check_input",
         "Specify if types should check their input in their C code. "
@@ -733,7 +632,7 @@ def add_testvalue_and_checking_configvars():
     config.add(
         "DebugMode__check_c",
         "Run C implementations where possible",
-        BoolParam(_has_cxx),
+        BoolParam(_default_cxx_bool),
         in_c_key=False,
     )
 
@@ -758,7 +657,7 @@ def add_testvalue_and_checking_configvars():
             "On difference: (0) - ignore, (1) warn, or (2) raise error"
         ),
         # TODO: make this an Enum setting
-        IntParam(0, _is_valid_check_strides),
+        IntParam(0, validate=_is_valid_012),
         in_c_key=False,
     )
 
@@ -834,7 +733,7 @@ def add_testvalue_and_checking_configvars():
         "profiling__min_memory_size",
         """For the memory profile, do not print Apply nodes if the size
                  of their outputs (in bytes) is lower than this threshold""",
-        IntParam(1024, _is_greater_or_equal_0),
+        IntParam(1024, validate=_is_ge_0),
         in_c_key=False,
     )
 
@@ -982,7 +881,7 @@ def add_optimizer_configvars():
         "are allowed, but it makes the compilation faster."
         "The interaction of which one give the lower peak memory usage is"
         "complicated and not predictable, so if you are close to the peak"
-        "memory usage, triyng both could give you a small gain.",
+        "memory usage, trying both could give you a small gain.",
         EnumStr("regular", ["fast"]),
         in_c_key=False,
     )
@@ -998,16 +897,6 @@ def add_optimizer_configvars():
         "the variable that had an empty stack trace."
         "raise: raises an exception if a stack trace is missing",
         EnumStr("off", ["log", "warn", "raise"]),
-        in_c_key=False,
-    )
-
-
-def add_metaopt_configvars():
-    config.add(
-        "metaopt__verbose",
-        "0 for silent, 1 for only warnings, 2 for full output with"
-        "timings and selected implementation",
-        IntParam(0),
         in_c_key=False,
     )
 
@@ -1045,26 +934,6 @@ def add_vm_configvars():
     )
 
 
-def add_deprecated_configvars():
-    # TODO: remove this? Agree
-    config.add(
-        "unittests__rseed",
-        "Seed to use for randomized unit tests. "
-        "Special value 'random' means using a seed of None.",
-        StrParam(666, validate=_good_seem_param),
-        in_c_key=False,
-    )
-
-    config.add(
-        "warn__round",
-        "Warn when using `tensor.round` with the default mode. "
-        "Round changed its default from `half_away_from_zero` to "
-        "`half_to_even` to have the same default as NumPy.",
-        BoolParam(_warn_default("0.9")),
-        in_c_key=False,
-    )
-
-
 def add_scan_configvars():
     config.add(
         "scan__allow_gc",
@@ -1077,18 +946,14 @@ def add_scan_configvars():
         "scan__allow_output_prealloc",
         "Allow/disallow memory preallocation for outputs inside of scan "
         "(default: True)",
-        BoolParam(True),
+        # Non-mutable because ScanSaveMem rewrite checks it,
+        # and we can't have the rewrite and the implementation mismatch
+        BoolParam(True, mutable=False),
         in_c_key=False,
     )
 
 
 def add_numba_configvars():
-    config.add(
-        "numba__vectorize_target",
-        ("Default target for numba.vectorize."),
-        EnumStr("cpu", ["parallel", "cuda"], mutable=True),
-        in_c_key=False,
-    )
     config.add(
         "numba__fastmath",
         ("If True, use Numba's fastmath mode."),
@@ -1101,12 +966,6 @@ def add_numba_configvars():
         BoolParam(True),
         in_c_key=False,
     )
-
-
-def _default_compiledirname() -> str:
-    formatted = config.compiledir_format % _compiledir_format_dict
-    safe = re.sub(r"[\(\)\s,]+", "_", formatted)
-    return safe
 
 
 def _filter_base_compiledir(path: str | Path) -> Path:
@@ -1181,34 +1040,49 @@ def _get_home_dir() -> Path:
     return Path(windowsfail_home)
 
 
-_compiledir_format_dict = {
-    "platform": platform.platform(),
-    "processor": platform.processor(),
-    "python_version": platform.python_version(),
-    "python_bitwidth": LOCAL_BITWIDTH,
-    "python_int_bitwidth": PYTHON_INT_BITWIDTH,
-    "pytensor_version": pytensor.__version__,
-    "numpy_version": np.__version__,
-    "gxx_version": "xxx",
-    "hostname": socket.gethostname(),
+_compiledir_format_keys = {
+    "platform",
+    "short_platform",
+    "processor",
+    "python_version",
+    "python_bitwidth",
+    "python_int_bitwidth",
+    "pytensor_version",
+    "numpy_version",
+    "gxx_version",
+    "hostname",
 }
 
 
 def _default_compiledir() -> Path:
-    return config.base_compiledir / _default_compiledirname()
+    from pytensor import __version__
+
+    compiledir_dict = {
+        "platform": platform.platform(),
+        "short_platform": short_platform(),
+        "processor": platform.processor(),
+        "python_version": platform.python_version(),
+        "python_bitwidth": LOCAL_BITWIDTH,
+        "python_int_bitwidth": PYTHON_INT_BITWIDTH,
+        "pytensor_version": __version__,
+        "numpy_version": np.__version__,
+        "gxx_version": (config.gcc_version_str.replace(" ", "_"),),
+        "hostname": platform.node(),
+    }
+    assert set(compiledir_dict) == _compiledir_format_keys
+    formatted = config.compiledir_format % compiledir_dict
+    safe = re.sub(r"[\(\)\s,]+", "_", formatted)
+
+    return config.base_compiledir / safe
+
+
+_compiledir_format_keys_str = ", ".join(sorted(_compiledir_format_keys))
+_default_compiledir_format = (
+    "compiledir_%(short_platform)s-%(processor)s-%(python_version)s-%(python_bitwidth)s"
+)
 
 
 def add_caching_dir_configvars():
-    _compiledir_format_dict["gxx_version"] = (gcc_version_str.replace(" ", "_"),)
-    _compiledir_format_dict["short_platform"] = short_platform()
-    # Allow to have easily one compiledir per device.
-    _compiledir_format_dict["device"] = config.device
-    compiledir_format_keys = ", ".join(sorted(_compiledir_format_dict))
-    _default_compiledir_format = (
-        "compiledir_%(short_platform)s-%(processor)s-"
-        "%(python_version)s-%(python_bitwidth)s"
-    )
-
     config.add(
         "compiledir_format",
         textwrap.fill(
@@ -1216,7 +1090,7 @@ def add_caching_dir_configvars():
                 f"""\
                      Format string for platform-dependent compiled
                      module subdirectory (relative to base_compiledir).
-                     Available keys: {compiledir_format_keys}. Defaults to {_default_compiledir_format}.
+                     Available keys: {_compiledir_format_keys_str}.
                  """
             )
         ),
@@ -1256,32 +1130,13 @@ config = _create_default_config()
 # The functions below register config variables into the config instance above.
 add_basic_configvars()
 add_compile_configvars()
+add_c_compile_configvars()
 add_tensor_configvars()
 add_traceback_configvars()
 add_error_and_warning_configvars()
 add_testvalue_and_checking_configvars()
 add_multiprocessing_configvars()
 add_optimizer_configvars()
-# TODO: Module-specific configs should probably be added upon import of the module.
-# This would mean either calling the function from there, or even moving all the related code there.
-# Blas-related config are a special pain-point, because their addition depends on a lot of stuff from
-# that module, which introduces a circular dependency!
-add_metaopt_configvars()
-add_deprecated_configvars()
 add_vm_configvars()
 add_numba_configvars()
-
-# TODO: `gcc_version_str` is used by other modules.. Should it become an immutable config var?
-if config.cxx != "":
-    try:
-        p_out = output_subprocess_Popen([config.cxx, "-dumpversion"])
-        gcc_version_str = p_out[0].strip().decode()
-    except OSError:
-        # Typically means gcc cannot be found.
-        gcc_version_str = "GCC_NOT_FOUND"
-else:
-    gcc_version_str = "GCC_NOT_FOUND"
-
-# TODO: The caching dir resolution is a procedural mess of helper functions, local variables
-# and config definitions. And the result is also not particularly pretty..
 add_caching_dir_configvars()

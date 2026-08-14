@@ -2,6 +2,7 @@ import itertools
 
 import numpy as np
 import pytest
+import scipy
 import scipy.special as sp
 
 import pytensor.tensor as pt
@@ -16,9 +17,8 @@ from pytensor.scalar.math import (
     betainc_grad,
     gammainc,
     gammaincc,
-    gammal,
-    gammau,
     hyp2f1,
+    psi,
 )
 from tests.link.test_link import make_function
 
@@ -82,7 +82,7 @@ def test_gammaincc_inf_c():
 def test_gammal_nan_c():
     x1 = pt.dscalar()
     x2 = pt.dscalar()
-    y = gammal(x1, x2)
+    y = pt.gammal(x1, x2)
     test_func = make_function(CLinker().accept(FunctionGraph([x1, x2], [y])))
     assert np.isnan(test_func(-1, 1))
     assert np.isnan(test_func(1, -1))
@@ -92,11 +92,31 @@ def test_gammal_nan_c():
 def test_gammau_nan_c():
     x1 = pt.dscalar()
     x2 = pt.dscalar()
-    y = gammau(x1, x2)
+    y = pt.gammau(x1, x2)
     test_func = make_function(CLinker().accept(FunctionGraph([x1, x2], [y])))
     assert np.isnan(test_func(-1, 1))
     assert np.isnan(test_func(1, -1))
     assert np.isnan(test_func(-1, -1))
+
+
+@pytest.mark.parametrize(
+    "pt_func, sp_reg_func, points",
+    [
+        (pt.gammau, sp.gammaincc, [(2, 1), (10, 1), (20, 5)]),
+        (pt.gammal, sp.gammainc, [(2, 16), (10, 80), (50, 200)]),
+    ],
+)
+def test_unregularized_gamma_c_domain(pt_func, sp_reg_func, points):
+    # Regression test for the removed upperGamma/lowerGamma C kernels, which used a
+    # single approximation method for the whole domain and returned garbage for
+    # gammau with x < k + 1 (NaN at k=2, x=1) and inaccurate gammal for x >> k
+    x1 = pt.dscalar()
+    x2 = pt.dscalar()
+    y = pt_func(x1, x2)
+    test_func = make_function(CLinker().accept(FunctionGraph([x1, x2], [y])))
+    for k, x in points:
+        expected = sp_reg_func(k, x) * sp.gamma(k)
+        np.testing.assert_allclose(test_func(k, x), expected, rtol=1e-12)
 
 
 @pytest.mark.parametrize("linker", ["py", "c"])
@@ -149,3 +169,20 @@ def test_scalarloop_grad_mixed_dtypes(op, scalar_loop_grads):
             (var.owner and isinstance(var.owner.op, ScalarLoop))
             for var in ancestors(grad)
         )
+
+
+@pytest.mark.parametrize(
+    "linker",
+    ["py", "cvm"],
+)
+def test_psi(linker):
+    x = float64("x")
+    out = psi(x)
+
+    fn = function([x], out, mode=Mode(linker=linker, optimizer="fast_run"))
+    fn.dprint()
+
+    x_test = np.float64(0.7)
+
+    np.testing.assert_allclose(fn(x_test), scipy.special.psi(x_test))
+    np.testing.assert_allclose(fn(-x_test), scipy.special.psi(-x_test))

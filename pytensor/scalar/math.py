@@ -9,8 +9,6 @@ from pathlib import Path
 from textwrap import dedent
 
 import numpy as np
-import scipy.special
-import scipy.stats
 
 from pytensor.configdefaults import config
 from pytensor.gradient import grad_not_implemented, grad_undefined
@@ -33,30 +31,36 @@ from pytensor.scalar.basic import (
     isinf,
     log,
     log1p,
+    maximum,
     reciprocal,
-    scalar_maximum,
     sqrt,
     switch,
     true_div,
     upcast,
     upgrade_to_float,
-    upgrade_to_float64,
     upgrade_to_float_no_complex,
 )
 from pytensor.scalar.basic import abs as scalar_abs
 from pytensor.scalar.loop import ScalarLoop
+from pytensor.utils import lazy_scipy_module
+
+
+# scipy.special is considerably slow to import; defer to first use
+special = lazy_scipy_module("special")
 
 
 C_CODE_PATH = Path(__file__).parent / "c_code"
 
 
 class Erf(UnaryScalarOp):
+    preserves_zero = True
+    monotonic_increasing = True
     nfunc_spec = ("scipy.special.erf", 1, 1)
 
     def impl(self, x):
-        return scipy.special.erf(x)
+        return special.erf(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -85,12 +89,13 @@ erf = Erf(upgrade_to_float, name="erf")
 
 
 class Erfc(UnaryScalarOp):
+    monotonic_decreasing = True
     nfunc_spec = ("scipy.special.erfc", 1, 1)
 
     def impl(self, x):
-        return scipy.special.erfc(x)
+        return special.erfc(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -115,7 +120,7 @@ class Erfc(UnaryScalarOp):
         return f"{z} = erfc(({cast}){x});"
 
 
-# scipy.special.erfc don't support complex. Why?
+# special.erfc don't support complex. Why?
 erfc = Erfc(upgrade_to_float_no_complex, name="erfc")
 
 
@@ -134,12 +139,13 @@ class Erfcx(UnaryScalarOp):
 
     """
 
+    monotonic_decreasing = True
     nfunc_spec = ("scipy.special.erfcx", 1, 1)
 
     def impl(self, x):
-        return scipy.special.erfcx(x)
+        return special.erfcx(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -179,6 +185,8 @@ erfcx = Erfcx(upgrade_to_float_no_complex, name="erfcx")
 
 
 class Erfinv(UnaryScalarOp):
+    preserves_zero = True
+    monotonic_increasing = True
     """
     Implements the inverse error function.
 
@@ -193,9 +201,9 @@ class Erfinv(UnaryScalarOp):
     nfunc_spec = ("scipy.special.erfinv", 1, 1)
 
     def impl(self, x):
-        return scipy.special.erfinv(x)
+        return special.erfinv(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -225,12 +233,13 @@ erfinv = Erfinv(upgrade_to_float_no_complex, name="erfinv")
 
 
 class Erfcinv(UnaryScalarOp):
+    monotonic_decreasing = True
     nfunc_spec = ("scipy.special.erfcinv", 1, 1)
 
     def impl(self, x):
-        return scipy.special.erfcinv(x)
+        return special.erfcinv(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -259,17 +268,50 @@ class Erfcinv(UnaryScalarOp):
 erfcinv = Erfcinv(upgrade_to_float_no_complex, name="erfcinv")
 
 
+class NdtriExp(UnaryScalarOp):
+    """
+    Implements the inverse of the standard normal CDF evaluated at the
+    exponent of x, `ndtri(exp(x))`, in a way that remains accurate for very
+    negative x, where `exp(x)` underflows.
+    """
+
+    monotonic_increasing = True
+    nfunc_spec = ("scipy.special.ndtri_exp", 1, 1)
+
+    def impl(self, x):
+        return special.ndtri_exp(x)
+
+    def pullback(self, inputs, outputs, grads):
+        (x,) = inputs
+        (z,) = outputs
+        (gz,) = grads
+        if x.type in complex_types:
+            raise NotImplementedError()
+        if z.type in discrete_types:
+            if x.type in discrete_types:
+                return [x.zeros_like(dtype=config.floatX)]
+            else:
+                return [x.zeros_like()]
+
+        # d/dx ndtri(exp(x)) = exp(x) / pdf(z), evaluated as sqrt(2 * pi) * exp(x + z ** 2 / 2)
+        # so that the underflowing exp(x) and the overflowing 1 / pdf(z) never appear on their own
+        cst = np.asarray(np.sqrt(2 * np.pi), dtype=gz.type.dtype)
+        return (gz * cst * exp(x + z**2 / 2),)
+
+    def c_code(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+ndtri_exp = NdtriExp(upgrade_to_float_no_complex, name="ndtri_exp")
+
+
 class Owens_t(BinaryScalarOp):
     nfunc_spec = ("scipy.special.owens_t", 2, 1)
 
-    @staticmethod
-    def st_impl(h, a):
-        return scipy.special.owens_t(h, a)
-
     def impl(self, h, a):
-        return Owens_t.st_impl(h, a)
+        return special.owens_t(h, a)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (h, a) = inputs
         (gz,) = grads
         return [
@@ -291,14 +333,10 @@ owens_t = Owens_t(upgrade_to_float, name="owens_t")
 class Gamma(UnaryScalarOp):
     nfunc_spec = ("scipy.special.gamma", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.gamma(x)
-
     def impl(self, x):
-        return Gamma.st_impl(x)
+        return special.gamma(x)
 
-    def L_op(self, inputs, outputs, gout):
+    def pullback(self, inputs, outputs, gout):
         (x,) = inputs
         (gz,) = gout
         if x.type in complex_types:
@@ -330,14 +368,10 @@ class GammaLn(UnaryScalarOp):
 
     nfunc_spec = ("scipy.special.gammaln", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.gammaln(x)
-
     def impl(self, x):
-        return GammaLn.st_impl(x)
+        return special.gammaln(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -374,14 +408,10 @@ class Psi(UnaryScalarOp):
 
     nfunc_spec = ("scipy.special.psi", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.psi(x)
-
     def impl(self, x):
-        return Psi.st_impl(x)
+        return special.psi(x)
 
-    def L_op(self, inputs, outputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         if x.type in complex_types:
@@ -403,46 +433,56 @@ class Psi(UnaryScalarOp):
             #define DEVICE
             #endif
 
-            #ifndef ga_double
-            #define ga_double double
+            #ifndef M_PI
+            #define M_PI 3.14159265358979323846
             #endif
 
             #ifndef _PSIFUNCDEFINED
             #define _PSIFUNCDEFINED
-            DEVICE double _psi(ga_double x) {
+            DEVICE double _psi(double x) {
 
-            /*taken from
-            Bernardo, J. M. (1976). Algorithm AS 103:
-            Psi (Digamma) Function. Applied Statistics. 25 (3), 315-317.
-            http://www.uv.es/~bernardo/1976AppStatist.pdf */
+                /*taken from
+                Bernardo, J. M. (1976). Algorithm AS 103:
+                Psi (Digamma) Function. Applied Statistics. 25 (3), 315-317.
+                http://www.uv.es/~bernardo/1976AppStatist.pdf
+                */
 
-            ga_double y, R, psi_ = 0;
-            ga_double S  = 1.0e-5;
-            ga_double C = 8.5;
-            ga_double S3 = 8.333333333e-2;
-            ga_double S4 = 8.333333333e-3;
-            ga_double S5 = 3.968253968e-3;
-            ga_double D1 = -0.5772156649;
+                double y, R, psi_ = 0;
+                double S  = 1.0e-5;
+                double C = 8.5;
+                double S3 = 8.333333333e-2;
+                double S4 = 8.333333333e-3;
+                double S5 = 3.968253968e-3;
+                double D1 = -0.5772156649;
 
-            y = x;
+                if (x <= 0) {
+                    // the digamma function approaches infinity from one side and -infinity from the other, around negative integers and zero
+                    if (x == floor(x)) {
+                        return INFINITY; // note that scipy returns -INF for 0 and NaN for negative integers
+                    }
 
-            if (y <= 0.0)
-               return psi_;
+                    // Use reflection formula
+                    double pi_x = M_PI * x;
+                    double cot_pi_x = cos(pi_x) / sin(pi_x);
+                    return _psi(1.0 - x) - M_PI * cot_pi_x;
+                }
 
-            if (y <= S)
-                return D1 - 1.0/y;
+                y = x;
 
-            while (y < C) {
-                psi_ = psi_ - 1.0 / y;
-                y = y + 1;
-            }
+                if (y <= S)
+                    return D1 - 1.0/y;
 
-            R = 1.0 / y;
-            psi_ = psi_ + log(y) - .5 * R ;
-            R= R*R;
-            psi_ = psi_ - R * (S3 - R * (S4 - R * S5));
+                while (y < C) {
+                    psi_ = psi_ - 1.0 / y;
+                    y = y + 1;
+                }
 
-            return psi_;
+                R = 1.0 / y;
+                psi_ = psi_ + log(y) - .5 * R ;
+                R= R*R;
+                psi_ = psi_ - R * (S3 - R * (S4 - R * S5));
+
+                return psi_;
             }
             #endif
             """
@@ -451,8 +491,8 @@ class Psi(UnaryScalarOp):
         (x,) = inp
         (z,) = out
         if node.inputs[0].type in float_types:
-            return f"""{z} =
-                _psi({x});"""
+            dtype = "npy_" + node.outputs[0].dtype
+            return f"{z} = ({dtype}) _psi({x});"
         raise NotImplementedError("only floating point is implemented")
 
 
@@ -465,14 +505,10 @@ class TriGamma(UnaryScalarOp):
 
     """
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.polygamma(1, x)
-
     def impl(self, x):
-        return TriGamma.st_impl(x)
+        return special.polygamma(1, x)
 
-    def L_op(self, inputs, outputs, outputs_gradients):
+    def pullback(self, inputs, outputs, outputs_gradients):
         (x,) = inputs
         (g_out,) = outputs_gradients
         if x in complex_types:
@@ -568,14 +604,10 @@ class PolyGamma(BinaryScalarOp):
         # Scipy doesn't support it
         return upgrade_to_float_no_complex(x_type)
 
-    @staticmethod
-    def st_impl(n, x):
-        return scipy.special.polygamma(n, x)
-
     def impl(self, n, x):
-        return PolyGamma.st_impl(n, x)
+        return special.polygamma(n, x)
 
-    def L_op(self, inputs, outputs, output_gradients):
+    def pullback(self, inputs, outputs, output_gradients):
         (n, x) = inputs
         (g_out,) = output_gradients
         if x in complex_types:
@@ -592,50 +624,6 @@ class PolyGamma(BinaryScalarOp):
 polygamma = PolyGamma(name="polygamma")
 
 
-class Chi2SF(BinaryScalarOp):
-    """
-    Compute (1 - chi2_cdf(x))
-        ie. chi2 pvalue (chi2 'survival function')
-    """
-
-    nfunc_spec = ("scipy.stats.chi2.sf", 2, 1)
-
-    @staticmethod
-    def st_impl(x, k):
-        return scipy.stats.chi2.sf(x, k)
-
-    def impl(self, x, k):
-        return Chi2SF.st_impl(x, k)
-
-    def c_support_code(self, **kwargs):
-        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
-
-    def c_code(self, node, name, inp, out, sub):
-        x, k = inp
-        (z,) = out
-        if node.inputs[0].type in float_types:
-            dtype = "npy_" + node.outputs[0].dtype
-            return f"""{z} =
-                ({dtype}) 1 - GammaP({k}/2., {x}/2.);"""
-        raise NotImplementedError("only floatingpoint is implemented")
-
-    def __eq__(self, other):
-        return type(self) is type(other)
-
-    def __hash__(self):
-        return hash(type(self))
-
-    def c_code_cache_version(self):
-        v = super().c_code_cache_version()
-        if v:
-            return (2, *v)
-        else:
-            return v
-
-
-chi2sf = Chi2SF(upgrade_to_float64, name="chi2sf")
-
-
 class GammaInc(BinaryScalarOp):
     """
     Compute the regularized lower gamma function (P).
@@ -643,14 +631,10 @@ class GammaInc(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.gammainc", 2, 1)
 
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammainc(k, x)
-
     def impl(self, k, x):
-        return GammaInc.st_impl(k, x)
+        return special.gammainc(k, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (k, x) = inputs
         (gz,) = grads
         return [
@@ -694,14 +678,10 @@ class GammaIncC(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.gammaincc", 2, 1)
 
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammaincc(k, x)
-
     def impl(self, k, x):
-        return GammaIncC.st_impl(k, x)
+        return special.gammaincc(k, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (k, x) = inputs
         (gz,) = grads
         return [
@@ -745,14 +725,10 @@ class GammaIncInv(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.gammaincinv", 2, 1)
 
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammaincinv(k, x)
-
     def impl(self, k, x):
-        return GammaIncInv.st_impl(k, x)
+        return special.gammaincinv(k, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (k, x) = inputs
         (gz,) = grads
         return [
@@ -774,14 +750,10 @@ class GammaIncCInv(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.gammainccinv", 2, 1)
 
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammainccinv(k, x)
-
     def impl(self, k, x):
-        return GammaIncCInv.st_impl(k, x)
+        return special.gammainccinv(k, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (k, x) = inputs
         (gz,) = grads
         return [
@@ -809,6 +781,11 @@ def _make_scalar_loop(n_steps, init, constant, inner_loop_fn, name, loop_op=Scal
     init = [i for i in init if i is not None]
     init_ = [i for i in init_ if i is not None]
     update_ = [u for u in update_ if u is not None]
+    # Each update is fed back as the next init, so their dtypes must match. A
+    # literal in the inner function can promote an update (e.g. a counter's
+    # `+ 1` becomes int64 under cast_policy="numpy+floatX"); cast it back. No-op
+    # when dtypes already agree.
+    update_ = [u.astype(i.type.dtype) for i, u in zip(init_, update_)]
     op = loop_op(
         init=init_,
         constant=constant_,
@@ -942,7 +919,7 @@ def gammaincc_grad(k, x, skip_loops=constant(False, dtype="bool")):
             dfac = k_minus_one_minus_n * dfac + fac
             fac *= k_minus_one_minus_n
             delta = dfac / xpow
-            return (sum_a, delta, xpow, k_minus_one_minus_n, fac, dfac), ()
+            return (sum_a, delta, xpow, k_minus_one_minus_n, fac, dfac), None
 
         init = [sum_a0, delta, xpow, k_minus_one_minus_n, fac, dfac]
         constant = [x]
@@ -1006,78 +983,6 @@ def gammaincc_grad(k, x, skip_loops=constant(False, dtype="bool")):
     )
 
 
-class GammaU(BinaryScalarOp):
-    """
-    compute the upper incomplete gamma function.
-    """
-
-    # Note there is no basic SciPy version so no nfunc_spec.
-
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammaincc(k, x) * scipy.special.gamma(k)
-
-    def impl(self, k, x):
-        return GammaU.st_impl(k, x)
-
-    def c_support_code(self, **kwargs):
-        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
-
-    def c_code(self, node, name, inp, out, sub):
-        k, x = inp
-        (z,) = out
-        if node.inputs[0].type in float_types:
-            dtype = "npy_" + node.outputs[0].dtype
-            return f"""{z} =
-                ({dtype}) upperGamma({k}, {x});"""
-        raise NotImplementedError("only floatingpoint is implemented")
-
-    def __eq__(self, other):
-        return type(self) is type(other)
-
-    def __hash__(self):
-        return hash(type(self))
-
-
-gammau = GammaU(upgrade_to_float, name="gammau")
-
-
-class GammaL(BinaryScalarOp):
-    """
-    Compute the lower incomplete gamma function.
-    """
-
-    # Note there is no basic SciPy version so no nfunc_spec.
-
-    @staticmethod
-    def st_impl(k, x):
-        return scipy.special.gammainc(k, x) * scipy.special.gamma(k)
-
-    def impl(self, k, x):
-        return GammaL.st_impl(k, x)
-
-    def c_support_code(self, **kwargs):
-        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
-
-    def c_code(self, node, name, inp, out, sub):
-        k, x = inp
-        (z,) = out
-        if node.inputs[0].type in float_types:
-            dtype = "npy_" + node.outputs[0].dtype
-            return f"""{z} =
-                ({dtype}) lowerGamma({k}, {x});"""
-        raise NotImplementedError("only floatingpoint is implemented")
-
-    def __eq__(self, other):
-        return type(self) is type(other)
-
-    def __hash__(self):
-        return hash(type(self))
-
-
-gammal = GammaL(upgrade_to_float, name="gammal")
-
-
 class Jv(BinaryScalarOp):
     """
     Bessel function of the first kind of order v (real).
@@ -1085,14 +990,10 @@ class Jv(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.jv", 2, 1)
 
-    @staticmethod
-    def st_impl(v, x):
-        return scipy.special.jv(v, x)
-
     def impl(self, v, x):
-        return self.st_impl(v, x)
+        return special.jv(v, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         v, x = inputs
         (gz,) = grads
         return [
@@ -1108,20 +1009,17 @@ jv = Jv(upgrade_to_float, name="jv")
 
 
 class J1(UnaryScalarOp):
+    preserves_zero = True
     """
     Bessel function of the first kind of order 1.
     """
 
     nfunc_spec = ("scipy.special.j1", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.j1(x)
-
     def impl(self, x):
-        return self.st_impl(x)
+        return special.j1(x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
         return [gz * (j0(x) - jv(2, x)) / 2.0]
@@ -1145,14 +1043,10 @@ class J0(UnaryScalarOp):
 
     nfunc_spec = ("scipy.special.j0", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.j0(x)
-
     def impl(self, x):
-        return self.st_impl(x)
+        return special.j0(x)
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         return [gz * -1 * j1(x)]
@@ -1169,53 +1063,22 @@ class J0(UnaryScalarOp):
 j0 = J0(upgrade_to_float, name="j0")
 
 
-class Iv(BinaryScalarOp):
-    """
-    Modified Bessel function of the first kind of order v (real).
-    """
-
-    nfunc_spec = ("scipy.special.iv", 2, 1)
-
-    @staticmethod
-    def st_impl(v, x):
-        return scipy.special.iv(v, x)
-
-    def impl(self, v, x):
-        return self.st_impl(v, x)
-
-    def grad(self, inputs, grads):
-        v, x = inputs
-        (gz,) = grads
-        return [
-            grad_not_implemented(self, 0, v),
-            gz * (iv(v - 1, x) + iv(v + 1, x)) / 2.0,
-        ]
-
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-iv = Iv(upgrade_to_float, name="iv")
-
-
 class I1(UnaryScalarOp):
+    preserves_zero = True
+    monotonic_increasing = True
     """
     Modified Bessel function of the first kind of order 1.
     """
 
     nfunc_spec = ("scipy.special.i1", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.i1(x)
-
     def impl(self, x):
-        return self.st_impl(x)
+        return special.i1(x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (x,) = inputs
         (gz,) = grads
-        return [gz * (i0(x) + iv(2, x)) / 2.0]
+        return [gz * (i0(x) + ive(2, x) * exp(abs(x))) / 2.0]
 
     def c_code(self, *args, **kwargs):
         raise NotImplementedError()
@@ -1231,14 +1094,10 @@ class I0(UnaryScalarOp):
 
     nfunc_spec = ("scipy.special.i0", 1, 1)
 
-    @staticmethod
-    def st_impl(x):
-        return scipy.special.i0(x)
-
     def impl(self, x):
-        return self.st_impl(x)
+        return special.i0(x)
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         return [gz * i1(x)]
@@ -1257,14 +1116,10 @@ class Ive(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.ive", 2, 1)
 
-    @staticmethod
-    def st_impl(v, x):
-        return scipy.special.ive(v, x)
-
     def impl(self, v, x):
-        return self.st_impl(v, x)
+        return special.ive(v, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         v, x = inputs
         (gz,) = grads
         return [
@@ -1286,14 +1141,10 @@ class Kve(BinaryScalarOp):
 
     nfunc_spec = ("scipy.special.kve", 2, 1)
 
-    @staticmethod
-    def st_impl(v, x):
-        return scipy.special.kve(v, x)
-
     def impl(self, v, x):
-        return self.st_impl(v, x)
+        return special.kve(v, x)
 
-    def L_op(self, inputs, outputs, output_grads):
+    def pullback(self, inputs, outputs, output_grads):
         v, x = inputs
         [kve_vx] = outputs
         [g_out] = output_grads
@@ -1318,12 +1169,13 @@ class Sigmoid(UnaryScalarOp):
     Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit
     """
 
+    monotonic_increasing = True
     nfunc_spec = ("scipy.special.expit", 1, 1)
 
     def impl(self, x):
-        return scipy.special.expit(x)
+        return special.expit(x)
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         y = sigmoid(x)
@@ -1372,11 +1224,13 @@ class Softplus(UnaryScalarOp):
         "Accurately computing `\log(1-\exp(- \mid a \mid))` Assessed by the Rmpfr package"
     """
 
-    @staticmethod
-    def static_impl(x):
+    monotonic_increasing = True
+
+    def impl(self, x):
         # If x is an int8 or uint8, numpy.exp will compute the result in
         # half-precision (float16), where we want float32.
-        not_int8 = str(getattr(x, "dtype", "")) not in ("int8", "uint8")
+        x_dtype = getattr(x, "dtype", None)
+        not_int8 = x_dtype is None or x_dtype.itemsize > 1
         if x < -37.0:
             return np.exp(x) if not_int8 else np.exp(x, signature="f")
         elif x < 18.0:
@@ -1384,14 +1238,14 @@ class Softplus(UnaryScalarOp):
                 np.log1p(np.exp(x)) if not_int8 else np.log1p(np.exp(x, signature="f"))
             )
         elif x < 33.3:
+            if x_dtype is not None and x_dtype.kind == "u":
+                # Negate uint will not do what we want
+                x = x.astype("float32" if x_dtype.itemsize <= 2 else "float64")
             return x + np.exp(-x) if not_int8 else x + np.exp(-x, signature="f")
         else:
             return x
 
-    def impl(self, x):
-        return Softplus.static_impl(x)
-
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         return [gz * sigmoid(x)]
@@ -1435,7 +1289,7 @@ class Softplus(UnaryScalarOp):
             return v
 
 
-softplus = Softplus(upgrade_to_float, name="scalar_softplus")
+softplus = Softplus(upgrade_to_float)
 
 
 class Log1mexp(UnaryScalarOp):
@@ -1453,17 +1307,15 @@ class Log1mexp(UnaryScalarOp):
         "Accurately computing `\log(1-\exp(- \mid a \mid))` Assessed by the Rmpfr package"
     """
 
-    @staticmethod
-    def static_impl(x):
+    monotonic_decreasing = True
+
+    def impl(self, x):
         if x < np.log(0.5):
             return np.log1p(-np.exp(x))
         else:
             return np.log(-np.expm1(x))
 
-    def impl(self, x):
-        return Log1mexp.static_impl(x)
-
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         res = true_div(-1.0, expm1(-x))
@@ -1484,7 +1336,7 @@ class Log1mexp(UnaryScalarOp):
             raise NotImplementedError("only floating point is implemented")
 
 
-log1mexp = Log1mexp(upgrade_to_float, name="scalar_log1mexp")
+log1mexp = Log1mexp(upgrade_to_float)
 
 
 class BetaInc(ScalarOp):
@@ -1496,9 +1348,9 @@ class BetaInc(ScalarOp):
     nfunc_spec = ("scipy.special.betainc", 3, 1)
 
     def impl(self, a, b, x):
-        return scipy.special.betainc(a, b, x)
+        return special.betainc(a, b, x)
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         a, b, x = inp
         (gz,) = grads
 
@@ -1709,9 +1561,7 @@ def betainc_grad(p, q, x, wrtp: bool):
             derivative_new = K * (F1 * dK + F2)
 
             errapx = scalar_abs(derivative - derivative_new)
-            d_errapx = errapx / scalar_maximum(
-                err_threshold, scalar_abs(derivative_new)
-            )
+            d_errapx = errapx / maximum(err_threshold, scalar_abs(derivative_new))
 
             min_iters_cond = n > (min_iters - 1)
             derivative = switch(
@@ -1756,9 +1606,9 @@ class BetaIncInv(ScalarOp):
     nfunc_spec = ("scipy.special.betaincinv", 3, 1)
 
     def impl(self, a, b, x):
-        return scipy.special.betaincinv(a, b, x)
+        return special.betaincinv(a, b, x)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         (a, b, x) = inputs
         (gz,) = grads
         return [
@@ -1794,14 +1644,10 @@ class Hyp2F1(ScalarOp):
     nin = 4
     nfunc_spec = ("scipy.special.hyp2f1", 4, 1)
 
-    @staticmethod
-    def st_impl(a, b, c, z):
-        return scipy.special.hyp2f1(a, b, c, z)
-
     def impl(self, a, b, c, z):
-        return Hyp2F1.st_impl(a, b, c, z)
+        return special.hyp2f1(a, b, c, z)
 
-    def grad(self, inputs, grads):
+    def pullback(self, inputs, outputs, grads):
         a, b, c, z = inputs
         (gz,) = grads
         grad_a, grad_b, grad_c = hyp2f1_grad(a, b, c, z, wrt=[0, 1, 2])
@@ -1961,7 +1807,7 @@ def _grad_2f1_loop(a, b, c, z, *, skip_loop, wrt, dtype):
         if len(grad_incs) == 1:
             [max_abs_grad_inc] = grad_incs
         else:
-            max_abs_grad_inc = reduce(scalar_maximum, abs_grad_incs)
+            max_abs_grad_inc = reduce(maximum, abs_grad_incs)
 
         return (
             (*grads, *log_gs, *log_gs_signs, log_t, log_t_sign, sign_zk, k),
@@ -2010,7 +1856,7 @@ def hyp2f1_grad(a, b, c, z, wrt: tuple[int, ...]):
     # We have to pass the converges flag to interrupt the loop, as the switch is not lazy
     z_is_zero = eq(z, 0)
     converges = check_2f1_converges(a, b, c, z)
-    *grads, grad_converges = _grad_2f1_loop(
+    *grads, _grad_converges = _grad_2f1_loop(
         a, b, c, z, skip_loop=z_is_zero | (~converges), wrt=wrt, dtype=dtype
     )
 

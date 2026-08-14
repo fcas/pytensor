@@ -3,7 +3,8 @@ import re
 import numpy as np
 import pytest
 
-from pytensor import Mode, function
+from pytensor import In, Mode, config, function
+from pytensor.compile import get_default_mode
 from pytensor.scalar import (
     Composite,
     as_scalar,
@@ -17,7 +18,10 @@ from pytensor.scalar import (
     sin,
 )
 from pytensor.scalar.loop import ScalarLoop
+from pytensor.scalar.math import _make_scalar_loop
 from pytensor.tensor import exp as tensor_exp
+from pytensor.tensor import lvector
+from pytensor.tensor.elemwise import Elemwise
 
 
 mode = pytest.mark.parametrize(
@@ -86,7 +90,7 @@ def test_input_not_aliased_to_update(mode):
         return [x, y]
 
     op = ScalarLoop(init=[x0, y0], constant=[const], update=update(x0, y0))
-    x, y = op(n_steps, x0, y0, const)
+    _x, y = op(n_steps, x0, y0, const)
 
     fn = function([n_steps, x0, y0, const], y, mode=mode)
     np.testing.assert_allclose(fn(n_steps=1, x0=0, y0=0, const=1), 0.0)
@@ -126,6 +130,24 @@ def test_init_update_type_error():
     assert x.type.dtype == "float64"
     with pytest.raises(TypeError, match="Init and update types must be the same"):
         ScalarLoop(init=[x0], constant=[const], update=[x])
+
+
+@pytest.mark.parametrize("cast_policy", ["custom", "numpy+floatX"])
+def test_make_scalar_loop_promoting_update(cast_policy):
+    # A counter's `+ 1` promotes to int64 under cast_policy="numpy+floatX". The
+    # update is fed back as the next init, so _make_scalar_loop must cast it back
+    # to the init dtype to keep the loop well-typed.
+    n_steps = int64("n_steps")
+
+    def inner(n):
+        return [n + 1], None
+
+    with config.change_flags(cast_policy=cast_policy):
+        out = _make_scalar_loop(
+            n_steps, [np.array(0, dtype="int32")], [], inner, name="count"
+        )
+    assert out.type.dtype == "int32"
+    assert function([n_steps], out)(n_steps=5) == 5
 
 
 def test_rebuild_dtype():
@@ -255,3 +277,62 @@ def test_inner_loop(mode):
         out16,
         3**2 + 2.5,
     )
+
+
+@pytest.mark.parametrize("mutate_arg_idx", (0, 1, 2, 3))
+def test_elemwise_inplace(mutate_arg_idx):
+    x0 = int64("x0")
+    y0 = int64("y0")
+    c = int64("c")
+    x = x0 - y0 + c
+    y = y0 - x0 + c
+    op = Elemwise(ScalarLoop(init=[x0, y0], constant=[c], update=[x, y]))
+
+    n_steps = lvector("n_steps")
+    x0v = lvector("x0")
+    y0v = lvector("y0")
+    cv = lvector("c")
+    xv, yv = op(n_steps, x0v, y0v, cv)
+
+    inputs = [
+        In(inp, mutable=i == mutate_arg_idx)
+        for i, inp in enumerate([n_steps, x0v, y0v, cv])
+    ]
+
+    fn = function(
+        inputs,
+        [xv, yv],
+        mode=get_default_mode().including("inplace"),
+    )
+    fn.dprint()
+    elem_op = fn.maker.fgraph.outputs[0].owner.op
+    assert isinstance(elem_op, Elemwise) and isinstance(elem_op.scalar_op, ScalarLoop)
+    destroy_map = elem_op.destroy_map
+    assert destroy_map == {0: [mutate_arg_idx]}
+
+    n_test = np.array([1, 4, 8], dtype="int64")
+    x0v_test = np.array([0, 0, 0], dtype="int64")
+    y0v_test = np.array([1, 1, 1], dtype="int64")
+    cv_test = np.array([0, 0, 0], dtype="int64")
+
+    xv_res, yv_res = fn(n_test, x0v_test, y0v_test, cv_test)
+    assert xv_res is (n_test, x0v_test, y0v_test, cv_test)[mutate_arg_idx]
+    np.testing.assert_allclose(xv_res, [-1, -8, -128])
+    np.testing.assert_allclose(yv_res, [1, 8, 128])
+
+
+def test_identical_loops_share_inner_graph():
+    x0 = float64("x0")
+    c = float64("c")
+
+    op1 = ScalarLoop(init=[x0], constant=[c], update=[x0 + c])
+    op2 = ScalarLoop(init=[x0], constant=[c], update=[x0 + c])
+
+    assert op1 == op2
+    assert hash(op1) == hash(op2)
+    assert op1.fgraph == op2.fgraph
+
+    # Structurally identical inner graphs are globally interned via FrozenApply,
+    # so the two distinct op wrappers share the very same inner-graph nodes (the
+    # heavy state) at construction -- no compilation or canonicalization needed.
+    assert op1.fgraph.outputs[0].owner is op2.fgraph.outputs[0].owner

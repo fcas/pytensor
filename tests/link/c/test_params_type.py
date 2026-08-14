@@ -77,18 +77,18 @@ class QuadraticOpFunc(COp):
         Y = outputs[0]
         float_type = node.inputs[0].type.c_element_type()
         return f"""
-        {float_type} a = ({float_type}) (*(npy_float64*) PyArray_GETPTR1({sub['params']}->a, 0)); // 0-D TensorType.
-        {float_type} b =                                                   {sub['params']}->b;      // ScalarType.
-        {float_type} c =                 ({float_type}) PyFloat_AsDouble({sub['params']}->c);     // Generic.
+        {float_type} a = ({float_type}) (*(npy_float64*) PyArray_GETPTR1({sub["params"]}->a, 0)); // 0-D TensorType.
+        {float_type} b =                                                   {sub["params"]}->b;      // ScalarType.
+        {float_type} c =                 ({float_type}) PyFloat_AsDouble({sub["params"]}->c);     // Generic.
         Py_XDECREF({Y});
         {Y} = (PyArrayObject*)PyArray_EMPTY(PyArray_NDIM({X}), PyArray_DIMS({X}), PyArray_TYPE({X}), PyArray_IS_F_CONTIGUOUS({X}));
         if (PyArray_CopyInto({Y}, {X}) != 0) {{
             PyErr_SetString(PyExc_RuntimeError, "Unable to copy input into output.");
-            {sub['fail']}
+            {sub["fail"]}
         }};
         if (quadratic_{name}({Y}, a, b, c) != 0) {{
             PyErr_SetString(PyExc_RuntimeError, "Unable to compute quadratic function.");
-            {sub['fail']}
+            {sub["fail"]}
         }}
         """
 
@@ -338,9 +338,10 @@ class TestParamsType:
         a, b, c = 2, 3, -7
         x = matrix(dtype="float64")
         y1 = QuadraticOpFunc(a, b, c)(x)
-        y2 = QuadraticCOpFunc(a, b, c)(x)
-        f1 = pytensor.function([x], y1)
-        f2 = pytensor.function([x], y2)
+        with pytest.warns(FutureWarning, match="ExternalCOp is deprecated"):
+            y2 = QuadraticCOpFunc(a, b, c)(x)
+        f1 = pytensor.function([x], y1, mode="CVM")
+        f2 = pytensor.function([x], y2, mode="CVM")
         shape = (100, 100)
         vx = (
             np.random.normal(size=shape[0] * shape[1]).astype("float64").reshape(*shape)

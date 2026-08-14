@@ -1,22 +1,24 @@
 import math
+from hashlib import sha256
 
+import numba
 import numpy as np
+from numba.core import types
+from numba.core.extending import get_cython_function_address
 
-from pytensor import config
-from pytensor.compile.ops import ViewOp
 from pytensor.graph.basic import Variable
+from pytensor.link.numba.cache import _call_cached_ptr, compile_numba_function_src
 from pytensor.link.numba.dispatch import basic as numba_basic
 from pytensor.link.numba.dispatch.basic import (
-    create_numba_signature,
     generate_fallback_impl,
-    numba_funcify,
+    numba_funcify_and_cache_key,
+    register_funcify_and_cache_key,
 )
 from pytensor.link.numba.dispatch.cython_support import wrap_cython_function
 from pytensor.link.utils import (
-    compile_function_src,
     get_name_for_object,
-    unique_name_generator,
 )
+from pytensor.scalar import ScalarLoop
 from pytensor.scalar.basic import (
     Add,
     Cast,
@@ -24,21 +26,25 @@ from pytensor.scalar.basic import (
     Composite,
     Identity,
     Mul,
+    Pow,
     Reciprocal,
     ScalarOp,
     Second,
     Switch,
 )
-from pytensor.scalar.math import Erf, Erfc, GammaLn, Log1mexp, Sigmoid
+from pytensor.scalar.math import Erf, Erfc, GammaLn, Log1mexp, Sigmoid, Softplus
 
 
-@numba_funcify.register(ScalarOp)
+def scalar_op_cache_key(op, **extra_fields):
+    # Scalar Ops don't have _props, because of their weird outputs_types_preference function
+    # So we create hash differently
+    return sha256(str((type(op), tuple(extra_fields.items()))).encode()).hexdigest()
+
+
+@register_funcify_and_cache_key(ScalarOp)
 def numba_funcify_ScalarOp(op, node, **kwargs):
-    # TODO: Do we need to cache these functions so that we don't end up
-    # compiling the same Numba function over and over again?
-
     if not hasattr(op, "nfunc_spec"):
-        return generate_fallback_impl(op, node, **kwargs)
+        return generate_fallback_impl(op, node=node, **kwargs), None
 
     scalar_func_path = op.nfunc_spec[0]
     scalar_func_numba = None
@@ -60,6 +66,7 @@ def numba_funcify_ScalarOp(op, node, **kwargs):
     output_inner_dtype = None
 
     # Cython functions might have an additional argument
+    cython_func = None
     has_pyx_skip_dispatch = False
 
     if scalar_func_path.startswith("scipy.special"):
@@ -67,34 +74,63 @@ def numba_funcify_ScalarOp(op, node, **kwargs):
 
         cython_func = getattr(scipy.special.cython_special, scalar_func_name, None)
         if cython_func is not None:
-            scalar_func_numba = wrap_cython_function(
-                cython_func, output_dtype, input_dtypes
-            )
-            has_pyx_skip_dispatch = scalar_func_numba.has_pyx_skip_dispatch
-            input_inner_dtypes = scalar_func_numba.numpy_arg_dtypes()
-            output_inner_dtype = scalar_func_numba.numpy_output_dtype()
+            try:
+                scalar_func_numba = wrap_cython_function(
+                    cython_func, output_dtype, input_dtypes
+                )
+            except NotImplementedError:
+                pass
+            else:
+                has_pyx_skip_dispatch = scalar_func_numba.has_pyx_skip_dispatch()
+                input_inner_dtypes = scalar_func_numba.input_dtypes
+                output_inner_dtype = scalar_func_numba.output_dtype
 
     if scalar_func_numba is None:
-        scalar_func_numba = generate_fallback_impl(op, node, **kwargs)
+        return generate_fallback_impl(op, node, **kwargs), None
 
     scalar_op_fn_name = get_name_for_object(scalar_func_numba)
+    prefix = "x" if scalar_func_name != "x" else "y"
+    input_names = [f"{prefix}{i}" for i in range(len(node.inputs))]
+    input_signature = ", ".join(input_names)
 
-    global_env = {"scalar_func_numba": scalar_func_numba}
+    if cython_func is not None:
+        # Resolve the cython function pointer at call time, caching it in a module global keyed
+        # by `unique_func_name` to make ops backed by `scipy.special.cython_special` cacheable.
+        module_name = scalar_func_numba.module_name
+        capi_name = scalar_func_numba.capi_name
+        unique_func_name = f"{module_name}.{capi_name}"
+        func_type_ref = types.FunctionType(scalar_func_numba.signature())
+
+        @numba_basic.numba_njit
+        def get_ptr_func():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_cython_function_address(module_name, capi_name)
+            return ptr
+
+        global_env = {
+            "_call_cached_ptr": _call_cached_ptr,
+            "get_ptr_func": get_ptr_func,
+            "func_type_ref": func_type_ref,
+            "unique_func_name": unique_func_name,
+        }
+        scalar_func_setup = (
+            "    scalar_func_numba = "
+            "_call_cached_ptr(get_ptr_func, func_type_ref, unique_func_name)\n"
+        )
+    else:
+        global_env = {"scalar_func_numba": scalar_func_numba}
+        scalar_func_setup = ""
 
     if input_inner_dtypes is None and output_inner_dtype is None:
-        unique_names = unique_name_generator(
-            [scalar_op_fn_name, "scalar_func_numba"], suffix_sep="_"
-        )
-        input_names = ", ".join(unique_names(v, force_unique=True) for v in node.inputs)
         if not has_pyx_skip_dispatch:
             scalar_op_src = f"""
-def {scalar_op_fn_name}({input_names}):
-    return scalar_func_numba({input_names})
+def {scalar_op_fn_name}({input_signature}):
+{scalar_func_setup}    return scalar_func_numba({input_signature})
             """
         else:
             scalar_op_src = f"""
-def {scalar_op_fn_name}({input_names}):
-    return scalar_func_numba({input_names}, np.intc(1))
+def {scalar_op_fn_name}({input_signature}):
+{scalar_func_setup}    return scalar_func_numba({input_signature}, np.intc(1))
             """
 
     else:
@@ -105,13 +141,6 @@ def {scalar_op_fn_name}({input_names}):
             for i, i_dtype in enumerate(input_inner_dtypes)
         }
         global_env.update(input_tmp_dtype_names)
-
-        unique_names = unique_name_generator(
-            [scalar_op_fn_name, "scalar_func_numba", *global_env.keys()],
-            suffix_sep="_",
-        )
-
-        input_names = [unique_names(v, force_unique=True) for v in node.inputs]
         converted_call_args = ", ".join(
             f"direct_cast({i_name}, {i_tmp_dtype_name})"
             for i_name, i_tmp_dtype_name in zip(
@@ -120,46 +149,50 @@ def {scalar_op_fn_name}({input_names}):
         )
         if not has_pyx_skip_dispatch:
             scalar_op_src = f"""
-def {scalar_op_fn_name}({', '.join(input_names)}):
-    return direct_cast(scalar_func_numba({converted_call_args}), output_dtype)
+def {scalar_op_fn_name}({input_signature}):
+{scalar_func_setup}    return direct_cast(scalar_func_numba({converted_call_args}), output_dtype)
             """
         else:
             scalar_op_src = f"""
-def {scalar_op_fn_name}({', '.join(input_names)}):
-    return direct_cast(scalar_func_numba({converted_call_args}, np.intc(1)), output_dtype)
+def {scalar_op_fn_name}({input_signature}):
+{scalar_func_setup}    return direct_cast(scalar_func_numba({converted_call_args}, np.intc(1)), output_dtype)
             """
 
-    scalar_op_fn = compile_function_src(
-        scalar_op_src, scalar_op_fn_name, {**globals(), **global_env}
+    scalar_op_fn = compile_numba_function_src(
+        scalar_op_src,
+        scalar_op_fn_name,
+        globals() | global_env,
     )
 
-    signature = create_numba_signature(node, force_scalar=True)
-
-    return numba_basic.numba_njit(
-        signature,
-        fastmath=config.numba__fastmath,
-        # Functions that call a function pointer can't be cached
-        cache=False,
-    )(scalar_op_fn)
-
-
-@numba_basic.numba_njit
-def switch(condition, x, y):
-    if condition:
-        return x
+    if cython_func is not None:
+        cache_key = scalar_op_cache_key(
+            op,
+            cython_capi=unique_func_name,
+            input_inner_dtypes=tuple(str(d) for d in input_inner_dtypes),
+            output_inner_dtype=str(output_inner_dtype),
+            has_pyx_skip_dispatch=has_pyx_skip_dispatch,
+        )
     else:
-        return y
+        cache_key = scalar_op_cache_key(op)
+    return numba_basic.numba_njit(scalar_op_fn), cache_key
 
 
-@numba_funcify.register(Switch)
+@register_funcify_and_cache_key(Switch)
 def numba_funcify_Switch(op, node, **kwargs):
-    return numba_basic.global_numba_func(switch)
+    @numba_basic.numba_njit
+    def switch(condition, x, y):
+        if condition:
+            return x
+        else:
+            return y
+
+    return switch, scalar_op_cache_key(op)
 
 
 def binary_to_nary_func(inputs: list[Variable], binary_op_name: str, binary_op: str):
     """Create a Numba-compatible N-ary function from a binary function."""
-    unique_names = unique_name_generator(["binary_op_name"], suffix_sep="_")
-    input_names = [unique_names(v, force_unique=True) for v in inputs]
+    var_prefix = "x" if binary_op_name != "x" else "y"
+    input_names = [f"{var_prefix}{i}" for i in range(len(inputs))]
     input_signature = ", ".join(input_names)
     output_expr = binary_op.join(input_names)
 
@@ -167,32 +200,42 @@ def binary_to_nary_func(inputs: list[Variable], binary_op_name: str, binary_op: 
 def {binary_op_name}({input_signature}):
     return {output_expr}
     """
-    nary_fn = compile_function_src(nary_src, binary_op_name, globals())
+    nary_fn = compile_numba_function_src(nary_src, binary_op_name, globals())
 
     return nary_fn
 
 
-@numba_funcify.register(Add)
+@register_funcify_and_cache_key(Pow)
+def numba_funcify_Pow(op, node, **kwargs):
+    pow_dtype = node.inputs[1].type.dtype
+
+    def pow(x, y):
+        return x**y
+
+    # Numba power fails when exponents are discrete integers and fasthmath=True
+    # https://github.com/numba/numba/issues/9554
+    fastmath = False if np.dtype(pow_dtype).kind in "ibu" else None
+
+    return numba_basic.numba_njit(pow, fastmath=fastmath), scalar_op_cache_key(
+        op, cache_version=1
+    )
+
+
+@register_funcify_and_cache_key(Add)
 def numba_funcify_Add(op, node, **kwargs):
-    signature = create_numba_signature(node, force_scalar=True)
     nary_add_fn = binary_to_nary_func(node.inputs, "add", "+")
 
-    return numba_basic.numba_njit(signature, fastmath=config.numba__fastmath)(
-        nary_add_fn
-    )
+    return numba_basic.numba_njit(nary_add_fn), scalar_op_cache_key(op)
 
 
-@numba_funcify.register(Mul)
+@register_funcify_and_cache_key(Mul)
 def numba_funcify_Mul(op, node, **kwargs):
-    signature = create_numba_signature(node, force_scalar=True)
-    nary_add_fn = binary_to_nary_func(node.inputs, "mul", "*")
+    nary_mul_fn = binary_to_nary_func(node.inputs, "mul", "*")
 
-    return numba_basic.numba_njit(signature, fastmath=config.numba__fastmath)(
-        nary_add_fn
-    )
+    return numba_basic.numba_njit(nary_mul_fn), scalar_op_cache_key(op)
 
 
-@numba_funcify.register(Cast)
+@register_funcify_and_cache_key(Cast)
 def numba_funcify_Cast(op, node, **kwargs):
     dtype = np.dtype(op.o_type.dtype)
 
@@ -200,121 +243,210 @@ def numba_funcify_Cast(op, node, **kwargs):
     def cast(x):
         return numba_basic.direct_cast(x, dtype)
 
-    return cast
+    return cast, sha256(str((type(op), op.o_type.dtype)).encode()).hexdigest()
 
 
-@numba_basic.numba_njit
-def viewop(x):
-    return x
-
-
-@numba_funcify.register(Identity)
-@numba_funcify.register(ViewOp)
-def numba_funcify_ViewOp(op, **kwargs):
-    return numba_basic.global_numba_func(viewop)
-
-
-@numba_basic.numba_njit
-def clip(_x, _min, _max):
-    x = numba_basic.to_scalar(_x)
-    _min_scalar = numba_basic.to_scalar(_min)
-    _max_scalar = numba_basic.to_scalar(_max)
-
-    if x < _min_scalar:
-        return _min_scalar
-    elif x > _max_scalar:
-        return _max_scalar
-    else:
+@register_funcify_and_cache_key(Identity)
+def numba_funcify_type_casting(op, **kwargs):
+    @numba_basic.numba_njit
+    def identity(x):
         return x
 
+    return identity, scalar_op_cache_key(op)
 
-@numba_funcify.register(Clip)
+
+@register_funcify_and_cache_key(Clip)
 def numba_funcify_Clip(op, **kwargs):
-    return numba_basic.global_numba_func(clip)
+    @numba_basic.numba_njit
+    def clip(x, min_val, max_val):
+        if x < min_val:
+            return min_val
+        elif x > max_val:
+            return max_val
+        else:
+            return x
+
+    return clip, scalar_op_cache_key(op)
 
 
-@numba_funcify.register(Composite)
+@register_funcify_and_cache_key(Composite)
 def numba_funcify_Composite(op, node, **kwargs):
-    signature = create_numba_signature(op.fgraph, force_scalar=True)
-
     _ = kwargs.pop("storage_map", None)
 
-    composite_fn = numba_basic.numba_njit(signature, fastmath=config.numba__fastmath)(
-        numba_funcify(op.fgraph, squeeze_output=True, **kwargs)
+    composite_fn, fgraph_key = numba_funcify_and_cache_key(
+        op.fgraph, squeeze_output=True, fgraph_name="numba_composite", **kwargs
     )
-    return composite_fn
-
-
-@numba_basic.numba_njit
-def second(x, y):
-    return y
-
-
-@numba_funcify.register(Second)
-def numba_funcify_Second(op, node, **kwargs):
-    return numba_basic.global_numba_func(second)
-
-
-@numba_basic.numba_njit
-def reciprocal(x):
-    # TODO FIXME: This isn't really the behavior or `numpy.reciprocal` when
-    # `x` is an `int`
-    return 1 / x
-
-
-@numba_funcify.register(Reciprocal)
-def numba_funcify_Reciprocal(op, node, **kwargs):
-    return numba_basic.global_numba_func(reciprocal)
-
-
-@numba_basic.numba_njit(fastmath=config.numba__fastmath)
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-
-@numba_funcify.register(Sigmoid)
-def numba_funcify_Sigmoid(op, node, **kwargs):
-    return numba_basic.global_numba_func(sigmoid)
-
-
-@numba_basic.numba_njit(fastmath=config.numba__fastmath)
-def gammaln(x):
-    return math.lgamma(x)
-
-
-@numba_funcify.register(GammaLn)
-def numba_funcify_GammaLn(op, node, **kwargs):
-    return numba_basic.global_numba_func(gammaln)
-
-
-@numba_basic.numba_njit(fastmath=config.numba__fastmath)
-def logp1mexp(x):
-    if x < np.log(0.5):
-        return np.log1p(-np.exp(x))
+    if fgraph_key is None:
+        composite_key = None
     else:
-        return np.log(-np.expm1(x))
+        composite_key = sha256(str((type(op), fgraph_key)).encode()).hexdigest()
+    return composite_fn, composite_key
 
 
-@numba_funcify.register(Log1mexp)
+@register_funcify_and_cache_key(Second)
+def numba_funcify_Second(op, node, **kwargs):
+    @numba_basic.numba_njit
+    def second(x, y):
+        return y
+
+    return second, scalar_op_cache_key(op)
+
+
+@register_funcify_and_cache_key(Reciprocal)
+def numba_funcify_Reciprocal(op, node, **kwargs):
+    @numba_basic.numba_njit
+    def reciprocal(x):
+        # This is how the C-backend implementation works
+        return np.divide(np.float32(1.0), x)
+
+    return reciprocal, scalar_op_cache_key(op, cache_version=1)
+
+
+@register_funcify_and_cache_key(Sigmoid)
+def numba_funcify_Sigmoid(op, node, **kwargs):
+    inp_dtype = node.inputs[0].type.dtype
+    if inp_dtype.startswith("uint"):
+        upcast_uint_dtype = {
+            "uint8": np.float32,  # numpy uses float16, but not Numba
+            "uint16": np.float32,
+            "uint32": np.float64,
+            "uint64": np.float64,
+        }[inp_dtype]
+
+        @numba_basic.numba_njit
+        def sigmoid(x):
+            # Can't negate uint
+            float_x = numba_basic.direct_cast(x, upcast_uint_dtype)
+            return 1 / (1 + np.exp(-float_x))
+
+    else:
+
+        @numba_basic.numba_njit
+        def sigmoid(x):
+            return 1 / (1 + np.exp(-x))
+
+    return sigmoid, scalar_op_cache_key(op, cache_version=1)
+
+
+@register_funcify_and_cache_key(GammaLn)
+def numba_funcify_GammaLn(op, node, **kwargs):
+    @numba_basic.numba_njit
+    def gammaln(x):
+        return math.lgamma(x)
+
+    return gammaln, scalar_op_cache_key(op)
+
+
+@register_funcify_and_cache_key(Log1mexp)
 def numba_funcify_Log1mexp(op, node, **kwargs):
-    return numba_basic.global_numba_func(logp1mexp)
+    @numba_basic.numba_njit
+    def logp1mexp(x):
+        if x < np.log(0.5):
+            return np.log1p(-np.exp(x))
+        else:
+            return np.log(-np.expm1(x))
+
+    return logp1mexp, scalar_op_cache_key(op)
 
 
-@numba_basic.numba_njit(fastmath=config.numba__fastmath)
-def erf(x):
-    return math.erf(x)
+@register_funcify_and_cache_key(Erf)
+def numba_funcify_Erf(op, node, **kwargs):
+    if node.inputs[0].type.dtype.startswith("complex"):
+        # Complex not supported by numba
+        return numba_funcify_ScalarOp(op, node=node, **kwargs)
+
+    @numba_basic.numba_njit
+    def erf(x):
+        return math.erf(x)
+
+    return erf, scalar_op_cache_key(op)
 
 
-@numba_funcify.register(Erf)
-def numba_funcify_Erf(op, **kwargs):
-    return numba_basic.global_numba_func(erf)
-
-
-@numba_basic.numba_njit(fastmath=config.numba__fastmath)
-def erfc(x):
-    return math.erfc(x)
-
-
-@numba_funcify.register(Erfc)
+@register_funcify_and_cache_key(Erfc)
 def numba_funcify_Erfc(op, **kwargs):
-    return numba_basic.global_numba_func(erfc)
+    @numba_basic.numba_njit
+    def erfc(x):
+        return math.erfc(x)
+
+    return erfc, scalar_op_cache_key(op)
+
+
+@register_funcify_and_cache_key(Softplus)
+def numba_funcify_Softplus(op, node, **kwargs):
+    inp_dtype = node.inputs[0].type.dtype
+    if inp_dtype.startswith("uint"):
+        upcast_uint_dtype = {
+            "uint8": np.float32,  # numpy uses float16, but not Numba
+            "uint16": np.float32,
+            "uint32": np.float64,
+            "uint64": np.float64,
+        }[inp_dtype]
+    else:
+        upcast_uint_dtype = None
+    out_dtype = np.dtype(node.outputs[0].type.dtype)
+
+    @numba_basic.numba_njit
+    def softplus(x):
+        if x < -37.0:
+            value = np.exp(x)
+        elif x < 18.0:
+            value = np.log1p(np.exp(x))
+        elif x < 33.3:
+            if upcast_uint_dtype is not None:
+                # Can't negate uint
+                x = numba_basic.direct_cast(x, upcast_uint_dtype)
+            value = x + np.exp(-x)
+        else:
+            value = x
+        return numba_basic.direct_cast(value, out_dtype)
+
+    return softplus, scalar_op_cache_key(op, cache_version=1)
+
+
+@register_funcify_and_cache_key(ScalarLoop)
+def numba_funcify_ScalarLoop(op, node, **kwargs):
+    inner_fn, inner_fn_cache_key = numba_funcify_and_cache_key(op.fgraph)
+    if inner_fn_cache_key is None:
+        loop_cache_key = None
+    else:
+        loop_cache_key = sha256(
+            str((type(op), op.is_while, inner_fn_cache_key)).encode()
+        ).hexdigest()
+
+    if op.is_while:
+        n_update = len(op.outputs) - 1
+
+        @numba_basic.numba_njit
+        def while_loop(n_steps, *inputs):
+            carry, constant = inputs[:n_update], inputs[n_update:]
+
+            until = False
+            for i in range(n_steps):
+                outputs = inner_fn(*carry, *constant)
+                carry, until = outputs[:-1], outputs[-1]
+                if until:
+                    break
+
+            return *carry, until
+
+        return while_loop, loop_cache_key
+
+    else:
+        n_update = len(op.outputs)
+
+        @numba_basic.numba_njit
+        def for_loop(n_steps, *inputs):
+            carry, constant = inputs[:n_update], inputs[n_update:]
+
+            if n_steps < 0:
+                raise ValueError("ScalarLoop does not have a termination condition.")
+
+            for i in range(n_steps):
+                carry = inner_fn(*carry, *constant)
+
+            if n_update == 1:
+                return carry[0]
+            else:
+                return carry
+
+        return for_loop, loop_cache_key

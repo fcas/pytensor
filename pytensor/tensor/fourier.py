@@ -89,18 +89,23 @@ class Fourier(Op):
                 raise TypeError(
                     "Length of the transformed axis must be a strictly positive scalar"
                 )
+        # The transformed axis is resized to `n`; the other axes keep `a`'s
+        # static sizes. Both are only known when `axis` and `n` are constant.
+        n_static = n.data.item() if isinstance(n, TensorConstant) else None
+        if isinstance(axis, TensorConstant):
+            axis_val = axis.data.item()
+            out_shape = tuple(
+                n_static if i == axis_val else s for i, s in enumerate(a.type.shape)
+            )
+        else:
+            out_shape = (None,) * a.ndim
         return Apply(
             self,
             [a, n, axis],
-            [
-                TensorType(
-                    "complex128",
-                    shape=tuple(1 if s == 1 else None for s in a.type.shape),
-                )()
-            ],
+            [TensorType("complex128", shape=out_shape)()],
         )
 
-    def infer_shape(self, fgraph, node, in_shapes):
+    def infer_shape(self, node, in_shapes):
         shape_a = in_shapes[0]
         n = node.inputs[1]
         axis = node.inputs[2]
@@ -116,8 +121,8 @@ class Fourier(Op):
             l = len(shape_a)
             shape_a = stack(shape_a)
             out_shape = concatenate((shape_a[0:axis], [n], shape_a[axis + 1 :]))
-            n_splits = [1] * l
-            out_shape = split(out_shape, n_splits, l)
+            splits = [1] * l
+            out_shape = split(out_shape, splits, n_splits=l)
             out_shape = [a[0] for a in out_shape]
         return [out_shape]
 
@@ -127,7 +132,7 @@ class Fourier(Op):
         axis = inputs[2]
         output_storage[0][0] = np.fft.fft(a, n=int(n), axis=axis.item())
 
-    def grad(self, inputs, cost_grad):
+    def pullback(self, inputs, outputs, cost_grad):
         """
         In defining the gradient, the Finite Fourier Transform is viewed as
         a complex-differentiable function of a complex variable

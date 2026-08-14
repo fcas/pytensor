@@ -5,6 +5,17 @@ from pytensor.link.utils import unique_name_generator
 class PytorchLinker(JITLinker):
     """A `Linker` that compiles NumPy-based operations using torch.compile."""
 
+    required_rewrites = ("minimum_compile",)
+    incompatible_rewrites = (
+        "cxx_only",
+        "BlasOpt",
+        "fusion",
+        "inplace",
+        "scan_reduce_trace_prealloc",
+        "reuse_lu_decomposition_multiple_solves",
+        "scan_split_non_sequence_lu_decomposition_solve",
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gen_functors = []
@@ -31,11 +42,16 @@ class PytorchLinker(JITLinker):
             **kwargs,
         }
         return pytorch_funcify(
-            fgraph, input_storage=input_storage, storage_map=storage_map, **built_kwargs
+            fgraph,
+            input_storage=input_storage,
+            storage_map=storage_map,
+            **built_kwargs,
         )
 
     def jit_compile(self, fn):
         import torch
+
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
         from pytensor.link.pytorch.dispatch import pytorch_typify
 

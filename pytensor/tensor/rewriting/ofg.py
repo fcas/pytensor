@@ -1,51 +1,21 @@
-from typing import cast
-
-from pytensor import Variable, clone_replace
-from pytensor.compile import optdb
-from pytensor.compile.builders import OpFromGraph
-from pytensor.graph import Apply, node_rewriter
-from pytensor.graph.rewriting.basic import copy_stack_trace, in2out
+from pytensor.compile.rewriting import inline_ofg_node
+from pytensor.graph import node_rewriter
+from pytensor.graph.rewriting.basic import MergeOptimizer, dfs_rewriter
 from pytensor.tensor.basic import AllocDiag
 from pytensor.tensor.rewriting.basic import register_specialize
-
-
-def inline_ofg_node(node: Apply) -> list[Variable]:
-    op = node.op
-    assert isinstance(op, OpFromGraph)
-    inlined_outs = clone_replace(
-        op.inner_outputs, dict(zip(op.inner_inputs, node.inputs, strict=True))
-    )
-    copy_stack_trace(op.inner_outputs, inlined_outs)
-    return cast(list[Variable], inlined_outs)
-
-
-@node_rewriter([OpFromGraph])
-def inline_ofg_expansion(fgraph, node):
-    """
-    This optimization expands internal graph of OpFromGraph.
-    Only performed if node.op.is_inline == True
-    Doing so can improve optimization at the cost of compilation speed.
-    """
-    op = node.op
-    if not op.is_inline:
-        return False
-
-    return inline_ofg_node(node)
-
-
-# We want to run this before the first merge optimizer
-# and before the first scan optimizer.
-optdb.register(
-    "inline_ofg_expansion",
-    in2out(inline_ofg_expansion),
-    "fast_compile",
-    "fast_run",
-    position=-0.01,
+from pytensor.tensor.rewriting.elemwise import fuse_seqopt
+from pytensor.tensor.special import (
+    LogAddExp,
+    LogSoftmax,
+    LogSumExp,
+    Softmax,
+    XLog1PY,
+    XLogY,
 )
 
 
 @register_specialize("inline_ofg")
-@node_rewriter([AllocDiag])
+@node_rewriter([AllocDiag, XLogY, XLog1PY, LogSumExp, LogAddExp])
 def late_inline_OpFromGraph(fgraph, node):
     """
     Inline `OpFromGraph` nodes.
@@ -71,3 +41,43 @@ def late_inline_OpFromGraph(fgraph, node):
 
     """
     return inline_ofg_node(node)
+
+
+@node_rewriter([Softmax, LogSoftmax, LogSumExp, LogAddExp, XLogY, XLog1PY])
+def inline_symbolic_for_fusion(fgraph, node):
+    """Inline `SymbolicOp`s so their bodies can fuse.
+
+    The inner graph is otherwise compiled on its own, making the op a fusion barrier
+    both inside and across its boundary. Ops are listed explicitly, as some are worth
+    keeping opaque anyway (`KroneckerProduct` is: its body is one broadcasting `mul`
+    behind a `reshape`). Backends that dispatch these ops directly (JAX, PyTorch and MLX
+    have their own `Softmax`) exclude the whole fusion pass, so they keep them whole.
+
+    Ops that `late_inline_OpFromGraph` already inlines at specialize are listed here
+    too, since fusion also runs in modes that skip specialize.
+    """
+    return inline_ofg_node(node)
+
+
+# Fusion is the only thing that needs the body, so inline as its first step: every
+# Op-level rewrite still matches on the op.
+fuse_seqopt.register(
+    "inline_symbolic_for_fusion",
+    dfs_rewriter(inline_symbolic_for_fusion),
+    "fast_run",
+    "fusion",
+    position=0,
+)
+# Each op is inlined from its own inner graph, so two ops over the same inputs (a
+# `Softmax` and a `LogSoftmax` over the same logits) yield structurally identical but
+# distinct copies of everything they share. The `merge2` pass cannot clean this up: it
+# sits at the same optdb position as the fusion pass, where ties are broken by name, so
+# it only runs once fusion has pulled both copies into the `Composite`.
+fuse_seqopt.register(
+    "merge_inlined_symbolic",
+    MergeOptimizer(),
+    "fast_run",
+    "fusion",
+    "merge",
+    position=0.5,
+)

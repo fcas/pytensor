@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal, Optional
 
 import numpy as np
+import numpy.typing as npt
 
 import pytensor
 from pytensor import scalar as ps
@@ -69,8 +70,8 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
 
     def __init__(
         self,
-        dtype: str | np.dtype,
-        shape: Iterable[bool | int | None] | None = None,
+        dtype: str | npt.DTypeLike,
+        shape: Iterable[bool | int | None] | int | None = None,
         name: str | None = None,
         broadcastable: Iterable[bool] | None = None,
     ):
@@ -98,13 +99,13 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
             )
             shape = broadcastable
 
-        if str(dtype) == "floatX":
+        if dtype == "floatX":
             self.dtype = config.floatX
         else:
-            if np.obj2sctype(dtype) is None:
+            try:
+                self.dtype = str(np.dtype(dtype))
+            except TypeError:
                 raise TypeError(f"Invalid dtype: {dtype}")
-
-            self.dtype = np.dtype(dtype).name
 
         def parse_bcast_and_shape(s):
             if isinstance(s, bool | np.bool_):
@@ -117,10 +118,31 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                 f"TensorType broadcastable/shape must be a boolean, integer or None, got {type(s)} {s}"
             )
 
-        self.shape = tuple(parse_bcast_and_shape(s) for s in shape)
+        if isinstance(shape, int):
+            shape = (shape,)
+        self.shape = _shape = tuple(parse_bcast_and_shape(s) for s in shape)
+        self.broadcastable = tuple(s == 1 for s in _shape)
+        self.ndim = _ndim = len(_shape)
+        if _ndim > 64:
+            # Message mimicks that of numpy
+            raise ValueError(
+                f"maximum supported dimension for a TensorType is currently 64, found {_ndim}"
+            )
         self.dtype_specs()  # error checking is done there
         self.name = name
         self.numpy_dtype = np.dtype(self.dtype)
+
+    def __call__(self, *args, shape=None, **kwargs):
+        if shape is not None:
+            # Check if shape is compatible with the original type
+            new_type = self.clone(shape=shape)
+            if self.is_super(new_type):
+                return new_type(*args, **kwargs)
+            else:
+                raise ValueError(
+                    f"{shape=} is incompatible with original type shape {self.shape=}"
+                )
+        return super().__call__(*args, **kwargs)
 
     def clone(
         self, dtype=None, shape=None, broadcastable=None, **kwargs
@@ -177,7 +199,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         else:
             if allow_downcast:
                 # Convert to self.dtype, regardless of the type of data
-                data = np.asarray(data, dtype=self.dtype)
+                data = np.asarray(data).astype(self.dtype)
                 # TODO: consider to pad shape with ones to make it consistent
                 # with self.broadcastable... like vector->row type thing
             else:
@@ -186,11 +208,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                     # (do not try to convert the data)
                     up_dtype = ps.upcast(self.dtype, data.dtype)
                     if up_dtype == self.dtype:
-                        # Bug in the following line when data is a
-                        # scalar array, see
-                        # http://projects.scipy.org/numpy/ticket/1611
-                        # data = data.astype(self.dtype)
-                        data = np.asarray(data, dtype=self.dtype)
+                        data = data.astype(self.dtype)
                     if up_dtype != self.dtype:
                         err_msg = (
                             f"{self} cannot store a value of dtype {data.dtype} without "
@@ -248,17 +266,15 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                 " PyTensor C code does not support that.",
             )
 
-        # strict=False because we are in a hot loop
+        # zip strict not specified because we are in a hot loop
         if not all(
             ds == ts if ts is not None else True
-            for ds, ts in zip(data.shape, self.shape, strict=False)
+            for ds, ts in zip(data.shape, self.shape)
         ):
             raise TypeError(
                 f"The type's shape ({self.shape}) is not compatible with the data's ({data.shape})"
             )
 
-        if self.filter_checks_isfinite and not np.all(np.isfinite(data)):
-            raise ValueError("Non-finite elements not allowed")
         return data
 
     def filter_variable(self, other, allow_convert=True):
@@ -320,17 +336,14 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         return False
 
     def is_super(self, otype):
-        # strict=False because we are in a hot loop
+        # zip strict not specified because we are in a hot loop
         if (
             isinstance(otype, type(self))
             and otype.dtype == self.dtype
             and otype.ndim == self.ndim
             # `otype` is allowed to be as or more shape-specific than `self`,
             # but not less
-            and all(
-                sb == ob or sb is None
-                for sb, ob in zip(self.shape, otype.shape, strict=False)
-            )
+            and all(sb == ob or sb is None for sb, ob in zip(self.shape, otype.shape))
         ):
             return True
 
@@ -382,38 +395,19 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
     def __hash__(self):
         return hash((type(self), self.dtype, self.shape))
 
-    @property
-    def broadcastable(self):
-        """A boolean tuple indicating which dimensions have a shape equal to one."""
-        return tuple(s == 1 for s in self.shape)
-
-    @property
-    def ndim(self):
-        """The number of dimensions."""
-        return len(self.shape)
-
     def __str__(self):
         if self.name:
             return self.name
         else:
             shape = self.shape
             len_shape = len(shape)
-
-            def shape_str(s):
-                if s is None:
-                    return "?"
-                else:
-                    return str(s)
-
-            formatted_shape = ", ".join(shape_str(s) for s in shape)
-            if len_shape == 1:
-                formatted_shape += ","
+            formatted_shape = str(shape).replace("None", "?")
 
             if len_shape > 2:
                 name = f"Tensor{len_shape}"
             else:
                 name = ("Scalar", "Vector", "Matrix")[len_shape]
-            return f"{name}({self.dtype}, shape=({formatted_shape}))"
+            return f"{name}({self.dtype}, shape={formatted_shape})"
 
     def __repr__(self):
         return f"TensorType({self.dtype}, shape={self.shape})"
@@ -735,7 +729,7 @@ def values_eq_approx_always_true(a, b):
     return True
 
 
-pytensor.compile.register_view_op_c_code(
+pytensor.compile.ops.register_view_op_c_code(
     TensorType,
     """
     Py_XDECREF(%(oname)s);
@@ -746,7 +740,7 @@ pytensor.compile.register_view_op_c_code(
 )
 
 
-pytensor.compile.register_deep_copy_op_c_code(
+pytensor.compile.ops.register_deep_copy_op_c_code(
     TensorType,
     """
     int alloc = %(oname)s == NULL;
@@ -789,14 +783,16 @@ def tensor(
     **kwargs,
 ) -> "TensorVariable":
     if name is not None:
-        # Help catching errors with the new tensor API
-        # Many single letter strings are valid sctypes
-        if str(name) == "floatX" or (len(str(name)) > 1 and np.obj2sctype(name)):
-            np.obj2sctype(name)
-            raise ValueError(
-                f"The first and only positional argument of tensor is now `name`. Got {name}.\n"
-                "This name looks like a dtype, which you should pass as a keyword argument only."
-            )
+        try:
+            # Help catching errors with the new tensor API
+            # Many single letter strings are valid sctypes
+            if str(name) == "floatX" or (len(str(name)) > 2 and np.dtype(name).type):
+                raise ValueError(
+                    f"The first and only positional argument of tensor is now `name`. Got {name}.\n"
+                    "This name looks like a dtype, which you should pass as a keyword argument only."
+                )
+        except TypeError:
+            pass
 
     if dtype is None:
         dtype = config.floatX

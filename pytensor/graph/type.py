@@ -9,7 +9,7 @@ from pytensor.graph.utils import MetaObject
 D = TypeVar("D")
 
 
-class Type(MetaObject, Generic[D]):
+class Type(MetaObject, Generic[D]):  # noqa: UP046
     """
     Interface specification for variable type instances.
 
@@ -23,12 +23,12 @@ class Type(MetaObject, Generic[D]):
 
     """
 
-    variable_type: TypeAlias = Variable
+    variable_type: TypeAlias = Variable  # noqa: UP040
     """
     The `Type` that will be created by a call to `Type.make_variable`.
     """
 
-    constant_type: TypeAlias = Constant
+    constant_type: TypeAlias = Constant  # noqa: UP040
     """
     The `Type` that will be created by a call to `Type.make_constant`.
     """
@@ -95,34 +95,6 @@ class Type(MetaObject, Generic[D]):
             down-casted, and only to floatX scalars.
 
         """
-
-    def filter_inplace(
-        self,
-        value: Any,
-        storage: Any,
-        strict: bool = False,
-        allow_downcast: bool | None = None,
-    ):
-        """Return data or an appropriately wrapped/converted data by converting it in-place.
-
-        This method allows one to reuse old allocated memory.  If this method
-        is implemented, it will be called instead of `Type.filter`.
-
-        As of now, this method is not implemented and was previously used for transferring memory to and from GPU.
-
-        Parameters
-        ----------
-        value: array-like
-        storage: array-like
-            The old value (e.g. the old NumPy array)
-        strict: bool
-        allow_downcast: bool (optional)
-
-        Raises
-        ------
-        NotImplementedError
-        """
-        raise NotImplementedError()
 
     def filter_variable(
         self, other: Variable | D, allow_convert: bool = True

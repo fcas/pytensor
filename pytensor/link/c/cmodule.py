@@ -10,6 +10,7 @@ import os
 import pickle
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -19,26 +20,19 @@ import tempfile
 import textwrap
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
-from setuptools._distutils.sysconfig import (
-    get_config_h_filename,
-    get_config_var,
-    get_python_inc,
-    get_python_lib,
-)
 
 # we will abuse the lockfile mechanism when reading and writing the registry
 from pytensor.compile.compilelock import lock_ctx
-from pytensor.configdefaults import config, gcc_version_str
+from pytensor.configdefaults import config
 from pytensor.configparser import BoolParam, StrParam
 from pytensor.graph.op import Op
-from pytensor.link.c.exceptions import CompileError, MissingGXX
 from pytensor.utils import (
     LOCAL_BITWIDTH,
     flatten,
@@ -62,15 +56,6 @@ def is_StdLibDirsAndLibsType(
     fn: Callable[[], tuple[list[str], ...] | None],
 ) -> StdLibDirsAndLibsType:
     return cast(StdLibDirsAndLibsType, fn)
-
-
-class GCCLLVMType(Protocol):
-    is_llvm: bool | None
-    __call__: Callable[[], bool | None]
-
-
-def is_GCCLLVMType(fn: Callable[[], bool | None]) -> GCCLLVMType:
-    return cast(GCCLLVMType, fn)
 
 
 _logger = logging.getLogger("pytensor.link.c.cmodule")
@@ -163,7 +148,7 @@ class DynamicModule:
 
         self.support_code = []
         self.functions = []
-        self.includes = ["<Python.h>", "<iostream>", '"pytensor_mod_helper.h"']
+        self.includes = ["<Python.h>", '"pytensor_mod_helper.h"']
         self.init_blocks = []
 
     def print_methoddef(self, stream):
@@ -266,10 +251,9 @@ class DynamicModule:
 
 def _get_ext_suffix():
     """Get the suffix for compiled extensions"""
-    dist_suffix = get_config_var("EXT_SUFFIX")
-    if dist_suffix is None:
-        dist_suffix = get_config_var("SO")
-    return dist_suffix
+    from setuptools._distutils.sysconfig import get_config_var
+
+    return get_config_var("EXT_SUFFIX")
 
 
 def add_gcc_dll_directory() -> AbstractContextManager[None]:
@@ -448,7 +432,7 @@ def get_module_hash(src_code: str, key) -> str:
         to_hash += list(map(str, key[0]))
     c_link_key = key[1]
     # Currently, in order to catch potential bugs early, we are very
-    # convervative about the structure of the key and raise an exception
+    # conservative about the structure of the key and raise an exception
     # if it does not match exactly what we expect. In the future we may
     # modify this behavior to be less strict and be able to accommodate
     # changes to the key in an automatic way.
@@ -810,7 +794,7 @@ class ModuleCache:
                 to_delete_empty.append((args, kwargs))
 
         # add entries that are not in the entry_from_key dictionary
-        time_now = time.perf_counter()
+        time_now = time.time()
         # Go through directories in alphabetical order to ensure consistent
         # behavior.
         try:
@@ -980,7 +964,7 @@ class ModuleCache:
                             # directories in alphabetical order so as to make
                             # sure all new processes only use the first one.
                             if cleanup:
-                                age = time.perf_counter() - last_access_time(entry)
+                                age = time.time() - last_access_time(entry)
                                 if delete_if_problem or age > self.age_thresh_del:
                                     rmtree(
                                         root,
@@ -1500,7 +1484,7 @@ class ModuleCache:
                 # May happen for broken versioned keys.
                 continue
             for key_idx, key in enumerate(key_data.keys):
-                version, rest = key
+                version, _rest = key
                 if version:
                     # Since the version is included in the module hash,
                     # it should not be possible to mix versioned and
@@ -1532,7 +1516,7 @@ class ModuleCache:
             assert key[0]
 
         to_del = []
-        time_now = time.perf_counter()
+        time_now = time.time()
         for filename in os.listdir(self.dirname):
             if filename.startswith("tmp"):
                 try:
@@ -1566,11 +1550,11 @@ class ModuleCache:
                             continue
                     age = time_now - last_access_time(path)
 
-                    # In normal case, the processus that created this
-                    # directory will delete it. However, if this processus
+                    # In normal case, the process that created this
+                    # directory will delete it. However, if this process
                     # crashes, it will not be cleaned up.
                     # As we don't know if this directory is still used,
-                    # we wait one week and suppose that the processus
+                    # we wait one week and suppose that the process
                     # crashed, and we take care of the clean-up.
                     if age > min_age:
                         to_del.append(os.path.join(self.dirname, filename))
@@ -1697,6 +1681,8 @@ def get_gcc_shared_library_arg():
 
 
 def std_include_dirs():
+    from setuptools._distutils.sysconfig import get_python_inc
+
     numpy_inc_dirs = [np.get_include()]
     py_inc = get_python_inc()
     py_plat_spec_inc = get_python_inc(plat_specific=True)
@@ -1709,6 +1695,12 @@ def std_include_dirs():
 
 @is_StdLibDirsAndLibsType
 def std_lib_dirs_and_libs() -> tuple[list[str], ...] | None:
+    from setuptools._distutils.sysconfig import (
+        get_config_var,
+        get_python_inc,
+        get_python_lib,
+    )
+
     # We cache the results as on Windows, this trigger file access and
     # this method is called many times.
     if std_lib_dirs_and_libs.data is not None:
@@ -1811,37 +1803,6 @@ def std_libs():
 
 def std_lib_dirs():
     return std_lib_dirs_and_libs()[1]
-
-
-def gcc_version():
-    return gcc_version_str
-
-
-@is_GCCLLVMType
-def gcc_llvm() -> bool | None:
-    """
-    Detect if the g++ version used is the llvm one or not.
-
-    It don't support all g++ parameters even if it support many of them.
-
-    """
-    if gcc_llvm.is_llvm is None:
-        try:
-            p_out = output_subprocess_Popen([config.cxx, "--version"])
-            output = p_out[0] + p_out[1]
-        except OSError:
-            # Typically means g++ cannot be found.
-            # So it is not an llvm compiler.
-
-            # Normally this should not happen as we should not try to
-            # compile when g++ is not available. If this happen, it
-            # will crash later so supposing it is not llvm is "safe".
-            output = b""
-        gcc_llvm.is_llvm = b"llvm" in output
-    return gcc_llvm.is_llvm
-
-
-gcc_llvm.is_llvm = None
 
 
 class Compiler:
@@ -1982,7 +1943,7 @@ class Compiler:
         )
 
 
-def try_blas_flag(flags):
+def try_blas_flag(flags) -> str:
     test_code = textwrap.dedent(
         """\
         extern "C" double ddot_(int*, double*, int*, double*, int*);
@@ -2059,10 +2020,6 @@ class GCC_compiler(Compiler):
     supports_amdlibm = True
 
     @staticmethod
-    def version_str():
-        return config.cxx + " " + gcc_version_str
-
-    @staticmethod
     def compile_args(march_flags=True):
         cxxflags = [flag for flag in config.gcc__cxxflags.split(" ") if flag]
         if "-fopenmp" in cxxflags:
@@ -2101,49 +2058,48 @@ class GCC_compiler(Compiler):
             )
             detect_march = False
 
+        def get_lines(cmd: list[str], parse: bool = True) -> list[str] | None:
+            p = subprocess_Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+            # For mingw64 with GCC >= 4.7, passing os.devnull
+            # as stdin (which is the default) results in the process
+            # waiting forever without returning. For that reason,
+            # we use a pipe, and use the empty string as input.
+            (stdout, stderr) = p.communicate(input=b"")
+            if p.returncode != 0:
+                return None
+
+            lines_bytes = BytesIO(stdout + stderr).readlines()
+            lines = [l.decode() for l in lines_bytes]
+            if parse:
+                selected_lines: list[str] = []
+                for line in lines:
+                    if (
+                        "COLLECT_GCC_OPTIONS=" in line
+                        or "CFLAGS=" in line
+                        or "CXXFLAGS=" in line
+                        or "-march=native" in line
+                    ):
+                        continue
+                    selected_lines.extend(
+                        line.strip()
+                        for reg in ("-march=", "-mtune=", "-target-cpu", "-mabi=")
+                        if reg in line
+                    )
+                lines = list(set(selected_lines))  # to remove duplicate
+
+            return lines
+
         if detect_march:
             GCC_compiler.march_flags = []
 
-            def get_lines(cmd, parse=True):
-                p = subprocess_Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
-                    shell=True,
-                )
-                # For mingw64 with GCC >= 4.7, passing os.devnull
-                # as stdin (which is the default) results in the process
-                # waiting forever without returning. For that reason,
-                # we use a pipe, and use the empty string as input.
-                (stdout, stderr) = p.communicate(input=b"")
-                if p.returncode != 0:
-                    return None
-
-                lines = BytesIO(stdout + stderr).readlines()
-                lines = (l.decode() for l in lines)
-                if parse:
-                    selected_lines = []
-                    for line in lines:
-                        if (
-                            "COLLECT_GCC_OPTIONS=" in line
-                            or "CFLAGS=" in line
-                            or "CXXFLAGS=" in line
-                            or "-march=native" in line
-                        ):
-                            continue
-                        selected_lines.extend(
-                            line.strip()
-                            for reg in ("-march=", "-mtune=", "-target-cpu", "-mabi=")
-                            if reg in line
-                        )
-                    lines = list(set(selected_lines))  # to remove duplicate
-
-                return lines
-
             # The '-' at the end is needed. Otherwise, g++ do not output
             # enough information.
-            native_lines = get_lines(f"{config.cxx} -march=native -E -v -")
+            native_lines = get_lines([config.cxx, "-march=native", "-E", "-v", "-"])
             if native_lines is None:
                 _logger.info(
                     "Call to 'g++ -march=native' failed, not setting -march flag"
@@ -2158,7 +2114,7 @@ class GCC_compiler(Compiler):
                     # That means we did not select the right lines, so
                     # we have to report all the lines instead
                     reported_lines = get_lines(
-                        f"{config.cxx} -march=native -E -v -", parse=False
+                        [config.cxx, "-march=native", "-E", "-v", "-"], parse=False
                     )
                 else:
                     reported_lines = native_lines
@@ -2171,10 +2127,12 @@ class GCC_compiler(Compiler):
                     f" problem:\n {reported_lines}"
                 )
             else:
-                default_lines = get_lines(f"{config.cxx} -E -v -")
+                default_lines = get_lines([config.cxx, "-E", "-v", "-"])
                 _logger.info(f"g++ default lines: {default_lines}")
                 if len(default_lines) < 1:
-                    reported_lines = get_lines(f"{config.cxx} -E -v -", parse=False)
+                    reported_lines = get_lines(
+                        [config.cxx, "-E", "-v", "-"], parse=False
+                    )
                     warnings.warn(
                         "PyTensor was not able to find the "
                         "default g++ parameters. This is needed to tune "
@@ -2238,7 +2196,7 @@ class GCC_compiler(Compiler):
                                 if "target-cpu" in p:
                                     opt = p.split()
                                     if len(opt) == 2:
-                                        opt_name, opt_val = opt
+                                        _opt_name, opt_val = opt
                                         new_flags[i] = f"-march={opt_val}"
 
                             # Some versions of GCC report the native arch
@@ -2261,7 +2219,7 @@ class GCC_compiler(Compiler):
                                     # OK
                                     continue
                                 # Check the version of GCC
-                                version = gcc_version_str.split(".")
+                                version = config.gcc_version_str.split(".")
                                 if len(version) != 3:
                                     # Unexpected, but should not be a problem
                                     continue
@@ -2388,23 +2346,6 @@ class GCC_compiler(Compiler):
                 # xcode's version.
                 cxxflags.append("-ld64")
 
-        if sys.platform == "win32":
-            # Workaround for https://github.com/Theano/Theano/issues/4926.
-            # https://github.com/python/cpython/pull/11283/ removed the "hypot"
-            # redefinition for recent CPython versions (>=2.7.16 and >=3.7.3).
-            # The following nullifies that redefinition, if it is found.
-            python_version = sys.version_info[:3]
-            if (3,) <= python_version < (3, 7, 3):
-                config_h_filename = get_config_h_filename()
-                try:
-                    with open(config_h_filename) as config_h:
-                        if any(
-                            line.startswith("#define hypot _hypot") for line in config_h
-                        ):
-                            cxxflags.append("-D_hypot=hypot")
-                except OSError:
-                    pass
-
         return cxxflags
 
     @classmethod
@@ -2486,7 +2427,7 @@ class GCC_compiler(Compiler):
         else:
             # In explicit else because of https://github.com/python/mypy/issues/10773
             def sort_key(lib):
-                name, *numbers, extension = lib.split(".")
+                _name, *numbers, extension = lib.split(".")
                 return (extension == "dll", tuple(map(int, numbers)))
 
             patched_lib_ldflags = []
@@ -2555,8 +2496,9 @@ class GCC_compiler(Compiler):
 
         """
         # TODO: Do not do the dlimport in this function
-
         if not config.cxx:
+            from pytensor.link.c.exceptions import MissingGXX
+
             raise MissingGXX("g++ not available! We can't compile c code.")
 
         if include_dirs is None:
@@ -2586,6 +2528,8 @@ class GCC_compiler(Compiler):
                 cppfile.write("\n")
 
         if platform.python_implementation() == "PyPy":
+            from setuptools._distutils.sysconfig import get_config_var
+
             suffix = "." + get_lib_extension()
 
             dist_suffix = get_config_var("SO")
@@ -2621,7 +2565,7 @@ class GCC_compiler(Compiler):
         cmd.append(f"{path_wrapper}{cppfilename}{path_wrapper}")
         cmd.extend(GCC_compiler.linking_patch(lib_dirs, libs))
         # print >> sys.stderr, 'COMPILING W CMD', cmd
-        _logger.debug(f"Running cmd: {' '.join(cmd)}")
+        _logger.debug(f"Running cmd: {shlex.join(cmd)}")
 
         def print_command_line_error():
             # Print command line when a problem occurred.
@@ -2629,7 +2573,7 @@ class GCC_compiler(Compiler):
                 ("Problem occurred during compilation with the command line below:"),
                 file=sys.stderr,
             )
-            print(" ".join(cmd), file=sys.stderr)
+            print(shlex.join(cmd), file=sys.stderr)
 
         try:
             p_out = output_subprocess_Popen(cmd)
@@ -2642,6 +2586,8 @@ class GCC_compiler(Compiler):
         status = p_out[2]
 
         if status:
+            from pytensor.link.c.exceptions import CompileError
+
             tf = tempfile.NamedTemporaryFile(
                 mode="w", prefix="pytensor_compilation_error_", delete=False
             )
@@ -2743,97 +2689,122 @@ sure you have the right version you *will* get wrong results.
         )
 
 
-def default_blas_ldflags():
-    """Read local NumPy and MKL build settings and construct `ld` flags from them.
+def _check_required_file(
+    paths: Collection[Path],
+    required_regexs: Collection[str | re.Pattern[str]],
+) -> list[tuple[str, str]]:
+    """Select path parents for each required pattern."""
+    libs: list[tuple[str, str]] = []
+    for req in required_regexs:
+        found = False
+        for path in paths:
+            m = re.search(req, path.name)
+            if m:
+                libs.append((str(path.parent), m.string[slice(*m.span())]))
+                found = True
+                break
+        if not found:
+            _logger.debug("Required file '%s' not found", req)
+            raise RuntimeError(f"Required file {req} not found")
+    return libs
+
+
+def _get_cxx_library_dirs() -> list[str]:
+    """Query C++ search dirs and return those the existing ones."""
+    cmd = [config.cxx, "-print-search-dirs"]
+    p = subprocess_Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+    )
+    (stdout, stderr) = p.communicate(input=b"")
+    if p.returncode != 0:
+        warnings.warn(
+            "Pytensor cxx failed to communicate its search dirs. As a consequence, "
+            "it might not be possible to automatically determine the blas link flags to use.\n"
+            f"Command that was run: {config.cxx} -print-search-dirs\n"
+            f"Output printed to stderr: {stderr.decode(sys.stderr.encoding)}"
+        )
+        return []
+
+    maybe_lib_dirs = [
+        [Path(p).resolve() for p in line[len("libraries: =") :].split(":")]
+        for line in stdout.decode(sys.getdefaultencoding()).splitlines()
+        if line.startswith("libraries: =")
+    ]
+    if not maybe_lib_dirs:
+        return []
+    return [str(d) for d in maybe_lib_dirs[0] if d.exists() and d.is_dir()]
+
+
+def _check_libs(
+    all_libs: Collection[Path],
+    required_libs: Collection[str | re.Pattern],
+    extra_compile_flags: Sequence[str] = (),
+    cxx_library_dirs: Sequence[str] = (),
+) -> str:
+    """Assembly library paths and try BLAS flags, returning the flags on success."""
+    found_libs = _check_required_file(
+        all_libs,
+        required_libs,
+    )
+    path_quote = '"' if sys.platform == "win32" else ""
+    libdir_ldflags = list(
+        dict.fromkeys(
+            [
+                f"-L{path_quote}{lib_path}{path_quote}"
+                for lib_path, _ in found_libs
+                if lib_path not in cxx_library_dirs
+            ]
+        )
+    )
+
+    flags = (
+        libdir_ldflags
+        + [f"-l{lib_name}" for _, lib_name in found_libs]
+        + list(extra_compile_flags)
+    )
+    res = try_blas_flag(flags)
+    if not res:
+        _logger.debug("Supplied flags '%s' failed to compile", res)
+        raise RuntimeError(f"Supplied flags {flags} failed to compile")
+
+    if any("mkl" in flag for flag in flags):
+        try:
+            check_mkl_openmp()
+        except Exception as e:
+            _logger.debug(e)
+    _logger.debug("The following blas flags will be used: '%s'", res)
+    return res
+
+
+def default_blas_ldflags() -> str:
+    """Look for an available BLAS implementation in the system.
+
+    This function tries to compile a simple C code that uses the BLAS
+    if the required files are found in the system.
+    It sequentially tries to link to the following implementations, until one is found:
+    1. Intel MKL with Intel OpenMP threading
+    2. Intel MKL with GNU OpenMP threading
+    3. Lapack + BLAS
+    4. BLAS alone
+    5. OpenBLAS
 
     Returns
     -------
-    str
+    blas flags: str
+        Blas flags needed to link to the BLAS implementation found in the system.
+        If no BLAS implementation is found, an empty string is returned.
+
+    Notes
+    -----
+    This function is triggered when `pytensor.config.blas__ldflags` is not given a user
+    default, and it is first accessed at runtime. It can be rather slow, so it is advised
+    to cache the results of this function in PYTENSORRC configuration file or
+    PyTensor environment flags.
 
     """
-
-    def check_required_file(paths, required_regexs):
-        libs = []
-        for req in required_regexs:
-            found = False
-            for path in paths:
-                m = re.search(req, path.name)
-                if m:
-                    libs.append((str(path.parent), m.string[slice(*m.span())]))
-                    found = True
-                    break
-            if not found:
-                _logger.debug("Required file '%s' not found", req)
-                raise RuntimeError(f"Required file {req} not found")
-        return libs
-
-    def get_cxx_library_dirs():
-        cmd = f"{config.cxx} -print-search-dirs"
-        p = subprocess_Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            shell=True,
-        )
-        (stdout, stderr) = p.communicate(input=b"")
-        if p.returncode != 0:
-            warnings.warn(
-                "Pytensor cxx failed to communicate its search dirs. As a consequence, "
-                "it might not be possible to automatically determine the blas link flags to use.\n"
-                f"Command that was run: {config.cxx} -print-search-dirs\n"
-                f"Output printed to stderr: {stderr.decode(sys.stderr.encoding)}"
-            )
-            return []
-
-        maybe_lib_dirs = [
-            [Path(p).resolve() for p in line[len("libraries: =") :].split(":")]
-            for line in stdout.decode(sys.getdefaultencoding()).splitlines()
-            if line.startswith("libraries: =")
-        ]
-        if len(maybe_lib_dirs) > 0:
-            maybe_lib_dirs = maybe_lib_dirs[0]
-        return [str(d) for d in maybe_lib_dirs if d.exists() and d.is_dir()]
-
-    def check_libs(
-        all_libs, required_libs, extra_compile_flags=None, cxx_library_dirs=None
-    ):
-        if cxx_library_dirs is None:
-            cxx_library_dirs = []
-        if extra_compile_flags is None:
-            extra_compile_flags = []
-        found_libs = check_required_file(
-            all_libs,
-            required_libs,
-        )
-        path_quote = '"' if sys.platform == "win32" else ""
-        libdir_ldflags = list(
-            dict.fromkeys(
-                [
-                    f"-L{path_quote}{lib_path}{path_quote}"
-                    for lib_path, _ in found_libs
-                    if lib_path not in cxx_library_dirs
-                ]
-            )
-        )
-
-        flags = (
-            libdir_ldflags
-            + [f"-l{lib_name}" for _, lib_name in found_libs]
-            + extra_compile_flags
-        )
-        res = try_blas_flag(flags)
-        if res:
-            if any("mkl" in flag for flag in flags):
-                try:
-                    check_mkl_openmp()
-                except Exception as e:
-                    _logger.debug(e)
-            _logger.debug("The following blas flags will be used: '%s'", res)
-            return res
-        else:
-            _logger.debug("Supplied flags '%s' failed to compile", res)
-            raise RuntimeError(f"Supplied flags {flags} failed to compile")
 
     # If no compiler is available we default to empty ldflags
     if not config.cxx:
@@ -2844,7 +2815,7 @@ def default_blas_ldflags():
     else:
         rpath = None
 
-    cxx_library_dirs = get_cxx_library_dirs()
+    cxx_library_dirs = _get_cxx_library_dirs()
     searched_library_dirs = cxx_library_dirs + _std_lib_dirs
     if sys.platform == "win32":
         # Conda on Windows saves MKL libraries under CONDA_PREFIX\Library\bin
@@ -2872,9 +2843,9 @@ def default_blas_ldflags():
     if rpath is not None:
         maybe_add_to_os_environ_pathlist("PATH", rpath)
     try:
-        # 1. Try to use MKL with INTEL OpenMP threading
+        # 1a. Try to use MKL with INTEL OpenMP threading
         _logger.debug("Checking MKL flags with intel threading")
-        return check_libs(
+        return _check_libs(
             all_libs,
             required_libs=[
                 "mkl_core",
@@ -2889,9 +2860,27 @@ def default_blas_ldflags():
     except Exception as e:
         _logger.debug(e)
     try:
+        # 1b. Try to use MKL with INTEL OpenMP threading with renamed iomp5 library
+        # Ref: <https://www.intel.com/content/www/us/en/docs/onemkl/developer-guide-windows/2024-1/selecting-libraries-to-link-with.html>
+        _logger.debug("Checking MKL flags with intel threading, iomp5md")
+        return _check_libs(
+            all_libs,
+            required_libs=[
+                "mkl_core",
+                "mkl_rt",
+                "mkl_intel_thread",
+                "iomp5md",
+                "pthread",
+            ],
+            extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    try:
         # 2. Try to use MKL with GNU OpenMP threading
         _logger.debug("Checking MKL flags with GNU OpenMP threading")
-        return check_libs(
+        return _check_libs(
             all_libs,
             required_libs=["mkl_core", "mkl_rt", "mkl_gnu_thread", "gomp", "pthread"],
             extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
@@ -2914,7 +2903,7 @@ def default_blas_ldflags():
     try:
         _logger.debug("Checking Lapack + blas")
         # 4. Try to use LAPACK + BLAS
-        return check_libs(
+        return _check_libs(
             all_libs,
             required_libs=["lapack", "blas", "cblas", "m"],
             extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
@@ -2925,7 +2914,7 @@ def default_blas_ldflags():
     try:
         # 5. Try to use BLAS alone
         _logger.debug("Checking blas alone")
-        return check_libs(
+        return _check_libs(
             all_libs,
             required_libs=["blas", "cblas"],
             extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
@@ -2936,7 +2925,7 @@ def default_blas_ldflags():
     try:
         # 6. Try to use openblas
         _logger.debug("Checking openblas")
-        return check_libs(
+        return _check_libs(
             all_libs,
             required_libs=["openblas", "gfortran", "gomp", "m"],
             extra_compile_flags=["-fopenmp", f"-Wl,-rpath,{rpath}"]
@@ -2947,6 +2936,14 @@ def default_blas_ldflags():
     except Exception as e:
         _logger.debug(e)
     _logger.debug("Failed to identify blas ldflags. Will leave them empty.")
+    warnings.warn(
+        "PyTensor could not link to a BLAS installation. Operations that might benefit from BLAS will be severely degraded.\n"
+        "This usually happens when PyTensor is installed via pip. We recommend it be installed via conda/mamba/pixi instead.\n"
+        "Alternatively, you can use an experimental backend such as Numba or JAX that perform their own BLAS optimizations, "
+        "by setting `pytensor.config.mode == 'NUMBA'` or passing `mode='NUMBA'` when compiling a PyTensor function.\n"
+        "For more options and details see https://pytensor.readthedocs.io/en/latest/troubleshooting.html#how-do-i-configure-test-my-blas-library",
+        UserWarning,
+    )
     return ""
 
 

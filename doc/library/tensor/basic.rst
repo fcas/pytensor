@@ -12,7 +12,7 @@ Basic Tensor Functionality
    import pytensor
    import pytensor.tensor as pt
    from pytensor.tensor.type import scalar, iscalar, TensorType, dmatrix, ivector, fmatrix
-   from pytensor.tensor import set_subtensor, inc_subtensor, batched_dot
+   from pytensor.tensor import set_subtensor, inc_subtensor
    from pytensor import shared
 
 PyTensor supports symbolic tensor expressions.  When you type,
@@ -477,7 +477,7 @@ them perfectly, but a `dscalar` otherwise.
     you'll want to call.
 
 
-.. autoclass:: pytensor.tensor.var._tensor_py_operators
+.. autoclass:: pytensor.tensor.variable._tensor_py_operators
    :members:
 
     This mix-in class adds convenient attributes, methods, and support
@@ -619,9 +619,8 @@ dimensions, see :meth:`_tensor_py_operators.dimshuffle`.
 
 .. function:: shape_padleft(x, n_ones=1)
 
-    Reshape `x` by left padding the shape with `n_ones` 1s. Note that all
-    this new dimension will be broadcastable. To make them non-broadcastable
-    see the :func:`unbroadcast`.
+    Reshape `x` by left padding the shape with `n_ones` 1s.
+    All new dimensions will be broadcastable.
 
     :param x: variable to be reshaped
     :type x: any `TensorVariable` (or compatible)
@@ -633,9 +632,8 @@ dimensions, see :meth:`_tensor_py_operators.dimshuffle`.
 
 .. function:: shape_padright(x, n_ones=1)
 
-    Reshape `x` by right padding the shape with `n_ones` ones. Note that all
-    this new dimension will be broadcastable. To make them non-broadcastable
-    see the :func:`unbroadcast`.
+    Reshape `x` by right padding the shape with `n_ones` ones.
+    All new dimensions will be broadcastable.
 
     :param x: variable to be reshaped
     :type x: any TensorVariable (or compatible)
@@ -646,9 +644,8 @@ dimensions, see :meth:`_tensor_py_operators.dimshuffle`.
 
 .. function:: shape_padaxis(t, axis)
 
-    Reshape `t` by inserting ``1`` at the dimension `axis`. Note that this new
-    dimension will be broadcastable. To make it non-broadcastable
-    see the :func:`unbroadcast`.
+    Reshape `t` by inserting ``1`` at the dimension `axis`.
+    All new dimensions will be broadcastable.
 
     :type x: any `TensorVariable` (or compatible)
     :param x: variable to be reshaped
@@ -1147,9 +1144,9 @@ Indexing
 
 Like NumPy, PyTensor distinguishes between *basic* and *advanced* indexing.
 PyTensor fully supports basic indexing
-(see `NumPy's indexing  <http://docs.scipy.org/doc/numpy/reference/arrays.indexing.html>`_)
+(see `NumPy's indexing  <https://numpy.org/doc/stable/user/basics.indexing.html>`_)
 and `integer advanced indexing
-<http://docs.scipy.org/doc/numpy/reference/arrays.indexing.html#integer>`_.
+<https://numpy.org/doc/stable/user/basics.indexing.html#integer-array-indexing>`_.
 
 Index-assignment is *not* supported.  If you want to do something like ``a[5]
 = b`` or ``a[5]+=b``, see :func:`pytensor.tensor.subtensor.set_subtensor` and
@@ -1531,6 +1528,10 @@ Mathematical
 
     Returns a variable representing the inverse error function or the inverse complementary error function. `wikipedia <http://en.wikipedia.org/wiki/Error_function#Inverse_functions>`__
 
+.. function:: ndtri_exp(a)
+
+    Returns a variable representing the inverse of the standard normal CDF evaluated at the exponent of a, computed accurately even where ``exp(a)`` underflows.
+
 .. function:: gamma(a)
 
    Returns a variable representing the gamma function.
@@ -1681,64 +1682,6 @@ Linear Algebra
 
     :note: See the documentation of `numpy.tensordot <http://docs.scipy.org/doc/numpy/reference/generated/numpy.tensordot.html>`_ for more examples.
 
-.. function:: batched_dot(X, Y)
-
-    :param x: A Tensor with sizes e.g.: for  3D (dim1, dim3, dim2)
-    :param y: A Tensor with sizes e.g.: for 3D (dim1, dim2, dim4)
-
-    This function computes the dot product between the two tensors, by iterating
-    over the first dimension using scan.
-    Returns a tensor of size e.g. if it is 3D: (dim1, dim3, dim4)
-    Example:
-
-    >>> first = pt.tensor3('first')
-    >>> second = pt.tensor3('second')
-    >>> result = batched_dot(first, second)
-
-    :note:  This is a subset of `numpy.einsum`, but we do not provide it for now.
-
-    :param X: left term
-    :param Y: right term
-    :type X: symbolic tensor
-    :type Y: symbolic tensor
-
-    :return: tensor of products
-
-.. function:: batched_tensordot(X, Y, axes=2)
-
-    :param x: A Tensor with sizes e.g.: for 3D (dim1, dim3, dim2)
-    :param y: A Tensor with sizes e.g.: for 3D (dim1, dim2, dim4)
-    :param axes: an integer or array. If an integer, the number of axes
-                 to sum over. If an array, it must have two array
-                 elements containing the axes to sum over in each tensor.
-
-                 If an integer i, it is converted to an array containing
-                 the last i dimensions of the first tensor and the first
-                 i dimensions of the second tensor (excluding the first
-                 (batch) dimension)::
-
-                     axes = [range(a.ndim - i, b.ndim), range(1,i+1)]
-
-                 If an array, its two elements must contain compatible axes
-                 of the two tensors. For example, [[1, 2], [2, 4]] means sum
-                 over the 2nd and 3rd axes of a and the 3rd and 5th axes of b.
-                 (Remember axes are zero-indexed!) The 2nd axis of a and the
-                 3rd axis of b must have the same shape; the same is true for
-                 the 3rd axis of a and the 5th axis of b.
-    :type axes: int or array-like of length 2
-
-    :returns: a tensor with shape equal to the concatenation of a's shape
-              (less any dimensions that were summed over) and b's shape
-              (less first dimension and any dimensions that were summed over).
-    :rtype: tensor of tensordots
-
-    A hybrid of batch_dot and tensordot, this function computes the
-    tensordot product between the two tensors, by iterating over the
-    first dimension using scan to perform a sequence of tensordots.
-
-    :note: See :func:`tensordot` and :func:`batched_dot` for
-        supplementary documentation.
-
 .. function:: mgrid
 
     :returns: an instance which returns a dense (or fleshed out) mesh-grid
@@ -1791,5 +1734,3 @@ Gradient / Differentiation
     :members: grad
     :noindex:
 
-See the :ref:`gradient <libdoc_gradient>` page for complete documentation
-of the gradient module.

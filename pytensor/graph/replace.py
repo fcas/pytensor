@@ -1,17 +1,19 @@
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
-from functools import partial, singledispatch
+from functools import singledispatch
 from typing import cast, overload
 
 from pytensor.graph.basic import (
     Apply,
     Constant,
     Variable,
-    io_toposort,
-    truncated_graph_inputs,
 )
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
+from pytensor.graph.traversal import (
+    toposort,
+    truncated_graph_inputs,
+)
 
 
 ReplaceTypes = Iterable[tuple[Variable, Variable]] | dict[Variable, Variable]
@@ -73,7 +75,7 @@ def clone_replace(
         Keywords to `rebuild_collect_shared`.
 
     """
-    from pytensor.compile.function.pfunc import rebuild_collect_shared
+    from pytensor.compile.rebuild import rebuild_collect_shared
 
     items = list(_format_replace(replace).items())
 
@@ -167,6 +169,9 @@ def graph_replace(
     fg_replace = {equiv[c]: c for c in conditions}
     # add the replacements on top of input mappings
     fg_replace.update({equiv[r]: v for r, v in replace_dict.items() if r in equiv})
+    # Filter out replacements whose keys are not in the FunctionGraph
+    # This can happen when a replacement makes an ancestor replacement redundant
+    fg_replace = {k: v for k, v in fg_replace.items() if k in fg.variables}
     # replacements have to be done in reverse topological order so that nested
     # expressions get recursively replaced correctly
 
@@ -181,11 +186,13 @@ def graph_replace(
     toposort = fg.toposort()
 
     def toposort_key(
-        fg: FunctionGraph, ts: list[Apply], pair: tuple[Variable, Variable]
+        pair: tuple[Variable, Variable],
+        toposort=toposort,
+        fg=fg,
     ) -> int:
         key, _ = pair
-        if key.owner is not None:
-            return ts.index(key.owner)
+        if (node := key.owner) is not None:
+            return toposort.index(node)  # type: ignore[no-any-return]
         else:
             if key in fg.variables:
                 return -1
@@ -195,7 +202,7 @@ def graph_replace(
     sorted_replacements = sorted(
         fg_replace.items(),
         # sort based on the fg toposort, if a variable has no owner, it goes first
-        key=partial(toposort_key, fg, toposort),
+        key=toposort_key,
         reverse=True,
     )
     fg.replace_all(sorted_replacements, import_missing=True)
@@ -206,19 +213,13 @@ def graph_replace(
 
 
 @singledispatch
-def _vectorize_node(op: Op, node: Apply, *batched_inputs) -> Apply:
+def _vectorize_node(op: Op, node: Apply, *batched_inputs) -> Apply | Sequence[Variable]:
     # Default implementation is provided in pytensor.tensor.blockwise
     raise NotImplementedError
 
 
-def vectorize_node(node: Apply, *batched_inputs) -> Apply:
-    """Returns vectorized version of node with new batched inputs."""
-    op = node.op
-    return _vectorize_node(op, node, *batched_inputs)
-
-
 def _vectorize_not_needed(op, node, *batched_inputs):
-    return op.make_node(*batched_inputs)
+    return op.make_node(*batched_inputs).outputs
 
 
 @overload
@@ -232,13 +233,13 @@ def vectorize_graph(
 def vectorize_graph(
     outputs: Sequence[Variable],
     replace: Mapping[Variable, Variable],
-) -> Sequence[Variable]: ...
+) -> list[Variable]: ...
 
 
 def vectorize_graph(
     outputs: Variable | Sequence[Variable],
     replace: Mapping[Variable, Variable],
-) -> Variable | Sequence[Variable]:
+) -> Variable | list[Variable]:
     """Vectorize outputs graph given mapping from old variables to expanded counterparts version.
 
     Expanded dimensions must be on the left. Behavior is similar to the functional `numpy.vectorize`.
@@ -287,19 +288,40 @@ def vectorize_graph(
         # [array([-10., -11.]), array([10., 11.])]
 
     """
+    # TODO: Move this to tensor.vectorize, and make this helper type agnostic.
+    #
+    # This helper may dispatch to tensor.vectorize_graph or xtensor.vectorize_graph depending on the replacement types
+    # The behavior is distinct, because tensor vectorization depends on axis-position while xtensor depends on dimension labels
+    #
+    # xtensor.vectorize_graph will be able to handle batched inner tensor operations, while tensor.vectorize_graph won't,
+    # as it is by design unaware of xtensors and their semantics.
     if isinstance(outputs, Sequence):
         seq_outputs = outputs
     else:
         seq_outputs = [outputs]
 
+    if not all(
+        isinstance(key, Variable) and isinstance(value, Variable)
+        for key, value in replace.items()
+    ):
+        raise ValueError(f"Some of the replaced items are not Variables: {replace}")
+
     inputs = truncated_graph_inputs(seq_outputs, ancestors_to_include=replace.keys())
     new_inputs = [replace.get(inp, inp) for inp in inputs]
 
     vect_vars = dict(zip(inputs, new_inputs, strict=True))
-    for node in io_toposort(inputs, seq_outputs):
+    for node in toposort(seq_outputs, blockers=inputs):
         vect_inputs = [vect_vars.get(inp, inp) for inp in node.inputs]
-        vect_node = vectorize_node(node, *vect_inputs)
-        for output, vect_output in zip(node.outputs, vect_node.outputs, strict=True):
+
+        vect_node_or_outputs = _vectorize_node(node.op, node, *vect_inputs)
+        # Compatibility with the old API
+        vect_outputs = (
+            vect_node_or_outputs.outputs
+            if isinstance(vect_node_or_outputs, Apply)
+            else vect_node_or_outputs
+        )
+
+        for output, vect_output in zip(node.outputs, vect_outputs, strict=True):
             if output in vect_vars:
                 # This can happen when some outputs of a multi-output node are given a replacement,
                 # while some of the remaining outputs are still needed in the graph.

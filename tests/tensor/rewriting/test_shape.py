@@ -5,8 +5,8 @@ import pytest
 
 import pytensor.tensor as pt
 from pytensor import shared
-from pytensor.compile.function import function
-from pytensor.compile.mode import get_default_mode, get_mode
+from pytensor.compile.maker import function
+from pytensor.compile.mode import Mode, get_default_mode, get_mode
 from pytensor.compile.ops import deep_copy_op
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable, equal_computations
@@ -17,7 +17,7 @@ from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.graph.type import Type
 from pytensor.tensor.basic import alloc, as_tensor_variable
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
-from pytensor.tensor.math import add, exp, maximum
+from pytensor.tensor.math import add, cos, exp, maximum, sin
 from pytensor.tensor.rewriting.basic import register_specialize
 from pytensor.tensor.rewriting.shape import (
     ShapeFeature,
@@ -162,7 +162,7 @@ class TestShapeRewriter:
                 (out,) = out_
                 out[0] = x.copy()
 
-            # def infer_shape(self, fgraph, node, (xshp,)):
+            # def infer_shape(self, node, (xshp,)):
             # return [tuple([self.shape_i(i)(r) for i in range(r.ndim)])]
 
         identity_noshape = IdentityNoShape()
@@ -179,7 +179,7 @@ class TestShapeRewriter:
                 (out,) = out_
                 out[0] = x.copy()
 
-            def infer_shape(self, fgraph, node, xshp_):
+            def infer_shape(self, node, xshp_):
                 # Could also just return.
                 (xshp,) = xshp_
                 return (xshp,)
@@ -383,6 +383,13 @@ class TestLocalUselessReshape:
         new_out = rewrite_graph(out)
         assert new_out is out
 
+        # Or if more than one dimension cannot be matched
+        x = tensor(shape=(None, None, None))
+        shape = [x.shape[0], 3, 3]
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is out
+
 
 class TestLocalReshapeToDimshuffle:
     def setup_method(self):
@@ -418,6 +425,89 @@ class TestLocalReshapeToDimshuffle:
         assert equal_computations([g.outputs[1]], [exp_y])
 
         assert check_stack_trace(g, ops_to_check=(DimShuffle, Reshape))
+
+    def test_expand_dims(self):
+        x = pt.scalar()
+        # This reshape does an implicit expand_dims
+        out = x.reshape((1, -1))
+        assert isinstance(out.owner.op, Reshape)
+        new_out = rewrite_graph(out, include=("canonicalize",))
+        assert equal_computations([new_out], [pt.expand_dims(x, (0, 1))])
+
+    def test_squeeze_of_alloc(self):
+        # This shows up in the graph of repeat
+        x = pt.vector("x", shape=(9,))
+        bcast_x = pt.alloc(x, 1, 12, x.shape[0])
+
+        # This reshape does an implicit squeeze
+        out = bcast_x.reshape((12, x.shape[0]))
+
+        new_out = rewrite_graph(out, include=("canonicalize", "ShapeOpt"))
+        assert equal_computations([new_out], [pt.alloc(x, 12, 9)], strict_dtype=False)
+
+    def test_reshape_implies_size_1_input(self):
+        x = pt.matrix("x", shape=(None, None))
+        out = pt.reshape(x, (1, 1, 1))
+
+        new_out = rewrite_graph(out, include=("canonicalize",))
+        assert equal_computations(
+            [new_out], [x.dimshuffle("x", "x", "x")], strict_dtype=False
+        )
+
+    def test_constant_shape_with_stale_static_output(self):
+        # Regression test: when the Reshape's static output shape has unknown
+        # entries (e.g. because the shape input was originally non-constant
+        # and only became constant via constant folding), but the shape input
+        # is now a constant of all ones, the rewrite must still produce an
+        # output with the same rank as the original Reshape.
+        x = pt.vector("x")
+        const_shape = as_tensor_variable([1, 1, 1])
+        # Build a Reshape node whose output type has shape (None, 1, 1) while
+        # its shape input is the constant [1, 1, 1].
+        stale_type = tensor(dtype=x.type.dtype, shape=(None, 1, 1))
+        reshape_node = Apply(Reshape(3), [x, const_shape], [stale_type])
+        out = reshape_node.outputs[0]
+
+        fg = FunctionGraph([x], [out], clone=False)
+        out2in(local_reshape_to_dimshuffle).rewrite(fg)
+
+        new_out = fg.outputs[0]
+        assert new_out.type.ndim == out.type.ndim
+
+
+def test_expand_dims_squeeze_reshape_fusion():
+    x = pt.tensor("x", shape=(1, 9))
+    reshape_x = x.squeeze(0).reshape((3, 3))[..., None]
+
+    assert isinstance(reshape_x.owner.op, DimShuffle)
+    assert isinstance(reshape_x.owner.inputs[0].owner.op, Reshape)
+    assert isinstance(reshape_x.owner.inputs[0].owner.inputs[0].owner.op, DimShuffle)
+
+    out = rewrite_graph(reshape_x, include=("specialize",))
+
+    # In this case we cannot get rid of the reshape, squeeze or expand_dims,
+    # so we fuse them all in one reshape
+    assert equal_computations([out], [x.reshape((3, 3, 1))])
+
+
+def test_implicit_broadcasting_via_repeat():
+    x = pt.vector("x", shape=(3,), dtype=int)
+    y = pt.vector("y", shape=(9,), dtype=int)
+    out = x[None, :].repeat(9, axis=0) <= y[:, None].repeat(3, axis=1)
+    # There are two Reshapes in the graph
+    assert isinstance(out.owner.inputs[0].owner.op, Reshape)
+    assert isinstance(out.owner.inputs[1].owner.op, Reshape)
+
+    new_out = rewrite_graph(out, include=("canonicalize", "specialize"))
+    assert equal_computations([new_out], [x[None] <= y[:, None]])
+
+    no_rewrite_mode = Mode(linker="py", optimizer=None)
+    x_test = np.arange(3) + 1
+    y_test = np.arange(9)
+    np.testing.assert_allclose(
+        new_out.eval({x: x_test, y: y_test}, mode=no_rewrite_mode),
+        out.eval({x: x_test, y: y_test}, mode=no_rewrite_mode),
+    )
 
 
 def test_local_reshape_lift():
@@ -523,6 +613,30 @@ class TestSameShape:
             shape_feature.same_shape(x, o, 0, 1)
 
 
+def test_get_shape_resolves_through_chain():
+    """get_shape should resolve to the deepest input, not intermediate ops."""
+    x = matrix("x")
+    w = matrix("w")
+    inner = cos(x)
+    y = sin(exp(inner.T))
+
+    fg = FunctionGraph([x, w], [y], clone=False)
+    sf = ShapeFeature()
+    fg.attach_feature(sf)
+
+    s = sf.get_shape(y, 0)
+    utt.assert_equal_computations([s], [Shape_i(1)(x)])
+
+    # Changing an input invalidates the cached shape of the changed node and of
+    # every node downstream of it, not just the node whose input changed. Here
+    # ``inner`` feeds the transpose, with ``exp`` and ``sin`` further downstream,
+    # so the re-query must resolve through ``w`` rather than returning the stale
+    # ``x``-based shape held by the downstream nodes' caches.
+    fg.replace(inner, cos(w))
+    s = sf.get_shape(y, 0)
+    utt.assert_equal_computations([s], [Shape_i(1)(w)])
+
+
 def test_useless_specify_shape():
     x = tensor("x", shape=(None, 5, 3))
 
@@ -580,12 +694,38 @@ def test_local_Shape_of_SpecifyShape_partial(s1):
     assert not any(isinstance(apply.op, SpecifyShape) for apply in fgraph.apply_nodes)
 
 
-def test_local_specify_shape_lift():
+def test_local_lift_specify_shape_elemwise():
     x = vector("x")
     out = specify_shape([1.0] + x, shape=(5,))  # noqa: RUF005
 
     new_out = rewrite_graph(out)
     assert equal_computations([new_out], [[1.0] + specify_shape(x, shape=(5,))])  # noqa: RUF005
+
+
+def test_local_lift_specify_shape_inc_subtensor():
+    x = matrix("x")
+    y = vector("y")
+    out = specify_shape(set_subtensor(x[1:4], y), shape=(5, None))
+
+    new_out = rewrite_graph(out)
+    assert equal_computations(
+        [new_out], [set_subtensor(specify_shape(x, shape=(5, None))[1:4], y)]
+    )
+
+
+def test_local_specify_shape_alloc():
+    x = scalar("x")
+    s1 = iscalar("s1")
+    s2 = iscalar("s2")
+
+    out = pt.specify_shape(alloc(x, s1), s2)
+
+    new_out = rewrite_graph(out, clone=True)
+    utt.assert_equal_computations([new_out], [alloc(x, s2)])
+
+    # Rewrite is excluded when shape_unsafe is excluded
+    new_out = rewrite_graph(out, clone=True, exclude=("shape_unsafe",))
+    utt.assert_equal_computations([out], [new_out])
 
 
 def test_local_Shape_i_ground():

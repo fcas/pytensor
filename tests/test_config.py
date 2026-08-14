@@ -143,17 +143,6 @@ class TestConfigTypes:
         with pytest.raises(ValueError, match="Non-str value"):
             configparser.EnumStr(default="red", options=["red", 12, "yellow"])
 
-    def test_deviceparam(self):
-        cp = configparser.DeviceParam("cpu", mutable=False)
-        assert cp.default == "cpu"
-        with pytest.raises(ValueError, match="It was removed from PyTensor"):
-            cp._apply("cuda123")
-        with pytest.raises(ValueError, match="It was removed from PyTensor"):
-            cp._apply("gpu123")
-        with pytest.raises(ValueError, match='Valid options start with one of "cpu".'):
-            cp._apply("notadevice")
-        assert str(cp) == "unnamed (cpu)"
-
 
 def test_config_context():
     root = _create_test_config()
@@ -192,7 +181,7 @@ def test_invalid_configvar_access():
 
     # But we can make sure that nothing crazy happens when we access it:
     with pytest.raises(configparser.ConfigAccessViolation, match="different instance"):
-        print(root.test__on_test_instance)
+        assert root.test__on_test_instance is not None
 
 
 def test_no_more_dotting():
@@ -233,9 +222,9 @@ def test_config_pickling():
     for name in root._config_var_dict:
         v_original = getattr(root, name)
         v_restored = getattr(restored, name)
-        assert (
-            v_restored == v_original
-        ), f"{name} did not survive pickling ({v_restored} != {v_original})"
+        assert v_restored == v_original, (
+            f"{name} did not survive pickling ({v_restored} != {v_original})"
+        )
 
     # and validate that the test would catch typical problems
     root = _create_test_config()
@@ -245,9 +234,12 @@ def test_config_pickling():
         configparser.IntParam(5, lambda i: i > 0),
         in_c_key=False,
     )
+    # Python 3.14 emits a pickle.PicklingError
+    # previous versions used to emit an AttributeError
+    # the error string changed a little bit too
     with pytest.raises(
-        AttributeError,
-        match="Can't (pickle|get) local object 'test_config_pickling.<locals>.<lambda>'",
+        (AttributeError, pickle.PicklingError),
+        match=r"Can't (pickle|get) local object .*test_config_pickling\.<locals>\.<lambda>",
     ):
         pickle.dump(root, io.BytesIO())
 

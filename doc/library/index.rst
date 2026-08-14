@@ -20,15 +20,12 @@ Modules
    d3viz/index
    graph/index
    gradient
-   misc/pkl_utils
    printing
-   sandbox/index
-   scalar/index
    scan
    sparse/index
-   sparse/sandbox
    tensor/index
    typed_list
+   xtensor/index
 
 .. module:: pytensor
    :platform: Unix, Windows
@@ -46,7 +43,7 @@ Graph
 
 .. function:: function(...)
 
-   Alias for :func:`pytensor.compile.function.function`
+   Alias for :func:`pytensor.compile.maker.function`
 
 .. autofunction:: pytensor.clone_replace(...)
 
@@ -64,10 +61,16 @@ Convert to Variable
 
 .. autofunction:: pytensor.as_symbolic(...)
 
+Wrap JAX functions
+==================
+
+.. autofunction:: wrap_jax(...)
+
+   Alias for :func:`pytensor.link.jax.ops.wrap_jax`
+
 Debug
 =====
 
 .. autofunction:: pytensor.dprint(...)
 
    Alias for :func:`pytensor.printing.debugprint`
-

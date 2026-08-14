@@ -1,25 +1,31 @@
 from itertools import chain
 
 from pytensor.compile import optdb
-from pytensor.configdefaults import config
 from pytensor.graph import ancestors
-from pytensor.graph.op import compute_test_value
-from pytensor.graph.rewriting.basic import copy_stack_trace, in2out, node_rewriter
-from pytensor.tensor import NoneConst, TensorVariable
+from pytensor.graph.rewriting.basic import (
+    copy_stack_trace,
+    dfs_rewriter,
+    node_rewriter,
+)
+from pytensor.tensor import TensorVariable
 from pytensor.tensor.basic import constant
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.extra_ops import broadcast_to
-from pytensor.tensor.random.op import RandomVariable
+from pytensor.tensor.random.op import RandomVariable, RNGConsumerOp
 from pytensor.tensor.random.utils import broadcast_params
+from pytensor.tensor.rewriting.basic import (
+    register_canonicalize,
+    register_stabilize,
+    register_useless,
+)
 from pytensor.tensor.shape import Shape, Shape_i
 from pytensor.tensor.subtensor import (
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     Subtensor,
-    get_idx_list,
+    indices_from_subtensor,
 )
 from pytensor.tensor.type import integer_dtypes
-from pytensor.tensor.type_other import NoneTypeT, SliceType
+from pytensor.tensor.type_other import NoneTypeT
 
 
 def is_rv_used_in_graph(base_rv, node, fgraph):
@@ -43,21 +49,20 @@ def is_rv_used_in_graph(base_rv, node, fgraph):
 def random_make_inplace(fgraph, node):
     op = node.op
 
-    if isinstance(op, RandomVariable) and not op.inplace:
-        props = op._props_dict()
-        props["inplace"] = True
-        new_op = type(op)(**props)
-        new_outputs = new_op.make_node(*node.inputs).outputs
-        for old_out, new_out in zip(node.outputs, new_outputs, strict=True):
-            copy_stack_trace(old_out, new_out)
-        return new_outputs
-
-    return False
+    if op.inplace:
+        return False
+    props = op._props_dict()
+    props["inplace"] = True
+    new_op = type(op)(**props)
+    new_outputs = new_op.make_node(*node.inputs).outputs
+    for old_out, new_out in zip(node.outputs, new_outputs, strict=True):
+        copy_stack_trace(old_out, new_out)
+    return new_outputs
 
 
 optdb.register(
     "random_make_inplace",
-    in2out(random_make_inplace, ignore_newtrees=True),
+    dfs_rewriter(random_make_inplace, ignore_newtrees=True),
     "fast_run",
     "inplace",
     position=50.9,
@@ -105,9 +110,6 @@ def local_rv_size_lift(fgraph, node):
     ]
 
     new_node = node.op.make_node(rng, None, *dist_params)
-
-    if config.compute_test_value != "off":
-        compute_test_value(new_node)
 
     return new_node.outputs
 
@@ -180,9 +182,6 @@ def local_dimshuffle_rv_lift(fgraph, node):
 
     new_node = rv_op.make_node(rng, new_size, *new_dist_params)
 
-    if config.compute_test_value != "off":
-        compute_test_value(new_node)
-
     new_next_rng, new_rv = new_node.outputs
 
     if rv.name:
@@ -196,7 +195,7 @@ def local_dimshuffle_rv_lift(fgraph, node):
     }
 
 
-@node_rewriter([Subtensor, AdvancedSubtensor1, AdvancedSubtensor])
+@node_rewriter([Subtensor, AdvancedSubtensor])
 def local_subtensor_rv_lift(fgraph, node):
     """Lift a ``*Subtensor`` through ``RandomVariable`` inputs.
 
@@ -233,16 +232,14 @@ def local_subtensor_rv_lift(fgraph, node):
         return False
 
     # Parse indices
-    indices = get_idx_list(node.inputs, getattr(subtensor_op, "idx_list", None))
-
+    if isinstance(subtensor_op, Subtensor | AdvancedSubtensor):
+        indices = indices_from_subtensor(node.inputs[1:], subtensor_op.idx_list)
+    else:
+        indices = node.inputs[1:]
     # The rewrite doesn't apply if advanced indexing could broadcast the samples (leading to duplicates)
-    # Note: For simplicity this also excludes subtensor-related expand_dims (np.newaxis).
-    #  If we wanted to support that we could rewrite it as subtensor + dimshuffle
-    #  and make use of the dimshuffle lift rewrite
-    if any(
-        is_nd_advanced_idx(idx, integer_dtypes) or NoneConst.equals(idx)
-        for idx in indices
-    ):
+    # TODO: This rewrite is aborting with dummy indexing dimensions which aren't a problem
+    # (e.g., x[[0],] is equivalent to x[0] - can only index one entry, won't lead to duplicates)
+    if any(is_nd_advanced_idx(idx, integer_dtypes) for idx in indices):
         return False
 
     # Check that indexing does not act on support dims
@@ -261,10 +258,7 @@ def local_subtensor_rv_lift(fgraph, node):
             non_bool_indices[batch_ndims:],
         )
         for idx in supp_indices:
-            if not (
-                isinstance(idx.type, SliceType)
-                and all(NoneConst.equals(i) for i in idx.owner.inputs)
-            ):
+            if idx != slice(None):
                 return False
         n_discarded_idxs = len(supp_indices)
         indices = indices[:-n_discarded_idxs]
@@ -279,7 +273,7 @@ def local_subtensor_rv_lift(fgraph, node):
 
         # Use shape_feature to facilitate inferring final shape.
         # Check that neither the RV nor the old Subtensor are in the shape graph.
-        output_shape = fgraph.shape_feature.shape_of.get(indexed_rv, None)
+        output_shape = shape_feature.shape_tuple(indexed_rv)
         if output_shape is None or {indexed_rv, rv} & set(ancestors(output_shape)):
             return None
 
@@ -324,7 +318,7 @@ def local_subtensor_rv_lift(fgraph, node):
                 # Broadcasted dim
                 if curr_dim in bcast_param_dims:
                     # Slice indexing, keep degenerate dim by none-slicing
-                    if isinstance(idx, slice) or isinstance(idx.type, SliceType):
+                    if isinstance(idx, slice):
                         batch_indices.append(slice(None))
                     # Integer indexing, drop degenerate dim by 0-indexing
                     else:
@@ -349,3 +343,43 @@ def local_subtensor_rv_lift(fgraph, node):
         indexed_rv: new_rv,
         next_rng: new_next_rng,
     }
+
+
+@register_useless("random_unsafe")
+@register_canonicalize("fast_compile", "random_unsafe")
+@register_stabilize("random_unsafe")
+@node_rewriter(tracks=[RNGConsumerOp])
+def sidestep_unused_rng_consumer(fgraph, node):
+    """Bypass an RNGConsumerOp when only the RNG outputs are used.
+
+    When an RNGConsumerOp's non-RNG outputs have no clients, the op can be
+    removed by connecting each RNG output directly to its corresponding
+    RNG input (as given by `op.update(node)`).
+
+    This can happen when chaining multiple RNGs but only keeping some of
+    the draws, or when only the shape is needed and is eventually lifted
+    away from the RV.
+
+    This alters the RNG state and can affect subsequent draws or the
+    final returned RNG. Hence, this rewrite is tagged as `random_unsafe`.
+    """
+    op = node.op
+    update_map = op.update(node)
+    if not update_map:
+        return None
+
+    rng_outputs = set(update_map.values())
+    non_rng_outputs = [out for out in node.outputs if out not in rng_outputs]
+
+    if any(fgraph.clients[out] for out in non_rng_outputs):
+        return None
+
+    # Don't sidestep if any input RNG has other clients.
+    # The graph likely has duplicate nodes that will be merged later,
+    # and sidestepping now would destroy the RNG update prematurely.
+    rng_inputs = set(update_map.keys())
+    if any(len(fgraph.clients[rng_in]) > 1 for rng_in in rng_inputs):
+        return None
+
+    # Bypass: map each RNG output back to its corresponding RNG input
+    return {rng_out: rng_in for rng_in, rng_out in update_map.items()}

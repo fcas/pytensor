@@ -1,14 +1,15 @@
 import itertools
 import pickle
 
-import numpy as np
 import pytest
 
 from pytensor.configdefaults import config
-from pytensor.graph.basic import NominalVariable
-from pytensor.graph.fg import FunctionGraph, Output
+from pytensor.graph.basic import NominalVariable, equal_computations
+from pytensor.graph.fg import FrozenFunctionGraph, FunctionGraph, Output
 from pytensor.graph.utils import MissingInputError
 from pytensor.printing import debugprint
+from pytensor.scalar.basic import ScalarConstant, add, float64, mul
+from pytensor.tensor import reshape, stack, vector
 from tests.graph.utils import (
     MyConstant,
     MyOp,
@@ -18,6 +19,8 @@ from tests.graph.utils import (
     op1,
     op2,
     op3,
+    op_y,
+    op_z,
 )
 
 
@@ -56,14 +59,14 @@ class TestFunctionGraph:
         with pytest.raises(TypeError, match="'Variable' object is not iterable"):
             FunctionGraph(var1, [var2])
 
-        with pytest.raises(TypeError, match="'Variable' object is not reversible"):
+        with pytest.raises(TypeError, match="'Variable' object is not iterable"):
             FunctionGraph([var1], var2)
 
         with pytest.raises(
             ValueError,
             match=(
-                "One of the provided inputs is the output of an already existing node. "
-                "If that is okay, either discard that input's owner or use graph.clone."
+                "One of the provided inputs is the output of an already existing node\\. "
+                "If that is okay, either discard that input's owner or use graph\\.clone\\."
             ),
         ):
             var3 = op1(var1)
@@ -208,7 +211,7 @@ class TestFunctionGraph:
         assert var5 in fg.variables
         assert var5.owner in fg.apply_nodes
 
-        with pytest.raises(TypeError, match="Computation graph contains.*"):
+        with pytest.raises(TypeError, match=r"Computation graph contains.*"):
             from pytensor.graph.null_type import NullType
 
             fg.import_var(NullType()(), "testing")
@@ -247,26 +250,6 @@ class TestFunctionGraph:
 
         assert var5.owner.inputs[1] is var1
         assert (var5.owner, 1) not in fg.get_clients(var2)
-
-    @config.change_flags(compute_test_value="raise")
-    def test_replace_test_value(self):
-        var1 = MyVariable("var1")
-        var1.tag.test_value = 1
-        var2 = MyVariable("var2")
-        var2.tag.test_value = 2
-        var3 = op1(var2, var1)
-        var4 = op2(var3, var2)
-        var4.tag.test_value = np.array([1, 2])
-        var5 = op3(var4, var2, var2)
-        fg = FunctionGraph([var1, var2], [var3, var5], clone=False)
-
-        var6 = op3()
-        var6.tag.test_value = np.array(0)
-
-        assert var6.tag.test_value.shape != var4.tag.test_value.shape
-
-        with pytest.raises(AssertionError, match="The replacement.*"):
-            fg.replace(var4, var6)
 
     def test_replace(self):
         var1 = MyVariable("var1")
@@ -342,12 +325,12 @@ class TestFunctionGraph:
         var5 = op3(var4, var2, var2)
         fg = FunctionGraph([var1, var2], [var3, var5], clone=False)
 
-        with pytest.raises(Exception, match="The following nodes are .*"):
+        with pytest.raises(Exception, match=r"The following nodes are .*"):
             fg.apply_nodes.remove(var5.owner)
 
             fg.check_integrity()
 
-        with pytest.raises(Exception, match="Inconsistent clients.*"):
+        with pytest.raises(Exception, match=r"Inconsistent clients.*"):
             fg.apply_nodes.add(var5.owner)
             fg.remove_client(var2, (var5.owner, 1))
 
@@ -355,14 +338,14 @@ class TestFunctionGraph:
 
         fg.add_client(var2, (var5.owner, 1))
 
-        with pytest.raises(Exception, match="The following variables are.*"):
+        with pytest.raises(Exception, match=r"The following variables are.*"):
             fg.variables.remove(var4)
 
             fg.check_integrity()
 
         fg.variables.add(var4)
 
-        with pytest.raises(Exception, match="Undeclared input.*"):
+        with pytest.raises(Exception, match=r"Undeclared input.*"):
             var6 = MyVariable2("var6")
             fg.clients[var6] = [(var5.owner, 3)]
             fg.variables.add(var6)
@@ -376,26 +359,26 @@ class TestFunctionGraph:
         # TODO: What if the index value is greater than 1?  It will throw an
         # `IndexError`, but that doesn't sound like anything we'd want.
         out_node = Output(idx=1).make_node(var4)
-        with pytest.raises(Exception, match="Inconsistent clients list.*"):
+        with pytest.raises(Exception, match=r"Inconsistent clients list.*"):
             fg.add_client(var4, (out_node, 0))
 
             fg.check_integrity()
 
         fg.remove_client(var4, (out_node, 0))
 
-        with pytest.raises(TypeError, match="The first entry of.*"):
+        with pytest.raises(TypeError, match=r"The first entry of.*"):
             fg.add_client(var4, (None, 0))
 
         var7 = op1(var4)
 
-        with pytest.raises(Exception, match="Client not in FunctionGraph.*"):
+        with pytest.raises(Exception, match=r"Client not in FunctionGraph.*"):
             fg.add_client(var4, (var7.owner, 0))
 
             fg.check_integrity()
 
         fg.remove_client(var4, (var7.owner, 0))
 
-        with pytest.raises(Exception, match="Inconsistent clients list.*"):
+        with pytest.raises(Exception, match=r"Inconsistent clients list.*"):
             fg.add_client(var4, (var3.owner, 0))
 
             fg.check_integrity()
@@ -731,3 +714,358 @@ class TestFunctionGraph:
         o1 = op1(r1, r2)
         fg = FunctionGraph([r1, r2], [o1], clone=False)
         assert fg.dprint(file="str") == debugprint(fg, file="str")
+
+    def test_optimizer_verbose(self, capsys):
+        x = MyVariable("x")
+        y = MyVariable("y")
+        z = MyVariable("z")
+
+        o1 = op1(x, y)
+        fgraph = FunctionGraph([x, y, z], [o1], clone=False)
+
+        with config.change_flags(optimizer_verbose=False):
+            fgraph.replace(y, z, reason="y->z")
+
+        cap_out = capsys.readouterr().out
+        assert cap_out == ""
+
+        with config.change_flags(optimizer_verbose=True):
+            fgraph.replace(z, y, reason="z->y")
+
+        cap_out = capsys.readouterr().out
+        assert "z->y" in cap_out
+
+        with config.change_flags(
+            optimizer_verbose=True, optimizer_verbose_ignore="y->z"
+        ):
+            fgraph.replace(y, z, reason="y->z")
+            fgraph.replace(z, y, reason="z->y")
+
+        cap_out = capsys.readouterr().out
+        assert "y->z" not in cap_out
+        assert "z->y" in cap_out
+
+        with config.change_flags(
+            optimizer_verbose=True, optimizer_verbose_ignore="y->z,z->y"
+        ):
+            fgraph.replace(y, z, reason="y->z")
+            fgraph.replace(z, y, reason="z->y")
+
+        cap_out = capsys.readouterr().out
+        assert "y->z" not in cap_out
+        assert "z->y" not in cap_out
+
+
+class TestFrozenFunctionGraph:
+    def test_hashability_and_comparison(self):
+        var1, var2 = MyVariable("x"), MyVariable("y")
+
+        # op_y and op_z are both MyOp(x=1), so they are structurally equal
+        ffg1 = FunctionGraph([var1, var2], [op_y(var1, var2)]).freeze()
+        ffg2 = FunctionGraph([var1, var2], [op_z(var1, var2)]).freeze()
+        # Structurally different op (different x value)
+        op_different = MyOp("Different", x=2)
+        ffg_different = FunctionGraph([var1, var2], [op_different(var1, var2)]).freeze()
+
+        assert ffg1 == ffg2
+        assert hash(ffg1) == hash(ffg2)
+        assert ffg1 != ffg_different
+
+        assert {ffg1: "value"}[ffg2] == "value"
+        assert len({ffg1, ffg2}) == 1
+
+    def test_nominal_inputs_renumbered(self):
+        """Inputs are always renumbered 0..n regardless of original ids."""
+        t = MyType()
+        nm5, nm10 = NominalVariable(5, t), NominalVariable(10, t)
+
+        ffg = FunctionGraph([nm5, nm10], [op1(nm5, nm10)]).freeze()
+        assert [inp.id for inp in ffg.inputs] == [0, 1]
+
+    def test_deduplication(self):
+        var1 = MyVariable("x")
+
+        dup1, dup2 = op1(var1), op1(var1)
+        frozen = FunctionGraph([var1], [op2(dup1, dup2)]).freeze()
+        assert {n.op for n in frozen.apply_nodes} == {op1, op2}
+
+        c1 = MyConstant("c", data=42)
+        c2 = MyConstant("c", data=42)
+        frozen_const = FunctionGraph(
+            [var1], [op2(op1(var1, c1), op1(var1, c2))]
+        ).freeze()
+        assert {n.op for n in frozen_const.apply_nodes} == {op1, op2}
+
+    def test_input_passed_directly_to_output(self):
+        var1 = MyVariable("x")
+        frozen = FunctionGraph([var1], [var1]).freeze()
+
+        assert frozen.apply_nodes == set()
+        assert isinstance(frozen.outputs[0], NominalVariable)
+
+    def test_cross_graph_output_identity(self):
+        var1, var2 = MyVariable("x"), MyVariable("y")
+        ffg1 = FunctionGraph([var1, var2], [op1(var1, var2)]).freeze()
+        ffg2 = FunctionGraph([var1, var2], [op1(var1, var2)]).freeze()
+
+        assert all(a is b for a, b in zip(ffg1.outputs, ffg2.outputs))
+
+    def test_pickle_round_trip(self):
+        x, y = float64("x"), float64("y")
+        ffg = FunctionGraph([x, y], [mul(add(x, y), y)]).freeze()
+
+        ffg2 = pickle.loads(pickle.dumps(ffg))
+        assert ffg == ffg2
+        assert hash(ffg) == hash(ffg2)
+        # Interned objects survive pickle
+        assert all(o1 is o2 for o1, o2 in zip(ffg.outputs, ffg2.outputs))
+
+    def test_pickle_with_constants(self):
+        x = float64("x")
+        c = ScalarConstant(float64, 3.14)
+        ffg = FunctionGraph([x], [add(x, c)]).freeze()
+
+        ffg2 = pickle.loads(pickle.dumps(ffg))
+        assert ffg == ffg2
+        assert hash(ffg) == hash(ffg2)
+
+    def test_pickle_identity_output(self):
+        """Pickle round-trip when an input is passed directly to the output."""
+        var1 = MyVariable("x")
+        ffg = FunctionGraph([var1], [var1]).freeze()
+
+        ffg2 = pickle.loads(pickle.dumps(ffg))
+        assert ffg == ffg2
+        assert hash(ffg) == hash(ffg2)
+
+    def test_pickle_multi_output_shared_subexpr(self):
+        """Pickle round-trip with multiple outputs sharing subexpressions."""
+        x, y = float64("x"), float64("y")
+        shared = add(x, y)
+        out1 = mul(shared, x)
+        out2 = add(shared, y)
+        ffg = FunctionGraph([x, y], [out1, out2]).freeze()
+
+        ffg2 = pickle.loads(pickle.dumps(ffg))
+        assert ffg == ffg2
+        assert hash(ffg) == hash(ffg2)
+
+    def test_pickle_hash_stability(self):
+        """Hash is the same before and after pickle, and across independent constructions."""
+        x, y = float64("x"), float64("y")
+        ffg = FunctionGraph([x, y], [mul(add(x, y), y)]).freeze()
+        h_before = hash(ffg)
+
+        ffg2 = pickle.loads(pickle.dumps(ffg))
+        assert hash(ffg2) == h_before
+
+        ffg3 = FunctionGraph([x, y], [mul(add(x, y), y)]).freeze()
+        assert hash(ffg3) == h_before
+
+    def test_different_arity_not_equal(self):
+        """Graphs with different numbers of inputs must not be equal, even if outputs match."""
+        var1, var2 = MyVariable("x"), MyVariable("y")
+        # op1(var1) uses only var1
+        ffg1 = FunctionGraph([var1], [op1(var1)]).freeze()
+        ffg2 = FunctionGraph([var1, var2], [op1(var1)]).freeze()
+        assert ffg1 != ffg2
+
+    def test_orphan_non_constant_raises(self):
+        var1 = MyVariable("x")
+        orphan = MyVariable("orphan")
+        out = op1(var1, orphan)
+        with pytest.raises(ValueError, match=r"Orphan.*orphan"):
+            FrozenFunctionGraph.from_io([var1], [out])
+
+    def test_unmapped_output_raises(self):
+        var1 = MyVariable("x")
+        disconnected = MyVariable("disconnected")
+        with pytest.raises(ValueError, match="could not be mapped"):
+            FrozenFunctionGraph.from_io([var1], [disconnected])
+
+    def test_interned_constant_in_variables(self):
+        """Regression test: all node inputs must appear in variables.
+
+        FrozenApply interns whole nodes, not individual constants. A cache
+        miss stores the current constant (c2), while a cache hit for a
+        different node returns a previously interned constant (c1). If the
+        cache hit overwrites memo[c2]=c1, c2 is evicted from variables
+        while the cache-miss node still references it.
+        """
+        op_shared = MyOp("shared")
+        op_unique = MyOp("unique")
+
+        # Populate FrozenApply cache: op_shared(NomVar_0, c1)
+        x1 = MyVariable("x")
+        c1 = MyConstant("c", data=42)
+        FrozenFunctionGraph.from_io([x1], [op_shared(x1, c1)])
+
+        # New graph with a fresh constant c2 (same value, different object).
+        # op_unique: cache miss → FrozenApply stores c2
+        # op_shared: cache hit from above → FrozenApply has c1
+        # Both c1 and c2 must be in variables.
+        x2 = MyVariable("x")
+        c2 = MyConstant("c", data=42)
+        fg = FrozenFunctionGraph.from_io([x2], [op_shared(x2, c2), op_unique(x2, c2)])
+
+        for node in fg.toposort():
+            for inp in node.inputs:
+                assert inp in fg.variables
+
+    def test_constant_output_equality(self):
+        """FFGs with distinct but equal constant outputs should be equal."""
+        c1 = ScalarConstant(float64, 3.14)
+        c2 = ScalarConstant(float64, 3.14)
+        assert c1 is not c2
+
+        ffg1 = FrozenFunctionGraph.from_io([], [c1])
+        ffg2 = FrozenFunctionGraph.from_io([], [c2])
+        assert ffg1 == ffg2
+        assert hash(ffg1) == hash(ffg2)
+        assert ffg1.outputs == ffg2.outputs
+
+    def test_output_clients(self):
+        """Output variables should have dummy Output node clients."""
+        x, y = float64("x"), float64("y")
+        ffg = FunctionGraph([x, y], [mul(add(x, y), y)]).freeze()
+
+        for i, out in enumerate(ffg.outputs):
+            out_clients = ffg.clients[out]
+            output_clients = [
+                (node, idx) for node, idx in out_clients if isinstance(node.op, Output)
+            ]
+            assert len(output_clients) == 1
+            node, idx = output_clients[0]
+            assert node.op.idx == i
+            assert idx == 0
+
+    def test_freeze_unfreeze_round_trip(self):
+        x, y = float64("x"), float64("y")
+        ffg = FunctionGraph([x, y], [mul(add(x, y), y)]).freeze()
+
+        refrozen = ffg.unfreeze().freeze()
+
+        assert ffg == refrozen
+        assert hash(ffg) == hash(refrozen)
+
+    def test_value_dependent_output_type_collision(self):
+        """Output types are part of the interning key.
+
+        Freezing roots an inner graph on ``NominalVariable`` inputs (index + type
+        only), discarding each input's value and defining subgraph. For an Op
+        whose output type is derived from that information -- here ``Reshape``,
+        which sets ``_output_type_depends_on_input_value`` -- ``(op, inputs)``
+        alone no longer determines the output type after nominalization. Two such
+        graphs differing only in those erased details must stay distinct rather
+        than collapse onto whichever was interned first.
+
+        Regression for the ``FrozenApply`` collision behind issue #2202.
+        """
+
+        x = vector("x", shape=(6,))
+        s1 = stack([2, 3])
+        s2 = stack([3, 2])
+
+        rs1 = reshape(x, s1)
+        rs2 = reshape(x, s2)
+        assert rs1.type.shape == (2, 3)
+        assert rs2.type.shape == (3, 2)
+
+        # s1/s2 are MakeVector variables used as inputs, so freezing nominalizes them and
+        # discards the [2,3]/[3,2] values that informed each reshape's output shape.
+        ffg1 = FrozenFunctionGraph.from_io([x, s1], [rs1])
+        ffg2 = FrozenFunctionGraph.from_io([x, s2], [rs2])
+
+        # The original output types are part of the FrozenApply key, so the fgraphs aren't identical.
+        # Alternative design: the two ffg get merged with a general output type (None, None)
+        # Similar to what `clone_replace(rs1, {s1: s1.type()}, rebuild_strict=False)` would do.
+        # That would require calling make_node on every interned node (or only on Ops with
+        # `_output_type_depends_on_input_value=True`, but then that flag becomes a mandatory Op contract).
+        assert ffg1 != ffg2
+        assert ffg1.outputs[0].type.shape == (2, 3)
+        assert ffg2.outputs[0].type.shape == (3, 2)
+
+        # ``bind`` reproduces each graph's own output type, not a collided one
+        assert ffg1.bind([x, s1])[0].type.shape == (2, 3)
+        assert ffg2.bind([x, s2])[0].type.shape == (3, 2)
+
+    def test_bind_constant_output(self):
+        """bind must handle constants that appear directly as outputs."""
+        x = float64("x")
+        c = ScalarConstant(float64, 42.0)
+        # c2 appears *only* as an output, never as a node input
+        c2 = ScalarConstant(float64, 7.0)
+        ffg = FunctionGraph([x], [add(x, c), c, c2]).freeze()
+
+        y = float64("y")
+        bound, memo = ffg.bind({ffg.inputs[0]: y}, return_memo=True)
+        assert len(bound) == 3
+        assert bound[1] is c
+        assert bound[2].data == 7.0
+        # Callers index the memo with inner outputs directly (e.g. ScanMerge),
+        # so it must cover constant-only outputs too.
+        assert memo[ffg.outputs[1]] is bound[1]
+        assert memo[ffg.outputs[2]] is bound[2]
+
+    def test_from_structural_inputs_only_root_inputs(self):
+        """All inputs are roots: behaves like the plain constructor."""
+        x, y = float64("x"), float64("y")
+        out = add(x, y)
+
+        ffg = FrozenFunctionGraph.from_structural_inputs([x, y], [out])
+        assert len(ffg.inputs) == 2
+
+        a, b = float64("a"), float64("b")
+        [res] = ffg.bind(dict(zip(ffg.inputs, [a, b], strict=True)))
+        assert equal_computations([res], [add(a, b)])
+
+    def test_from_structural_inputs_only_intermediate_inputs(self):
+        """Inputs may be only intermediate expressions; roots are found automatically."""
+        x, y = float64("x"), float64("y")
+        # out depends on x, y only through the product.
+        out = add(mul(x, y), mul(x, y))
+
+        # The passed expression is matched by structure, not identity.
+        prod = mul(x, y)
+        assert prod is not out.owner.inputs[0]
+
+        ffg = FrozenFunctionGraph.from_structural_inputs([prod], [out])
+        assert len(ffg.inputs) == 1
+
+        p = float64("p")
+        [res] = ffg.bind({ffg.inputs[0]: p})
+        # Both occurrences rewire to the single input.
+        assert equal_computations([res], [add(p, p)])
+
+    def test_from_structural_inputs_mixed_inputs(self):
+        """A root input and an intermediate input, both live."""
+        x, y = float64("x"), float64("y")
+        out = add(mul(x, y), x)
+
+        ffg = FrozenFunctionGraph.from_structural_inputs([x, mul(x, y)], [out])
+        assert len(ffg.inputs) == 2
+
+        a, p = float64("a"), float64("p")
+        # x is used directly; root y is dropped (it feeds only the lifted product).
+        [res] = ffg.bind(dict(zip(ffg.inputs, [a, p], strict=True)))
+        assert equal_computations([res], [add(p, a)])
+
+    def test_from_structural_inputs_dead_inputs(self):
+        """A dead root input and a dead intermediate input are retained but ignored."""
+        x, y = float64("x"), float64("y")
+        out = add(x, x)  # uses neither y nor the product
+
+        ffg = FrozenFunctionGraph.from_structural_inputs([x, y, mul(x, y)], [out])
+        assert len(ffg.inputs) == 3
+
+        a, b, p = float64("a"), float64("b"), float64("p")
+        [res] = ffg.bind(dict(zip(ffg.inputs, [a, b, p], strict=True)))
+        assert equal_computations([res], [add(a, a)])
+
+    def test_from_structural_inputs_unreachable_output_raises(self):
+        """Outputs needing a root absent from the inputs cannot be expressed."""
+        x, y = float64("x"), float64("y")
+        out = add(mul(x, y), x)  # needs x directly, not only via the product
+
+        with pytest.raises(ValueError):
+            FrozenFunctionGraph.from_structural_inputs([mul(x, y)], [out])

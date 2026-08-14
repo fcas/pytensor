@@ -7,7 +7,6 @@ and inplace operations.
 import itertools
 from collections import deque
 
-import pytensor
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Constant
 from pytensor.graph.features import AlreadyThere, Bookkeeper
@@ -181,7 +180,7 @@ def _build_droot_impact(destroy_handler):
     impact = {}  # destroyed nonview variable -> it + all views of it
     root_destroyer = {}  # root -> destroyer apply
 
-    for app in destroy_handler.destroyers:
+    for app in destroy_handler._destroying_apps:
         for input_idx_list in app.op.destroy_map.values():
             if len(input_idx_list) != 1:
                 raise NotImplementedError()
@@ -223,7 +222,7 @@ def _build_droot_impact(destroy_handler):
     return droot, impact, root_destroyer
 
 
-def fast_inplace_check(fgraph, inputs):
+def inplace_candidates(fgraph, inputs, protected_inputs=None):
     """
     Return the variables in inputs that are possible candidate for as inputs of
     inplace operation.
@@ -234,22 +233,49 @@ def fast_inplace_check(fgraph, inputs):
         Inputs Variable that you want to use as inplace destination.
 
     """
-    Supervisor = pytensor.compile.function.types.Supervisor
-    protected_inputs = list(
-        itertools.chain.from_iterable(
-            f.protected for f in fgraph._features if isinstance(f, Supervisor)
-        )
-    )
-    protected_inputs.extend(fgraph.outputs)
+    if protected_inputs is None:
+        from pytensor.compile.aliasing import Supervisor
 
-    inputs = [
-        i
-        for i in inputs
-        if not isinstance(i, Constant)
-        and not fgraph.has_destroyers([i])
-        and i not in protected_inputs
-    ]
-    return inputs
+        protected_inputs = set(
+            itertools.chain.from_iterable(
+                f.protected for f in fgraph._features if isinstance(f, Supervisor)
+            )
+        )
+        protected_inputs.update(fgraph.outputs)
+
+    has_destroyers = fgraph.has_destroyers
+    view_i = fgraph.destroy_handler.view_i
+    candidate_roots = {}
+    candidate_inputs = []
+    for inp in inputs:
+        if isinstance(inp, Constant):
+            # Can't inplace on constants.
+            continue
+
+        # Find the root of the view chain, and while traversing check if it passes on any protected inputs.
+        view_of_protected = False
+        root = inp
+        try:
+            while True:
+                if root in protected_inputs:
+                    view_of_protected = True
+                root = view_i[root]
+        except KeyError:
+            pass
+
+        if root in candidate_roots:
+            # Another input views on the same root, we can't destroy either
+            if (invalid_candidate := candidate_roots[root]) is not None:
+                # Invalidate the previous candidate
+                candidate_inputs.remove(invalid_candidate)
+            candidate_roots[root] = None
+        elif not view_of_protected and not has_destroyers([inp]):
+            candidate_inputs.append(inp)
+            candidate_roots[root] = inp
+        else:
+            candidate_roots[root] = None
+
+    return candidate_inputs
 
 
 class DestroyHandler(Bookkeeper):
@@ -295,7 +321,7 @@ class DestroyHandler(Bookkeeper):
 
     """
 
-    pickle_rm_attr = ["destroyers", "has_destroyers"]
+    provides: tuple[str, ...] = ("destroyers", "has_destroyers")
 
     def __init__(self, do_imports_on_attach=True, algo=None):
         self.fgraph = None
@@ -352,7 +378,9 @@ class DestroyHandler(Bookkeeper):
 
         """
 
-        if any(hasattr(fgraph, attr) for attr in ("destroyers", "destroy_handler")):
+        if "destroyers" in fgraph._feature_methods or hasattr(
+            fgraph, "destroy_handler"
+        ):
             raise AlreadyThere("DestroyHandler feature is already present")
 
         if self.fgraph is not None and self.fgraph != fgraph:
@@ -360,66 +388,50 @@ class DestroyHandler(Bookkeeper):
                 "A DestroyHandler instance can only serve one FunctionGraph"
             )
 
-        # Annotate the FunctionGraph #
-        self.unpickle(fgraph)
         fgraph.destroy_handler = self
-
         self.fgraph = fgraph
-        self.destroyers = (
-            OrderedSet()
-        )  # set of Apply instances with non-null destroy_map
-        self.view_i = {}  # variable -> variable used in calculation
-        self.view_o = {}  # variable -> set of variables that use this one as a direct input
-        # clients: how many times does an apply use a given variable
-        self.clients = {}  # variable -> apply -> ninputs
+        self._destroying_apps = OrderedSet()
+        self.view_i = {}
+        self.view_o = {}
+        self.clients = {}
         self.stale_droot = True
-
         self.debug_all_apps = set()
         if self.do_imports_on_attach:
             Bookkeeper.on_attach(self, fgraph)
 
-    def unpickle(self, fgraph):
-        def get_destroyers_of(r):
+    def destroyers(self, fgraph, r):
+        droot, _, root_destroyer = self.refresh_droot_impact()
+        try:
+            return [root_destroyer[droot[r]]]
+        except Exception:
+            return []
+
+    def has_destroyers(self, fgraph, protected_list):
+        if self.algo != "fast":
             droot, _, root_destroyer = self.refresh_droot_impact()
-            try:
-                return [root_destroyer[droot[r]]]
-            except Exception:
-                return []
-
-        fgraph.destroyers = get_destroyers_of
-
-        def has_destroyers(protected_list):
-            if self.algo != "fast":
-                droot, _, root_destroyer = self.refresh_droot_impact()
-                for protected_var in protected_list:
-                    try:
-                        root_destroyer[droot[protected_var]]
-                        return True
-                    except KeyError:
-                        pass
-                return False
-
-            def recursive_destroys_finder(protected_var):
-                # protected_var is the idx'th input of app.
-                for app, idx in fgraph.clients[protected_var]:
-                    destroy_maps = app.op.destroy_map.values()
-                    # If True means that the apply node, destroys the protected_var.
-                    if idx in [dmap for sublist in destroy_maps for dmap in sublist]:
-                        return True
-                    for var_idx in app.op.view_map:
-                        if idx in app.op.view_map[var_idx]:
-                            # We need to recursively check the destroy_map of all the
-                            # outputs that we have a view_map on.
-                            if recursive_destroys_finder(app.outputs[var_idx]):
-                                return True
-                return False
-
             for protected_var in protected_list:
-                if recursive_destroys_finder(protected_var):
+                try:
+                    root_destroyer[droot[protected_var]]
                     return True
+                except KeyError:
+                    pass
             return False
 
-        fgraph.has_destroyers = has_destroyers
+        def recursive_destroys_finder(protected_var):
+            for app, idx in fgraph.clients[protected_var]:
+                destroy_maps = app.op.destroy_map.values()
+                if idx in [dmap for sublist in destroy_maps for dmap in sublist]:
+                    return True
+                for var_idx in app.op.view_map:
+                    if idx in app.op.view_map[var_idx]:
+                        if recursive_destroys_finder(app.outputs[var_idx]):
+                            return True
+            return False
+
+        for protected_var in protected_list:
+            if recursive_destroys_finder(protected_var):
+                return True
+        return False
 
     def refresh_droot_impact(self):
         """
@@ -435,14 +447,12 @@ class DestroyHandler(Bookkeeper):
     def on_detach(self, fgraph):
         if fgraph is not self.fgraph:
             raise Exception("detaching wrong fgraph", fgraph)
-        del self.destroyers
+        del self._destroying_apps
         del self.view_i
         del self.view_o
         del self.clients
         del self.stale_droot
-        assert self.fgraph.destroyer_handler is self
-        delattr(self.fgraph, "destroyers")
-        delattr(self.fgraph, "has_destroyers")
+        assert self.fgraph.destroy_handler is self
         delattr(self.fgraph, "destroy_handler")
         self.fgraph = None
 
@@ -509,7 +519,7 @@ class DestroyHandler(Bookkeeper):
         dmap = app.op.destroy_map
         vmap = app.op.view_map
         if dmap:
-            self.destroyers.add(app)
+            self._destroying_apps.add(app)
             if self.algo == "fast":
                 self.fast_destroy(fgraph, app, reason)
 
@@ -548,7 +558,7 @@ class DestroyHandler(Bookkeeper):
             del self.clients[input][app]
 
         if app.op.destroy_map:
-            self.destroyers.remove(app)
+            self._destroying_apps.remove(app)
 
         # Note: leaving empty client dictionaries in the struct.
         # Why? It's a pain to remove them. I think they aren't doing any harm, they will be
@@ -618,7 +628,7 @@ class DestroyHandler(Bookkeeper):
                 self.fast_destroy(fgraph, app, reason)
         self.stale_droot = True
 
-    def validate(self, fgraph):
+    def on_validate(self, fgraph):
         """
         Return None.
 
@@ -627,7 +637,7 @@ class DestroyHandler(Bookkeeper):
         b) orderings cannot be topologically sorted.
 
         """
-        if self.destroyers:
+        if self._destroying_apps:
             if self.algo == "fast":
                 if self.fail_validate:
                     app_err_pairs = self.fail_validate
@@ -676,7 +686,7 @@ class DestroyHandler(Bookkeeper):
         set_type = OrderedSet if ordered else set
         rval = {}
 
-        if self.destroyers:
+        if self._destroying_apps:
             # BUILD DATA STRUCTURES
             # CHECK for multiple destructions during construction of variables
 
@@ -694,7 +704,7 @@ class DestroyHandler(Bookkeeper):
                 )
 
             # add destroyed variable clients as computational dependencies
-            for app in self.destroyers:
+            for app in self._destroying_apps:
                 # keep track of clients that should run before the current Apply
                 root_clients = set_type()
                 # for each destroyed input...
@@ -745,9 +755,9 @@ class DestroyHandler(Bookkeeper):
                     }
                     tolerated.add(destroyed_idx)
                     tolerate_aliased = getattr(
-                        app.op, "destroyhandler_tolerate_aliased", []
+                        app.op, "destroyhandler_tolerate_aliased", ()
                     )
-                    assert isinstance(tolerate_aliased, list)
+                    assert isinstance(tolerate_aliased, tuple | list)
                     ignored = {
                         idx1 for idx0, idx1 in tolerate_aliased if idx0 == destroyed_idx
                     }

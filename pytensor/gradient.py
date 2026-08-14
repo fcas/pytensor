@@ -11,10 +11,9 @@ import numpy as np
 import pytensor
 from pytensor.compile.ops import ViewOp
 from pytensor.configdefaults import config
-from pytensor.graph import utils
-from pytensor.graph.basic import Apply, NominalVariable, Variable
+from pytensor.graph import utils, vectorize_graph
+from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.null_type import NullType, null_type
-from pytensor.graph.op import get_test_values
 from pytensor.graph.type import Type
 
 
@@ -25,12 +24,31 @@ if TYPE_CHECKING:
 V = TypeVar("V", bound=Variable | None)
 
 
+def _match_tangent_dtype(var: Variable, tangent: Variable) -> Variable:
+    """Cast a tangent/cotangent to match the dtype of the variable it corresponds to.
+
+    Float variables get their tangent cast to the same float dtype (to avoid
+    unnecessary precision upcasting). Integer/discrete variables are left alone,
+    since their tangents are legitimately float-valued.
+    """
+    var_dt = getattr(var.type, "dtype", None)
+    tangent_dt = getattr(tangent.type, "dtype", None)
+    if (
+        var_dt is not None
+        and tangent_dt is not None
+        and var_dt != tangent_dt
+        and var_dt not in pytensor.scalar.basic.discrete_dtypes
+    ):
+        tangent = tangent.astype(var_dt)  # type: ignore[attr-defined]
+    return tangent
+
+
 # TODO: Refactor this so that it's not a global variable
 grad_time: float = 0.0
 
 
 # TODO: Add `overload` variants
-def as_list_or_tuple(
+def as_list_or_tuple[V: Variable | None](
     use_list: bool, use_tuple: bool, outputs: V | Sequence[V]
 ) -> V | list[V] | tuple[V, ...]:
     """Return either a single object or a list/tuple of objects.
@@ -121,7 +139,7 @@ class DisconnectedType(Type):
             " a symbolic placeholder."
         )
 
-    def fiter_variable(self, other):
+    def filter_variable(self, other):
         raise AssertionError(
             "If you're assigning to a DisconnectedType you're"
             " doing something wrong. It should only be used as"
@@ -142,27 +160,61 @@ class DisconnectedType(Type):
 disconnected_type = DisconnectedType()
 
 
-def Rop(
-    f: Variable | Sequence[Variable],
-    wrt: Variable | Sequence[Variable],
-    eval_points: Variable | Sequence[Variable],
+def pushforward_through_pullback(
+    outputs: Sequence[Variable],
+    inputs: Sequence[Variable],
+    tangents: Sequence[Variable],
     disconnected_outputs: Literal["ignore", "warn", "raise"] = "raise",
     return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
-) -> Variable | None | Sequence[Variable | None]:
-    """Computes the R-operator applied to `f` with respect to `wrt` at `eval_points`.
+) -> Sequence[Variable | None]:
+    """Compute the push-forward through two applications of a pull-back operation.
 
-    Mathematically this stands for the Jacobian of `f` right multiplied by the
-    `eval_points`.
+    References
+    ----------
+    .. [1] J. Towns, "A new trick for calculating Jacobian vector products", 2017.
+           Available: https://j-towns.github.io/2017/06/12/A-new-trick.html
+
+    """
+    # Cotangents are just auxiliary variables that should be pruned from the final graph,
+    # but that would require a graph rewrite before the user tries to compile a pytensor function.
+    # To avoid trouble we use .zeros_like() instead of .type(), which does not create a new root variable.
+    cotangents = [out.zeros_like(dtype=config.floatX) for out in outputs]  # type: ignore
+
+    input_cotangents = pullback(
+        f=outputs,
+        wrt=inputs,
+        cotangents=cotangents,
+        disconnected_inputs=disconnected_outputs,
+        return_disconnected="zero",
+    )
+
+    return pullback(
+        f=input_cotangents,  # type: ignore
+        wrt=cotangents,
+        cotangents=tangents,
+        disconnected_inputs="ignore",
+        return_disconnected=return_disconnected,
+    )
+
+
+def _pushforward_direct(
+    f: Sequence[Variable],
+    wrt: Sequence[Variable],
+    tangents: Sequence[Variable],
+    disconnected_outputs: Literal["ignore", "warn", "raise"] = "raise",
+    return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
+) -> Sequence[Variable | None]:
+    """Compute the push-forward by directly calling :meth:`Op.pushforward` on each node.
 
     Parameters
     ----------
     f
-        The outputs of the computational graph to which the R-operator is
+        The outputs of the computational graph to which the push-forward is
         applied.
     wrt
-        Variables for which the R-operator of `f` is computed.
-    eval_points
-        Points at which to evaluate each of the variables in `wrt`.
+        Variables for which the push-forward of `f` is computed.
+    tangents
+        Tangent vectors, one for each variable in `wrt`.
     disconnected_outputs
         Defines the behaviour if some of the variables in `f`
         have no dependency on any of the variable in `wrt` (or if
@@ -182,45 +234,10 @@ def Rop(
     Returns
     -------
     :class:`~pytensor.graph.basic.Variable` or list/tuple of Variables
-        A symbolic expression such obeying
-        ``R_op[i] = sum_j (d f[i] / d wrt[j]) eval_point[j]``,
-        where the indices in that expression are magic multidimensional
-        indices that specify both the position within a list and all
-        coordinates of the tensor elements.
+        A symbolic expression for the Jacobian-vector product
+        ``Jvp[i] = sum_j (d f[i] / d wrt[j]) tangents[j]``.
         If `f` is a list/tuple, then return a list/tuple with the results.
     """
-
-    if not isinstance(wrt, list | tuple):
-        _wrt: list[Variable] = [pytensor.tensor.as_tensor_variable(wrt)]
-    else:
-        _wrt = [pytensor.tensor.as_tensor_variable(x) for x in wrt]
-
-    if not isinstance(eval_points, list | tuple):
-        _eval_points: list[Variable] = [pytensor.tensor.as_tensor_variable(eval_points)]
-    else:
-        _eval_points = [pytensor.tensor.as_tensor_variable(x) for x in eval_points]
-
-    if not isinstance(f, list | tuple):
-        _f: list[Variable] = [pytensor.tensor.as_tensor_variable(f)]
-    else:
-        _f = [pytensor.tensor.as_tensor_variable(x) for x in f]
-
-    if len(_wrt) != len(_eval_points):
-        raise ValueError("`wrt` must be the same length as `eval_points`.")
-
-    # Check that each element of wrt corresponds to an element
-    # of eval_points with the same dimensionality.
-    for i, (wrt_elem, eval_point) in enumerate(zip(_wrt, _eval_points, strict=True)):
-        try:
-            if wrt_elem.type.ndim != eval_point.type.ndim:
-                raise ValueError(
-                    f"Elements {i} of `wrt` and `eval_point` have mismatched dimensionalities: "
-                    f"{wrt_elem.type.ndim} and {eval_point.type.ndim}"
-                )
-        except AttributeError:
-            # wrt_elem and eval_point don't always have ndim like random type
-            # Tensor, Sparse have the ndim attribute
-            pass
 
     seen_nodes: dict[Apply, Sequence[Variable]] = {}
 
@@ -233,78 +250,59 @@ def Rop(
         op = node.op
         inputs = node.inputs
 
-        # Compute the evaluation points corresponding to each of the
+        # Compute the tangents corresponding to each of the
         # inputs of the node
-        local_eval_points = []
+        local_tangents = []
         for inp in inputs:
-            if inp in _wrt:
-                local_eval_points.append(_eval_points[_wrt.index(inp)])
+            if inp in wrt:
+                local_tangents.append(tangents[wrt.index(inp)])
             elif inp.owner is None:
                 try:
-                    local_eval_points.append(inp.zeros_like())
+                    local_tangents.append(inp.zeros_like())
                 except Exception:
-                    # None should be used for non-differentiable
-                    # arguments, like for example random states
-                    local_eval_points.append(None)
+                    local_tangents.append(disconnected_type())
             elif inp.owner in seen_nodes:
-                local_eval_points.append(
+                local_tangents.append(
                     seen_nodes[inp.owner][inp.owner.outputs.index(inp)]
                 )
 
             else:
-                # We actually need to compute the R_op for this node
+                # We actually need to compute the pushforward for this node
 
                 _traverse(inp.owner)
-                local_eval_points.append(
+                local_tangents.append(
                     seen_nodes[inp.owner][inp.owner.outputs.index(inp)]
                 )
-        same_type_eval_points = []
-        for x, y in zip(inputs, local_eval_points, strict=True):
-            if y is not None:
+        matched_tangents = []
+        for x, y in zip(inputs, local_tangents, strict=True):
+            if not isinstance(y.type, DisconnectedType):
                 if not isinstance(x, Variable):
                     x = pytensor.tensor.as_tensor_variable(x)
                 if not isinstance(y, Variable):
                     y = pytensor.tensor.as_tensor_variable(y)
-                try:
-                    y = x.type.filter_variable(y)
-                except TypeError:
-                    # This is a hack
-                    # Originally both grad and Rop were written
-                    # with the assumption that a variable and the
-                    # gradient wrt that variable would have the same
-                    # dtype. This was a bad assumption because the
-                    # gradient wrt an integer can take on non-integer
-                    # values.
-                    # grad is now fixed, but Rop is not, so when grad
-                    # does the right thing and violates this assumption
-                    # we have to make it be wrong for Rop to keep working
-                    # Rop should eventually be upgraded to handle integers
-                    # correctly, the same as grad
-                    y = pytensor.tensor.cast(y, x.type.dtype)
-                    y = x.type.filter_variable(y)
-                assert x.type.in_same_class(y.type)
-                same_type_eval_points.append(y)
+                y = _match_tangent_dtype(x, y)
+                matched_tangents.append(y)
             else:
-                same_type_eval_points.append(y)
+                matched_tangents.append(y)
 
-        seen_nodes[node] = op.R_op(node.inputs, same_type_eval_points)
+        seen_nodes[node] = op.pushforward(node.inputs, node.outputs, matched_tangents)
 
     # end _traverse
 
     # Populate the dictionary
-    for out in _f:
+    for out in f:
         _traverse(out.owner)
 
     rval: list[Variable | None] = []
-    for out in _f:
-        if out in _wrt:
-            rval.append(_eval_points[_wrt.index(out)])
-        elif (
-            seen_nodes.get(out.owner, None) is None
-            or seen_nodes[out.owner][out.owner.outputs.index(out)] is None
+    for out in f:
+        if out in wrt:
+            rval.append(tangents[wrt.index(out)])
+        elif seen_nodes.get(out.owner, None) is None or isinstance(
+            seen_nodes[out.owner][out.owner.outputs.index(out)].type,
+            DisconnectedType,
         ):
             message = (
-                "Rop method was asked to compute the gradient "
+                "pushforward was asked to compute the Jacobian-vector product "
                 "with respect to a variable that is not part of "
                 "the computational graph of variables in wrt, or is "
                 f"used only by a non-differentiable operator: {out}"
@@ -337,32 +335,142 @@ def Rop(
         else:
             rval.append(seen_nodes[out.owner][out.owner.outputs.index(out)])
 
+    return rval
+
+
+def pushforward(
+    f: Variable | Sequence[Variable],
+    wrt: Variable | Sequence[Variable],
+    tangents: Variable | Sequence[Variable],
+    disconnected_outputs: Literal["ignore", "warn", "raise"] = "raise",
+    return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
+    use_op_pushforward: bool = False,
+) -> Variable | None | Sequence[Variable | None]:
+    """Compute the push-forward (Jacobian-vector product) of `f` with respect to `wrt` at `tangents`.
+
+    Mathematically this computes the Jacobian of `f` right-multiplied by the
+    `tangents`.
+
+    By default, the push-forward is implemented as a double application of pullback [1]_.
+    In most cases this should be as performant as a specialized implementation.
+    However, PyTensor may sometimes fail to prune dead branches or fuse common expressions within composite operators,
+    such as Scan and OpFromGraph, that would be more easily avoidable in a direct implementation.
+
+    When this is a concern, it is possible to force ``pushforward`` to use the specialized :meth:`Op.pushforward`
+    methods by passing ``use_op_pushforward=True``. Note that this will fail if the graph contains Ops
+    that don't implement this method.
+
+    Parameters
+    ----------
+    f
+        The outputs of the computational graph to which the push-forward is
+        applied.
+    wrt
+        Variables for which the push-forward of `f` is computed.
+    tangents
+        Tangent vectors, one for each variable in `wrt`.
+    disconnected_outputs
+        Defines the behaviour if some of the variables in `f`
+        have no dependency on any of the variable in `wrt` (or if
+        all links are non-differentiable). The possible values are:
+
+        - ``'ignore'``: considers that the gradient on these parameters is zero.
+        - ``'warn'``: consider the gradient zero, and print a warning.
+        - ``'raise'``: raise `DisconnectedInputError`.
+
+    return_disconnected
+        - ``'zero'`` : If ``wrt[i]`` is disconnected, return value ``i`` will be
+          ``wrt[i].zeros_like()``.
+        - ``'none'`` : If ``wrt[i]`` is disconnected, return value ``i`` will be
+          ``None``
+        - ``'disconnected'`` : returns variables of type `DisconnectedType`
+    use_op_pushforward : bool, default=False
+        If ``False``, we obtain the push-forward via double application of pullback.
+        If ``True``, the :meth:`Op.pushforward` implementation is used directly.
+        The number of graphs that support this form is more restricted, and the generated
+        graphs may be less optimized.
+
+    Returns
+    -------
+    :class:`~pytensor.graph.basic.Variable` or list/tuple of Variables
+        A symbolic expression for the Jacobian-vector product
+        ``Jvp[i] = sum_j (d f[i] / d wrt[j]) tangents[j]``.
+        If `f` is a list/tuple, then return a list/tuple with the results.
+
+    References
+    ----------
+    .. [1] J. Towns, "A new trick for calculating Jacobian vector products", 2017.
+           Available: https://j-towns.github.io/2017/06/12/A-new-trick.html
+    """
+
+    if not isinstance(wrt, list | tuple):
+        _wrt: list[Variable] = [pytensor.tensor.as_tensor_variable(wrt)]
+    else:
+        _wrt = [pytensor.tensor.as_tensor_variable(x) for x in wrt]
+
+    if not isinstance(tangents, list | tuple):
+        _tangents: list[Variable] = [pytensor.tensor.as_tensor_variable(tangents)]
+    else:
+        _tangents = [pytensor.tensor.as_tensor_variable(x) for x in tangents]
+
+    if not isinstance(f, list | tuple):
+        _f: list[Variable] = [pytensor.tensor.as_tensor_variable(f)]
+    else:
+        _f = [pytensor.tensor.as_tensor_variable(x) for x in f]
+
+    if len(_wrt) != len(_tangents):
+        raise ValueError("`wrt` must be the same length as `tangents`.")
+
+    # Check that each element of wrt corresponds to an element
+    # of tangents with the same dimensionality.
+    for i, (wrt_elem, tangent) in enumerate(zip(_wrt, _tangents, strict=True)):
+        try:
+            if wrt_elem.type.ndim != tangent.type.ndim:
+                raise ValueError(
+                    f"Elements {i} of `wrt` and `tangents` have mismatched dimensionalities: "
+                    f"{wrt_elem.type.ndim} and {tangent.type.ndim}"
+                )
+        except AttributeError:
+            # wrt_elem and tangent don't always have ndim like random type
+            # Tensor, Sparse have the ndim attribute
+            pass
+
+    if use_op_pushforward:
+        rval = _pushforward_direct(
+            _f, _wrt, _tangents, disconnected_outputs, return_disconnected
+        )
+    else:
+        rval = pushforward_through_pullback(
+            _f, _wrt, _tangents, disconnected_outputs, return_disconnected
+        )
+
     using_list = isinstance(f, list)
     using_tuple = isinstance(f, tuple)
     return as_list_or_tuple(using_list, using_tuple, rval)
 
 
-def Lop(
+def pullback(
     f: Variable | Sequence[Variable],
     wrt: Variable | Sequence[Variable],
-    eval_points: Variable | Sequence[Variable],
+    cotangents: Variable | Sequence[Variable],
     consider_constant: Sequence[Variable] | None = None,
     disconnected_inputs: Literal["ignore", "warn", "raise"] = "raise",
+    return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
 ) -> Variable | None | Sequence[Variable | None]:
-    """Computes the L-operator applied to `f` with respect to `wrt` at `eval_points`.
+    """Compute the pull-back (vector-Jacobian product) of `f` with respect to `wrt` at `cotangents`.
 
-    Mathematically this stands for the Jacobian of `f` with respect to `wrt`
-    left muliplied by the `eval_points`.
+    Mathematically this computes the Jacobian of `f` with respect to `wrt`
+    left-multiplied by the `cotangents`.
 
     Parameters
     ----------
     f
-        The outputs of the computational graph to which the L-operator is
+        The outputs of the computational graph to which the pull-back is
         applied.
     wrt
-        Variables for which the L-operator of `f` is computed.
-    eval_points
-        Points at which to evaluate each of the variables in `wrt`.
+        Variables for which the pull-back of `f` is computed.
+    cotangents
+        Cotangent vectors, one for each output in `f`.
     consider_constant
         See `grad`.
     disconnected_inputs
@@ -371,29 +479,29 @@ def Lop(
     Returns
     -------
     :class:`~pytensor.graph.basic.Variable` or list/tuple of Variables
-        A symbolic expression satisfying
-        ``L_op[i] = sum_i (d f[i] / d wrt[j]) eval_point[i]``
-        where the indices in that expression are magic multidimensional
-        indices that specify both the position within a list and all
-        coordinates of the tensor elements.
+        A symbolic expression for the vector-Jacobian product
+        ``vJp[j] = sum_i cotangents[i] (d f[i] / d wrt[j])``.
         If `f` is a list/tuple, then return a list/tuple with the results.
     """
-    if not isinstance(eval_points, list | tuple):
-        _eval_points: list[Variable] = [pytensor.tensor.as_tensor_variable(eval_points)]
-    else:
-        _eval_points = [pytensor.tensor.as_tensor_variable(x) for x in eval_points]
+    from pytensor.tensor import as_tensor_variable
 
-    if not isinstance(f, list | tuple):
-        _f: list[Variable] = [pytensor.tensor.as_tensor_variable(f)]
-    else:
-        _f = [pytensor.tensor.as_tensor_variable(x) for x in f]
+    if not isinstance(cotangents, Sequence):
+        cotangents = [cotangents]
+    _cotangents = [
+        x if isinstance(x, Variable) else as_tensor_variable(x) for x in cotangents
+    ]
 
-    grads = list(_eval_points)
+    if not isinstance(f, Sequence):
+        f = [f]
+    _f = [x if isinstance(x, Variable) else as_tensor_variable(x) for x in f]
 
-    if not isinstance(wrt, list | tuple):
-        _wrt: list[Variable] = [pytensor.tensor.as_tensor_variable(wrt)]
-    else:
-        _wrt = [pytensor.tensor.as_tensor_variable(x) for x in wrt]
+    grads = list(_cotangents)
+
+    using_list = isinstance(wrt, list)
+    using_tuple = isinstance(wrt, tuple)
+    if not isinstance(wrt, Sequence):
+        wrt = [wrt]
+    _wrt = [x if isinstance(x, Variable) else as_tensor_variable(x) for x in wrt]
 
     assert len(_f) == len(grads)
     known = dict(zip(_f, grads, strict=True))
@@ -404,11 +512,56 @@ def Lop(
         consider_constant=consider_constant,
         wrt=_wrt,
         disconnected_inputs=disconnected_inputs,
+        return_disconnected=return_disconnected,
     )
 
-    using_list = isinstance(wrt, list)
-    using_tuple = isinstance(wrt, tuple)
     return as_list_or_tuple(using_list, using_tuple, ret)
+
+
+def Rop(
+    f,
+    wrt,
+    eval_points,
+    disconnected_outputs="raise",
+    return_disconnected="zero",
+    use_op_rop_implementation=False,
+):
+    """.. deprecated:: Use :func:`pushforward` instead."""
+    warnings.warn(
+        "Rop is deprecated, use pushforward instead.",
+        FutureWarning,
+    )
+    return pushforward(
+        f,
+        wrt,
+        tangents=eval_points,
+        disconnected_outputs=disconnected_outputs,
+        return_disconnected=return_disconnected,
+        use_op_pushforward=use_op_rop_implementation,
+    )
+
+
+def Lop(
+    f,
+    wrt,
+    eval_points,
+    consider_constant=None,
+    disconnected_inputs="raise",
+    return_disconnected="zero",
+):
+    """.. deprecated:: Use :func:`pullback` instead."""
+    warnings.warn(
+        "Lop is deprecated, use pullback instead.",
+        FutureWarning,
+    )
+    return pullback(
+        f,
+        wrt,
+        cotangents=eval_points,
+        consider_constant=consider_constant,
+        disconnected_inputs=disconnected_inputs,
+        return_disconnected=return_disconnected,
+    )
 
 
 @overload
@@ -507,8 +660,7 @@ def grad(
 
     if cost is not None and isinstance(cost.type, NullType):
         raise ValueError(
-            "Can't differentiate a NaN cost. "
-            f"Cost is NaN because {cost.type.why_null}"
+            f"Can't differentiate a NaN cost. Cost is NaN because {cost.type.why_null}"
         )
 
     if cost is not None and cost.type.ndim != 0:
@@ -586,15 +738,15 @@ def grad(
         grad_dict[var] = g_var
 
     def handle_disconnected(var):
-        message = (
-            "grad method was asked to compute the gradient "
-            "with respect to a variable that is not part of "
-            "the computational graph of the cost, or is used "
-            f"only by a non-differentiable operator: {var}"
-        )
         if disconnected_inputs == "ignore":
-            pass
+            return
         elif disconnected_inputs == "warn":
+            message = (
+                "grad method was asked to compute the gradient "
+                "with respect to a variable that is not part of "
+                "the computational graph of the cost, or is used "
+                f"only by a non-differentiable operator: {var}"
+            )
             warnings.warn(message, stacklevel=2)
         elif disconnected_inputs == "raise":
             message = utils.get_variable_trace_string(var)
@@ -1150,18 +1302,10 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                 # gradients.
                 # DO NOT force integer variables to have integer dtype.
                 # This is a violation of the op contract.
-                new_output_grads = []
-                for o, og in zip(node.outputs, output_grads, strict=True):
-                    o_dt = getattr(o.type, "dtype", None)
-                    og_dt = getattr(og.type, "dtype", None)
-                    if (
-                        o_dt not in pytensor.tensor.type.discrete_dtypes
-                        and og_dt
-                        and o_dt != og_dt
-                    ):
-                        new_output_grads.append(og.astype(o_dt))
-                    else:
-                        new_output_grads.append(og)
+                new_output_grads = [
+                    _match_tangent_dtype(o, og)
+                    for o, og in zip(node.outputs, output_grads, strict=True)
+                ]
 
                 # Make sure that, if new_output_grads[i] has a floating point
                 # dtype, it is the same dtype as outputs[i]
@@ -1180,45 +1324,19 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                     for ng in new_output_grads
                 )
 
-                # If config.compute_test_value is turned on, check that the
-                # gradients on the outputs of this node have the right shape.
-                # We also check the gradient on the inputs later--both checks
-                # are needed, because some gradients are only ever specified
-                # by the user, not computed by Op.grad, and some gradients are
-                # only computed and returned, but never passed as another
-                # node's output grads.
-                for idx, packed in enumerate(
-                    zip(node.outputs, new_output_grads, strict=True)
-                ):
-                    orig_output, new_output_grad = packed
-                    if not hasattr(orig_output, "shape"):
-                        continue
-                    if isinstance(new_output_grad.type, DisconnectedType):
-                        continue
-                    for orig_output_v, new_output_grad_v in get_test_values(*packed):
-                        o_shape = orig_output_v.shape
-                        g_shape = new_output_grad_v.shape
-                        if o_shape != g_shape:
-                            raise ValueError(
-                                "Got a gradient of shape "
-                                + str(o_shape)
-                                + " on an output of shape "
-                                + str(g_shape)
-                            )
-
-                input_grads = node.op.L_op(inputs, node.outputs, new_output_grads)
+                input_grads = node.op.pullback(inputs, node.outputs, new_output_grads)
 
                 if input_grads is None:
                     raise TypeError(
-                        f"{node.op}.grad returned NoneType, expected iterable."
+                        f"{node.op}.pullback returned NoneType, expected iterable."
                     )
 
                 if len(input_grads) != len(inputs):
                     raise ValueError(
                         f"{node.op} returned the wrong number of gradient terms."
                     )
-            # We can not enforce this, as AdvancedSubtensor1 has an option to
-            # return the sparse grad for optimization reason.
+            # We can not enforce this, as sparse Ops have an option to return a
+            # structured grad for optimization reason.
 
             #            for ig, i in zip(input_grads, inputs):
             #                if (not isinstance(ig.type, (DisconnectedType, NullType)) and
@@ -1278,21 +1396,6 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                         "functions."
                     )
 
-                # Check that the gradient term for this input
-                # has the right shape
-                if hasattr(term, "shape"):
-                    orig_ipt = inputs[i]
-                    if not isinstance(orig_ipt, NominalVariable):
-                        for orig_ipt_v, term_v in get_test_values(orig_ipt, term):
-                            i_shape = orig_ipt_v.shape
-                            t_shape = term_v.shape
-                            if i_shape != t_shape:
-                                raise ValueError(
-                                    f"{node.op}.grad returned object of "
-                                    f"shape {t_shape} as gradient term on input {int(i)} "
-                                    f"of shape {i_shape}"
-                                )
-
                 if not isinstance(term.type, NullType | DisconnectedType):
                     if term.type.dtype not in pytensor.tensor.type.float_dtypes:
                         raise TypeError(
@@ -1329,7 +1432,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                                 f" {i}. Since this input is only connected "
                                 "to integer-valued outputs, it should "
                                 "evaluate to zeros, but it evaluates to"
-                                f"{pytensor.get_underlying_scalar_constant(term)}."
+                                f"{pytensor.get_underlying_scalar_constant_value(term)}."
                             )
                             raise ValueError(msg)
 
@@ -1667,15 +1770,15 @@ class numeric_grad:
 
 
 def mode_not_slow(mode):
-    from pytensor.compile.debugmode import DebugMode
-    from pytensor.compile.mode import FAST_RUN, get_mode
+    from pytensor.compile.debug.debugmode import DebugMode
+    from pytensor.compile.mode import get_mode
 
     if mode == "FAST_COMPILE":
-        return FAST_RUN
+        return get_mode("FAST_RUN")
     mode = get_mode(mode)
     if isinstance(mode, DebugMode):
         opt = mode.optimizer
-        return FAST_RUN.clone(optimizer=opt)
+        return get_mode("FAST_RUN").clone(optimizer=opt)
     else:
         return mode
 
@@ -1748,7 +1851,7 @@ def verify_grad(
     there is an experimental `verify_grad` that covers that case as well by
     using random projections.
     """
-    from pytensor.compile.function import function
+    from pytensor.compile.maker import function
     from pytensor.compile.sharedvalue import shared
 
     if not isinstance(pt, list | tuple):
@@ -1904,13 +2007,19 @@ GradientError: numeric gradient and analytic gradient exceed tolerance:
 Exception args: {args_msg}"""
 
 
-def jacobian(expression, wrt, consider_constant=None, disconnected_inputs="raise"):
+def jacobian(
+    expression,
+    wrt,
+    consider_constant=None,
+    disconnected_inputs="raise",
+    vectorize=False,
+):
     """
     Compute the full Jacobian, row by row.
 
     Parameters
     ----------
-    expression : Vector (1-dimensional) :class:`~pytensor.graph.basic.Variable`
+    expression :class:`~pytensor.graph.basic.Variable`
         Values that we are differentiating (that we want the Jacobian of)
     wrt : :class:`~pytensor.graph.basic.Variable` or list of Variables
         Term[s] with respect to which we compute the Jacobian
@@ -1934,62 +2043,73 @@ def jacobian(expression, wrt, consider_constant=None, disconnected_inputs="raise
         output, then a zero variable is returned. The return value is
         of same type as `wrt`: a list/tuple or TensorVariable in all cases.
     """
+    from pytensor.tensor.basic import eye
+    from pytensor.tensor.extra_ops import broadcast_to
 
     if not isinstance(expression, Variable):
         raise TypeError("jacobian expects a Variable as `expression`")
 
-    if expression.ndim > 1:
-        raise ValueError(
-            "jacobian expects a 1 dimensional variable as `expression`."
-            " If not use flatten to make it a vector"
-        )
-
     using_list = isinstance(wrt, list)
     using_tuple = isinstance(wrt, tuple)
+    grad_kwargs = {
+        "consider_constant": consider_constant,
+        "disconnected_inputs": disconnected_inputs,
+    }
 
     if isinstance(wrt, list | tuple):
         wrt = list(wrt)
     else:
         wrt = [wrt]
 
-    if expression.ndim == 0:
-        # expression is just a scalar, use grad
-        return as_list_or_tuple(
-            using_list,
-            using_tuple,
-            grad(
-                expression,
-                wrt,
-                consider_constant=consider_constant,
-                disconnected_inputs=disconnected_inputs,
-            ),
+    if all(expression.type.broadcastable):
+        jacobian_matrices = grad(expression.squeeze(), wrt, **grad_kwargs)
+
+    elif vectorize:
+        expression_flat = expression.ravel()
+        row_tangent = _float_ones_like(expression_flat).type("row_tangent")
+        jacobian_single_rows = pullback(
+            expression.ravel(), wrt, row_tangent, **grad_kwargs
         )
 
-    def inner_function(*args):
-        idx = args[0]
-        expr = args[1]
-        rvals = []
-        for inp in args[2:]:
-            rval = grad(
-                expr[idx],
-                inp,
-                consider_constant=consider_constant,
-                disconnected_inputs=disconnected_inputs,
-            )
-            rvals.append(rval)
-        return rvals
+        n_rows = expression_flat.size
+        jacobian_matrices = vectorize_graph(
+            jacobian_single_rows,
+            replace={row_tangent: eye(n_rows, dtype=row_tangent.dtype)},
+        )
+        if disconnected_inputs != "raise":
+            # If the input is disconnected from the cost, `vectorize_graph` has no effect on the respective jacobian
+            # We have to broadcast the zeros explicitly here
+            for i, (jacobian_single_row, jacobian_matrix) in enumerate(
+                zip(jacobian_single_rows, jacobian_matrices, strict=True)
+            ):
+                if jacobian_single_row.ndim == jacobian_matrix.ndim:
+                    jacobian_matrices[i] = broadcast_to(
+                        jacobian_matrix, shape=(n_rows, *jacobian_matrix.shape)
+                    )
 
-    # Computing the gradients does not affect the random seeds on any random
-    # generator used n expression (because during computing gradients we are
-    # just backtracking over old values. (rp Jan 2012 - if anyone has a
-    # counter example please show me)
-    jacobs, updates = pytensor.scan(
-        inner_function,
-        sequences=pytensor.tensor.arange(expression.shape[0]),
-        non_sequences=[expression, *wrt],
-    )
-    assert not updates, "Scan has returned a list of updates; this should not happen."
-    return as_list_or_tuple(using_list, using_tuple, jacobs)
+    else:
+
+        def inner_function(*args):
+            idx, expr, *wrt = args
+            return grad(expr[idx], wrt, **grad_kwargs)
+
+        jacobian_matrices = pytensor.scan(
+            inner_function,
+            sequences=pytensor.tensor.arange(expression.size),
+            non_sequences=[expression.ravel(), *wrt],
+            return_updates=False,
+            return_list=True,
+        )
+
+    if jacobian_matrices[0].ndim < (expression.ndim + wrt[0].ndim):
+        # There was some raveling or squeezing done prior to getting the jacobians
+        # Reshape into original shapes
+        jacobian_matrices = [
+            jac_matrix.reshape((*expression.shape, *w.shape))
+            for jac_matrix, w in zip(jacobian_matrices, wrt, strict=True)
+        ]
+
+    return as_list_or_tuple(using_list, using_tuple, jacobian_matrices)
 
 
 def hessian(cost, wrt, consider_constant=None, disconnected_inputs="raise"):
@@ -2054,7 +2174,7 @@ def hessian(cost, wrt, consider_constant=None, disconnected_inputs="raise"):
         # It is possible that the inputs are disconnected from expr,
         # even if they are connected to cost.
         # This should not be an error.
-        hess, updates = pytensor.scan(
+        hess = pytensor.scan(
             lambda i, y, x: grad(
                 y[i],
                 x,
@@ -2063,10 +2183,8 @@ def hessian(cost, wrt, consider_constant=None, disconnected_inputs="raise"):
             ),
             sequences=pytensor.tensor.arange(expr.shape[0]),
             non_sequences=[expr, input],
+            return_updates=False,
         )
-        assert (
-            not updates
-        ), "Scan has returned a list of updates; this should not happen."
         hessians.append(hess)
     return as_list_or_tuple(using_list, using_tuple, hessians)
 
@@ -2157,6 +2275,9 @@ def _is_zero(x):
     'maybe' means that x is an expression that is complicated enough
     that we can't tell that it simplifies to 0.
     """
+    from pytensor.tensor import get_underlying_scalar_constant_value
+    from pytensor.tensor.exceptions import NotScalarConstantError
+
     if not hasattr(x, "type"):
         return np.all(x == 0.0)
     if isinstance(x.type, NullType):
@@ -2166,9 +2287,9 @@ def _is_zero(x):
 
     no_constant_value = True
     try:
-        constant_value = pytensor.get_underlying_scalar_constant(x)
+        constant_value = get_underlying_scalar_constant_value(x)
         no_constant_value = False
-    except pytensor.tensor.exceptions.NotScalarConstantError:
+    except NotScalarConstantError:
         pass
 
     if no_constant_value:
@@ -2181,12 +2302,12 @@ def _is_zero(x):
 
 
 class ZeroGrad(ViewOp):
-    def grad(self, args, g_outs):
-        return [g_out.zeros_like(g_out) for g_out in g_outs]
+    def pullback(self, args, outputs, g_outs):
+        return [g_out.zeros_like() for g_out in g_outs]
 
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return [disconnected_type()]
 
         return pytensor.tensor.zeros(1)
 
@@ -2219,11 +2340,11 @@ def zero_grad(x):
 
 
 class UndefinedGrad(ViewOp):
-    def grad(self, args, g_outs):
+    def pullback(self, args, outputs, g_outs):
         return [grad_undefined(self, i, arg) for i, arg in enumerate(args)]
 
-    def R_op(self, inputs, eval_points):
-        return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        return [disconnected_type()]
 
     def connection_pattern(self, node):
         return [[True]]
@@ -2257,11 +2378,11 @@ def undefined_grad(x):
 
 
 class DisconnectedGrad(ViewOp):
-    def grad(self, args, g_outs):
+    def pullback(self, args, outputs, g_outs):
         return [disconnected_type() for g_out in g_outs]
 
-    def R_op(self, inputs, eval_points):
-        return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        return [disconnected_type()]
 
     def connection_pattern(self, node):
         return [[False]]
@@ -2312,7 +2433,7 @@ class GradClip(ViewOp):
         if not self.clip_upper_bound >= self.clip_lower_bound:
             raise ValueError("`clip_upper_bound` should be >= `clip_lower_bound`")
 
-    def grad(self, args, g_outs):
+    def pullback(self, args, outputs, g_outs):
         return [
             pytensor.tensor.clip(g_out, self.clip_lower_bound, self.clip_upper_bound)
             for g_out in g_outs
@@ -2355,7 +2476,7 @@ class GradScale(ViewOp):
     def __init__(self, multiplier):
         self.multiplier = multiplier
 
-    def grad(self, args, g_outs):
+    def pullback(self, args, outputs, g_outs):
         return [self.multiplier * g_out for g_out in g_outs]
 
 

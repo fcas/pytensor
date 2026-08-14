@@ -86,9 +86,7 @@ of symbolic differentiation).
    ``i`` of the output list is the gradient of the first argument of
    `pt.grad` with respect to the ``i``-th element of the list given as second argument.
    The first argument of `pt.grad` has to be a scalar (a tensor
-   of size 1). For more information on the semantics of the arguments of
-   `pt.grad` and details about the implementation, see
-   :ref:`this<libdoc_gradient>` section of the library.
+   of size 1).
 
    Additional information on the inner workings of differentiation may also be
    found in the more advanced tutorial :ref:`Extending PyTensor<extending>`.
@@ -103,9 +101,12 @@ PyTensor implements the :func:`pytensor.gradient.jacobian` macro that does all
 that is needed to compute the Jacobian. The following text explains how
 to do it manually.
 
+Using Scan
+----------
+
 In order to manually compute the Jacobian of some function ``y`` with
-respect to some parameter ``x`` we need to use `scan`. What we
-do is to loop over the entries in ``y`` and compute the gradient of
+respect to some parameter ``x`` we can use `scan`.
+In this case, we loop over the entries in ``y`` and compute the gradient of
 ``y[i]`` with respect to ``x``.
 
 .. note::
@@ -113,8 +114,7 @@ do is to loop over the entries in ``y`` and compute the gradient of
     `scan` is a generic op in PyTensor that allows writing in a symbolic
     manner all kinds of recurrent equations. While creating
     symbolic loops (and optimizing them for performance) is a hard task,
-    effort is being done for improving the performance of `scan`. We
-    shall return to :ref:`scan<tutloop>` later in this tutorial.
+    efforts are being made to improving the performance of `scan`.
 
 >>> import pytensor
 >>> import pytensor.tensor as pt
@@ -126,9 +126,9 @@ do is to loop over the entries in ``y`` and compute the gradient of
 array([[ 8.,  0.],
        [ 0.,  8.]])
 
-What we do in this code is to generate a sequence of integers from ``0`` to
-``y.shape[0]`` using `pt.arange`. Then we loop through this sequence, and
-at each step, we compute the gradient of element ``y[i]`` with respect to
+This code generates a sequence of integers from ``0`` to
+``y.shape[0]`` using `pt.arange`. Then it loops through this sequence, and
+at each step, computes the gradient of element ``y[i]`` with respect to
 ``x``. `scan` automatically concatenates all these rows, generating a
 matrix which corresponds to the Jacobian.
 
@@ -139,6 +139,31 @@ matrix which corresponds to the Jacobian.
     even though from the documentation of scan this
     seems possible. The reason is that ``y_i`` will not be a function of
     ``x`` anymore, while ``y[i]`` still is.
+
+
+Using automatic vectorization
+-----------------------------
+An alternative way to build the Jacobian is to vectorize the graph that computes a single row or colum of the jacobian
+We can use `pullback` or `pushforward` (more about it below) to obtain the row or column of the jacobian and `vectorize_graph`
+to vectorize it to the full jacobian matrix.
+
+>>> import pytensor
+>>> import pytensor.tensor as pt
+>>> from pytensor.gradient import pullback
+>>> from pytensor.graph import vectorize_graph
+>>> x = pt.dvector('x')
+>>> y = x ** 2
+>>> row_cotangent = pt.dvector("row_cotangent")  # Helper variable, it will be replaced during vectorization
+>>> J_row = pullback(y, x, row_cotangent)
+>>> J = vectorize_graph(J_row, replace={row_cotangent: pt.eye(x.size)})
+>>> f = pytensor.function([x], J)
+>>> f([4, 4])
+array([[ 8.,  0.],
+       [ 0.,  8.]])
+
+This avoids the overhead of scan, at the cost of higher memory usage if the jacobian expression has large intermediate operations.
+Also, not all graphs are safely vectorizable (e.g., if different rows require intermediate operations of different sizes).
+For these reasons `jacobian` uses scan by default. The behavior can be changed by setting `vectorize=True`.
 
 
 Computing the Hessian
@@ -182,16 +207,16 @@ in practice, implementing such optimizations in a generic manner is extremely
 difficult. Therefore, we provide special functions dedicated to these tasks.
 
 
-R-operator
-----------
+Pushforward (Jacobian-vector product)
+-------------------------------------
 
-The **R operator** is built to evaluate the product between a Jacobian and a
+The **pushforward** evaluates the product between a Jacobian and a
 vector, namely :math:`\frac{\partial f(x)}{\partial x} v`. The formulation
 can be extended even for :math:`x` being a matrix, or a tensor in general, case in
 which also the Jacobian becomes a tensor and the product becomes some kind
 of tensor product. Because in practice we end up needing to compute such
 expressions in terms of weight matrices, PyTensor supports this more generic
-form of the operation. In order to evaluate the R-operation of
+form of the operation. In order to evaluate the pushforward of
 expression ``y``, with respect to ``x``, multiplying the Jacobian with ``V``
 you need to do something similar to this:
 
@@ -199,26 +224,40 @@ you need to do something similar to this:
 >>> V = pt.dmatrix('V')
 >>> x = pt.dvector('x')
 >>> y = pt.dot(x, W)
->>> JV = pytensor.gradient.Rop(y, W, V)
+>>> JV = pytensor.gradient.pushforward(y, W, V)
 >>> f = pytensor.function([W, V, x], JV)
 >>> f([[1, 1], [1, 1]], [[2, 2], [2, 2]], [0,1])
 array([ 2.,  2.])
 
-:ref:`List <R_op_list>` of Op that implement Rop.
+By default, the pushforward is implemented as a double application of the pullback
+(see `reference <https://j-towns.github.io/2017/06/12/A-new-trick.html>`_).
+In most cases this should be as performant as a specialized implementation of the pushforward.
+However, PyTensor may sometimes fail to prune dead branches or fuse common expressions within composite operators,
+such as Scan and OpFromGraph, that would be more easily avoidable in a direct implentation of the pushforward.
 
-L-operator
-----------
+When this is a concern, it is possible to force `pushforward` to use the specialized `Op.pushforward` methods by passing
+`use_op_pushforward=True`. Note that this will fail if the graph contains `Op`s that don't implement this method.
 
-In similitude to the R-operator, the **L-operator** would compute a row vector times
+
+>>> JV = pytensor.gradient.pushforward(y, W, V, use_op_pushforward=True)
+>>> f = pytensor.function([W, V, x], JV)
+>>> f([[1, 1], [1, 1]], [[2, 2], [2, 2]], [0,1])
+array([ 2.,  2.])
+
+
+Pullback (vector-Jacobian product)
+----------------------------------
+
+The **pullback** computes a row vector times
 the Jacobian. The mathematical formula would be :math:`v \frac{\partial
-f(x)}{\partial x}`. The L-operator is also supported for generic tensors
+f(x)}{\partial x}`. The pullback is also supported for generic tensors
 (not only for vectors). Similarly, it can be implemented as follows:
 
 >>> W = pt.dmatrix('W')
 >>> v = pt.dvector('v')
 >>> x = pt.dvector('x')
 >>> y = pt.dot(x, W)
->>> VJ = pytensor.gradient.Lop(y, W, v)
+>>> VJ = pytensor.gradient.pullback(y, W, v)
 >>> f = pytensor.function([v,x], VJ)
 >>> f([2, 2], [0, 1])
 array([[ 0.,  0.],
@@ -226,15 +265,14 @@ array([[ 0.,  0.],
 
 .. note::
 
-    ``v``, the point of evaluation, differs between the L-operator and the R-operator.
-    For the L-operator, the point of evaluation needs to have the same shape
-    as the output, whereas for the R-operator this point should
+    The cotangent/tangent vectors differ between the pullback and the pushforward.
+    For the pullback, the cotangent vectors need to have the same shape
+    as the output, whereas for the pushforward the tangent vectors should
     have the same shape as the input parameter. Furthermore, the results of these two
-    operations differ. The result of the L-operator is of the same shape
-    as the input parameter, while the result of the R-operator has a shape similar
+    operations differ. The result of the pullback is of the same shape
+    as the input parameter, while the result of the pushforward has a shape similar
     to that of the output.
 
-   :ref:`List of op with r op support <R_op_list>`.
 
 Hessian times a Vector
 ======================
@@ -256,13 +294,13 @@ Hence, we suggest profiling the methods before using either one of the two:
 array([ 4.,  4.])
 
 
-or, making use of the R-operator:
+or, making use of the pushforward:
 
 >>> x = pt.dvector('x')
 >>> v = pt.dvector('v')
 >>> y = pt.sum(x ** 2)
 >>> gy = pt.grad(y, x)
->>> Hv = pytensor.gradient.Rop(gy, x, v)
+>>> Hv = pytensor.gradient.pushforward(gy, x, v)
 >>> f = pytensor.function([x, v], Hv)
 >>> f([4, 4], [2, 2])
 array([ 4.,  4.])

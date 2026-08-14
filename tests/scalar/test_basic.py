@@ -1,18 +1,23 @@
+import pickle
+
 import numpy as np
 import pytest
 
 import pytensor
 import pytensor.tensor as pt
-import tests.unittest_tools as utt
-from pytensor.compile.mode import Mode
+from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.graph.fg import FunctionGraph
 from pytensor.link.c.basic import DualLinker
+from pytensor.link.numba import NumbaLinker
 from pytensor.scalar.basic import (
+    EQ,
     ComplexError,
     Composite,
-    InRange,
+    IntDiv,
     ScalarType,
+    TrueDiv,
     add,
+    all_types,
     and_,
     arccos,
     arccosh,
@@ -21,18 +26,16 @@ from pytensor.scalar.basic import (
     arctan,
     arctan2,
     arctanh,
-    cast,
     complex64,
     constant,
     cos,
     cosh,
-    deg2rad,
     eq,
     exp,
     exp2,
     expm1,
-    float16,
     float32,
+    float64,
     floats,
     int8,
     int32,
@@ -46,23 +49,22 @@ from pytensor.scalar.basic import (
     mul,
     neg,
     neq,
-    rad2deg,
+    pow,
     reciprocal,
     sin,
     sinh,
     sqrt,
-    switch,
     tan,
     tanh,
     true_div,
-    uint8,
 )
+from pytensor.tensor import tensor_from_scalar
 from pytensor.tensor.type import fscalar, imatrix, matrix
 from tests.link.test_link import make_function
 
 
 def test_mul_add_true():
-    x, y, z = floats("xyz")
+    x, y, _z = floats("xyz")
     e = mul(add(x, y), true_div(x, y))
     g = FunctionGraph([x, y], [e])
     fn = make_function(DualLinker().accept(g))
@@ -70,45 +72,8 @@ def test_mul_add_true():
 
 
 class TestComposite:
-    def test_composite_clone_float32(self):
-        def has_f16(comp):
-            if any(v.type == float16 for v in comp.fgraph.variables):
-                return True
-            return False
-
-        w = int8()
-        x = float16()
-        y = float32()
-        cz = Composite([x, y], [tanh(x + cast(y, "float16"))])
-        c = Composite(
-            [w, x, y],
-            [
-                cz(x, y)
-                - cz(x, y) ** 2
-                + cast(x, "int16")
-                + cast(x, "float32")
-                + cast(w, "float16")
-                - constant(np.float16(1.0))
-            ],
-        )
-        assert has_f16(c)
-        nc = c.clone_float32()
-        assert not has_f16(nc)
-
-        v = uint8()
-        w = float16()
-        x = float16()
-        y = float16()
-        z = float16()
-
-        c = Composite([v, w, x, y, z], [switch(v, mul(w, x, y), z)])
-
-        assert has_f16(c)
-        nc = c.clone_float32()
-        assert not has_f16(nc)
-
     def test_straightforward(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         e = mul(add(x, y), true_div(x, y))
         C = Composite([x, y], [e])
         c = C.make_node(x, y)
@@ -117,21 +82,27 @@ class TestComposite:
         fn = make_function(DualLinker().accept(g))
         assert fn(1.0, 2.0) == 1.5
 
-    def test_flatten(self):
-        # Test that we flatten multiple Composite.
-        x, y, z = floats("xyz")
-        C = Composite([x, y], [x + y])
-        CC = Composite([x, y], [C(x * y, y)])
-        assert not isinstance(CC.outputs[0].owner.op, Composite)
+    def test_shared_identity(self):
+        x, y = floats("xy")
+        c1 = Composite([x, y], [x + y])
+        c2 = Composite([x, y], [x + y])
+        assert c1 == c2
+        assert hash(c1) == hash(c2)
+        assert {c1: 1}[c2] == 1
 
-        # Test with multiple outputs
-        CC = Composite([x, y, z], [C(x * y, y), C(x * z, y)])
-        # We don't flatten that case.
-        assert isinstance(CC.outputs[0].owner.op, Composite)
+        c3 = Composite([x, y], [x * y])
+        assert c1 != c3
+
+    def test_pickle_roundtrip(self):
+        x, y = floats("xy")
+        c = Composite([x, y], [x + y])
+        c2 = pickle.loads(pickle.dumps(c))
+        assert c == c2
+        assert hash(c) == hash(c2)
 
     @pytest.mark.parametrize("literal_value", (70.0, -np.inf, np.float32("nan")))
     def test_with_constants(self, literal_value):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         e = mul(add(literal_value, y), true_div(x, y))
         comp_op = Composite([x, y], [e])
         comp_node = comp_op.make_node(x, y)
@@ -248,71 +219,71 @@ class TestComposite:
 
 class TestLogical:
     def test_gt(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x > y])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a > b)
 
     def test_lt(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x < y])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a < b)
 
     def test_le(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x <= y])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a <= b)
 
     def test_ge(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x >= y])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a >= b)
 
     def test_eq(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [eq(x, y)])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a == b)
 
     def test_neq(self):
-        x, y, z = floats("xyz")
+        x, y, _z = floats("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [neq(x, y)])))
         for a, b in ((3.0, 9), (3, 0.9), (3, 3)):
             assert fn(a, b) == (a != b)
 
     def test_or(self):
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x | y])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == (a | b), (a, b)
 
     def test_xor(self):
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x ^ y])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == (a ^ b), (a, b)
 
     def test_and(self):
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [and_(x, y)])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == (a & b), (a, b)
 
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [x & y])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == (a & b), (a, b)
 
     def test_not(self):
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [invert(x)])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == ~a, (a,)
 
-        x, y, z = ints("xyz")
+        x, y, _z = ints("xyz")
         fn = make_function(DualLinker().accept(FunctionGraph([x, y], [~x])))
         for a, b in ((0, 1), (0, 0), (1, 0), (1, 1)):
             assert fn(a, b) == ~a, (a,)
@@ -334,8 +305,6 @@ class TestUpgradeToFloat:
         (exp, list(range(-127, 89))),
         (exp2, list(range(-127, 89))),
         (expm1, list(range(-127, 89))),
-        (deg2rad, list(range(-127, 128))),
-        (rad2deg, list(range(-127, 128))),
         (cos, list(range(-127, 128))),
         (arccos, list(range(-1, 2))),
         (cosh, list(range(-89, 90))),
@@ -367,7 +336,9 @@ class TestUpgradeToFloat:
             outi = fi(x_val)
             outf = ff(x_val)
 
-            assert outi.dtype == outf.dtype, "incorrect dtype"
+            if not isinstance(ff.maker.linker, NumbaLinker):
+                # Numba doesn't return numpy scalars
+                assert outi.dtype == outf.dtype, "incorrect dtype"
             assert np.allclose(outi, outf), "insufficient precision"
 
     @staticmethod
@@ -388,7 +359,9 @@ class TestUpgradeToFloat:
                 outi = fi(x_val, y_val)
                 outf = ff(x_val, y_val)
 
-                assert outi.dtype == outf.dtype, "incorrect dtype"
+                if not isinstance(ff.maker.linker, NumbaLinker):
+                    # Numba doesn't return numpy scalars
+                    assert outi.dtype == outf.dtype, "incorrect dtype"
                 assert np.allclose(outi, outf), "insufficient precision"
 
     def test_true_div(self):
@@ -413,7 +386,9 @@ class TestUpgradeToFloat:
                 outi = fi(x_val, y_val)
                 outf = ff(x_val, y_val)
 
-                assert outi.dtype == outf.dtype, "incorrect dtype"
+                if not isinstance(ff.maker.linker, NumbaLinker):
+                    # Numba doesn't return numpy scalars
+                    assert outi.dtype == outf.dtype, "incorrect dtype"
                 assert np.allclose(outi, outf), "insufficient precision"
 
     def test_unary(self):
@@ -474,32 +449,6 @@ def test_grad_identity():
     pytensor.gradient.grad(l, x)
 
 
-def test_grad_inrange():
-    for bound_definition in [(True, True), (False, False)]:
-        # Instantiate op, and then take the gradient
-        op = InRange(*bound_definition)
-        x = fscalar("x")
-        low = fscalar("low")
-        high = fscalar("high")
-        out = op(x, low, high)
-        gx, glow, ghigh = pytensor.gradient.grad(out, [x, low, high])
-
-        # We look if the gradient are equal to zero
-        # if x is lower than the lower bound,
-        # equal to the lower bound, between lower and higher bound,
-        # equal to the higher bound and higher than the higher
-        # bound.
-        # Mathematically we should have an infinite gradient when
-        # x is equal to the lower or higher bound but in that case
-        # PyTensor defines the gradient to be zero for stability.
-        f = pytensor.function([x, low, high], [gx, glow, ghigh])
-        utt.assert_allclose(f(0, 1, 5), [0, 0, 0])
-        utt.assert_allclose(f(1, 1, 5), [0, 0, 0])
-        utt.assert_allclose(f(2, 1, 5), [0, 0, 0])
-        utt.assert_allclose(f(5, 1, 5), [0, 0, 0])
-        utt.assert_allclose(f(7, 1, 5), [0, 0, 0])
-
-
 def test_grad_abs():
     a = fscalar("a")
     b = 0.5 * (a + pytensor.tensor.abs(a))
@@ -543,3 +492,69 @@ def test_grad_log10():
     b_grad = pytensor.gradient.grad(b, a)
     assert b.dtype == "float32"
     assert b_grad.dtype == "float32"
+
+
+def test_scalar_hash_default_output_type_preference():
+    # Old hash used `getattr(self, "output_type_preference", 0)`
+    # whereas equality used `getattr(self, "output_type_preference", None)`.
+    # Since 27d797076668fbf0617654fd9b91f92ddb6737e6,
+    # output_type_preference is always present (None if not specified),
+    # which led to C-caching errors when comparing old cached Ops and fresh Ops,
+    # as they evaluated equal but hashed differently
+
+    new_eq = EQ()
+    old_eq = EQ()
+    del old_eq.output_types_preference  # mimic old Op
+    assert new_eq == old_eq
+    assert hash(new_eq) == hash(old_eq)
+
+
+def test_rtruediv():
+    x = ScalarType(dtype="float64")()
+    y = 1.0 / x
+    assert isinstance(y.owner.op, TrueDiv)
+    assert isinstance(y.type, ScalarType)
+    assert y.eval({x: 2.0}) == 0.5
+
+
+def test_rfloordiv():
+    x = ScalarType(dtype="float64")()
+    y = 5.0 // x
+    assert isinstance(y.owner.op, IntDiv)
+    assert isinstance(y.type, ScalarType)
+    assert y.eval({x: 2.0}) == 2.0
+
+
+@pytest.mark.parametrize("inp_type", all_types, ids=lambda x: x.dtype)
+def test_cast_to_complex(inp_type):
+    if inp_type.dtype == "float16":
+        if isinstance(get_default_mode().linker, NumbaLinker):
+            pytest.skip("Numba doesn't support float16")
+    x = inp_type("x")
+    # Output as tensor to sidestep numba issue with numpy scalar outputs
+    y = tensor_from_scalar(x.astype("complex64"))
+    res_y = y.eval({x: np.array(1.0, dtype=inp_type.dtype)})
+    assert res_y == 1
+    assert res_y.dtype == "complex64"
+
+
+@pytest.mark.parametrize("mode", [Mode(linker="py"), None])
+def test_pow_negative_base_fractional_exponent(mode):
+    x = float64("x")
+    y = float64("y")
+    f = pytensor.function([x, y], pow(x, y), mode=mode)
+
+    # Positive base works normally
+    assert f(2.0, 3.0) == 8.0
+
+    # Negative base with integer exponent works
+    assert f(-2.0, 3.0) == -8.0
+
+    # Negative base with fractional exponent returns nan, not complex
+    result = f(-1.0, 0.01)
+    if not isinstance(f.maker.linker, NumbaLinker):
+        # Numba doesn't return numpy scalars
+        assert isinstance(result, np.floating), (
+            f"Expected numpy float, got {type(result)}: {result}"
+        )
+    assert np.isnan(result), f"Expected nan, got {result}"

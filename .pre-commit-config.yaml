@@ -9,26 +9,28 @@ exclude: |
     )$
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: debug-statements
         exclude: |
           (?x)^(
               pytensor/breakpoint\.py|
               pytensor/graph/op\.py|
-              pytensor/compile/nanguardmode\.py|
+              pytensor/compile/debug/nanguardmode\.py|
               pytensor/graph/rewriting/basic\.py|
               pytensor/tensor/variable\.py|
           )$
       - id: check-merge-conflict
   - repo: https://github.com/sphinx-contrib/sphinx-lint                                  
-    rev: v1.0.0                                                                          
+    rev: v1.0.2                                                                          
     hooks:                                                                               
     - id: sphinx-lint 
-      args: ["."]
+      args: ["-i", ".pixi", "."]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.3
+    rev: v0.15.16
     hooks:
-      - id: ruff
+      - id: ruff-check
+        types_or: [python, pyi, jupyter]
         args: ["--fix", "--output-format=full"]
       - id: ruff-format
+        types_or: [python, pyi, jupyter]

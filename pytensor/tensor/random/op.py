@@ -1,6 +1,6 @@
+import abc
 import warnings
 from collections.abc import Sequence
-from copy import copy
 from typing import Any, cast
 
 import numpy as np
@@ -22,6 +22,7 @@ from pytensor.tensor.blockwise import OpWithCoreShape
 from pytensor.tensor.random.type import RandomGeneratorType, RandomType
 from pytensor.tensor.random.utils import (
     compute_batch_shape,
+    custom_rng_deepcopy,
     explicit_expand_dims,
     normalize_size_param,
 )
@@ -32,7 +33,20 @@ from pytensor.tensor.utils import _parse_gufunc_signature, safe_signature
 from pytensor.tensor.variable import TensorVariable
 
 
-class RandomVariable(Op):
+class RNGConsumerOp(Op):
+    """Baseclass for Ops that consume RNGs."""
+
+    @abc.abstractmethod
+    def update(self, node: Apply) -> dict[Variable, Variable]:
+        """Symbolic update expression for input RNG variables.
+
+        Returns a dictionary with the symbolic expressions required for correct updating
+        of RNG variables in repeated function evaluations.
+        """
+        pass
+
+
+class RandomVariable(RNGConsumerOp):
     """An `Op` that produces a sample from a random variable.
 
     This is essentially `RandomFunction`, except that it removes the
@@ -112,6 +126,8 @@ class RandomVariable(Op):
             else:
                 self.signature = safe_signature(self.ndims_params, [self.ndim_supp])
 
+        if isinstance(dtype, np.dtype):
+            dtype = dtype.name
         self.dtype = dtype or getattr(self, "dtype", None)
 
         self.inplace = (
@@ -120,6 +136,9 @@ class RandomVariable(Op):
 
         if self.inplace:
             self.destroy_map = {0: [0]}
+
+    def update(self, node: Apply) -> dict[Variable, Variable]:
+        return {node.inputs[0]: node.outputs[0]}
 
     def _supp_shape_from_params(self, dist_params, param_shapes=None):
         """Determine the support shape of a multivariate `RandomVariable`'s output given its parameters.
@@ -287,7 +306,7 @@ class RandomVariable(Op):
 
         return shape
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         _, size, *dist_params = node.inputs
         _, _, *param_shapes = input_shapes
 
@@ -295,7 +314,16 @@ class RandomVariable(Op):
 
         return [None, list(shape)]
 
-    def __call__(self, *args, size=None, name=None, rng=None, dtype=None, **kwargs):
+    def __call__(
+        self,
+        *args,
+        size=None,
+        name=None,
+        rng=None,
+        dtype=None,
+        return_next_rng: bool = False,
+        **kwargs,
+    ):
         if dtype is None:
             dtype = self.dtype
         if dtype == "floatX":
@@ -313,15 +341,32 @@ class RandomVariable(Op):
             props["dtype"] = dtype
             new_op = type(self)(**props)
             return new_op.__call__(
-                *args, size=size, name=name, rng=rng, dtype=dtype, **kwargs
+                *args,
+                size=size,
+                name=name,
+                rng=rng,
+                dtype=dtype,
+                return_next_rng=return_next_rng,
+                **kwargs,
             )
 
-        res = super().__call__(rng, size, *args, **kwargs)
+        if not return_next_rng:
+            warnings.warn(
+                "RandomVariable Ops will stop hiding the rng output in a future version. "
+                "Set return_next_rng=True to suppress this warning.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
+        node = self.make_node(rng, size, *args)
+        out = node.default_output()
         if name is not None:
-            res.name = name
-
-        return res
+            out.name = name
+        if return_next_rng:
+            next_rng = self.update(node)[self.rng_param(node)]
+            return next_rng, out
+        else:
+            return out
 
     def make_node(self, rng, size, *dist_params):
         """Create a random variable node.
@@ -354,11 +399,21 @@ class RandomVariable(Op):
         )
 
         if rng is None:
-            rng = pytensor.shared(np.random.default_rng())
+            from pytensor.tensor.random.variable import shared_rng
+
+            warnings.warn(
+                "Calling a RandomVariable without an explicit rng is deprecated. "
+                "Use pt.random.rng or pt.random.shared_rng.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            rng = shared_rng(seed=None)
         elif not isinstance(rng.type, RandomType):
             raise TypeError(
                 "The type of rng should be an instance of RandomGeneratorType "
             )
+
+        rng.tag.used = True
 
         inferred_shape = self._infer_shape(size, dist_params)
         _, static_shape = infer_static_shape(inferred_shape)
@@ -366,12 +421,21 @@ class RandomVariable(Op):
         dist_params = explicit_expand_dims(
             dist_params,
             self.ndims_params,
-            size_length=None if NoneConst.equals(size) else get_vector_length(size),
+            size_length=None
+            if isinstance(size.type, NoneTypeT)
+            else get_vector_length(size),
         )
 
         inputs = (rng, size, *dist_params)
         out_type = TensorType(dtype=self.dtype, shape=static_shape)
         outputs = (rng.type(), out_type())
+
+        if self.dtype == "floatX":
+            # Commit to a specific float type if the Op is still using "floatX"
+            dtype = config.floatX
+            props = self._props_dict()
+            props["dtype"] = dtype
+            self = type(self)(**props)
 
         return Apply(self, inputs, outputs)
 
@@ -395,7 +459,7 @@ class RandomVariable(Op):
 
         # Draw from `rng` if `self.inplace` is `True`, and from a copy of `rng` otherwise.
         if not self.inplace:
-            rng = copy(rng)
+            rng = custom_rng_deepcopy(rng)
 
         outputs[0][0] = rng
         outputs[1][0] = np.asarray(
@@ -403,7 +467,7 @@ class RandomVariable(Op):
             dtype=self.dtype,
         )
 
-    def grad(self, inputs, outputs):
+    def pullback(self, inputs, outputs, output_grads):
         return [
             pytensor.gradient.grad_undefined(
                 self, k, inp, "No gradient defined for random variables"
@@ -411,14 +475,18 @@ class RandomVariable(Op):
             for k, inp in enumerate(inputs)
         ]
 
-    def R_op(self, inputs, eval_points):
-        return [None for i in eval_points]
+    def pushforward(self, inputs, outputs, eval_points):
+        from pytensor.gradient import disconnected_type
+
+        return [disconnected_type() for i in eval_points]
 
 
 class AbstractRNGConstructor(Op):
     def make_node(self, seed=None):
         if seed is None:
             seed = NoneConst
+        elif isinstance(seed, Variable) and isinstance(seed.type, NoneTypeT):
+            pass
         else:
             seed = as_tensor_variable(seed)
         inputs = [seed]
@@ -468,6 +536,11 @@ def vectorize_random_variable(
 
 class RandomVariableWithCoreShape(OpWithCoreShape):
     """Generalizes a random variable `Op` to include a core shape parameter."""
+
+    @property
+    def core_op(self):
+        [rv_node] = self.fgraph.apply_nodes
+        return rv_node.op
 
     def __str__(self):
         [rv_node] = self.fgraph.apply_nodes

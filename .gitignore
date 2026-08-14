@@ -27,7 +27,6 @@ __pycache__
 \#*\#
 build
 compiled/*.cpp
-core.*
 cutils_ext.cpp
 dist
 doc/.build/
@@ -56,3 +55,16 @@ pytensor-venv/
 testing-report.html
 coverage.xml
 .coverage.*
+
+# ai
+.ai/
+.claude/
+.cursor/
+.CLAUDE.md
+
+# gallery notebook downloaded data
+doc/gallery/**/data/
+
+# JupyterLab session artifacts
+.jupyter/
+.jupyter_ystore.db

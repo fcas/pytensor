@@ -1,0 +1,2037 @@
+import numba
+import numpy as np
+from numba.core import cgutils, types
+from numba.core.extending import get_cython_function_address, intrinsic
+from numba.core.registry import CPUDispatcher
+from numba.core.types import Complex
+from numba.np.linalg import ensure_lapack, get_blas_kind
+
+from pytensor.link.numba.cache import _call_cached_ptr
+from pytensor.link.numba.dispatch import basic as numba_basic
+
+
+nb_i32 = types.int32
+nb_i32p = types.CPointer(nb_i32)
+
+nb_f32 = types.float32
+nb_f32p = types.CPointer(nb_f32)
+
+nb_f64 = types.float64
+nb_f64p = types.CPointer(nb_f64)
+
+nb_c64 = types.complex64
+nb_c64p = types.CPointer(nb_c64)
+
+nb_c128 = types.complex128
+nb_c128p = types.CPointer(nb_c128)
+
+
+def get_lapack_ptr(dtype, name):
+    d = get_blas_kind(dtype)
+    func_name = f"{d}{name}"
+    lapack_ptr = get_cython_function_address("scipy.linalg.cython_lapack", func_name)
+    return lapack_ptr
+
+
+def _get_underlying_float(dtype):
+    s_dtype = str(dtype)
+    out_type = s_dtype
+    if s_dtype == "complex64":
+        out_type = "float32"
+    elif s_dtype == "complex128":
+        out_type = "float64"
+
+    return np.dtype(out_type)
+
+
+def _get_nb_float_from_dtype(blas_dtype, return_pointer=True):
+    match blas_dtype:
+        case "s":
+            return nb_f32p if return_pointer else nb_f32
+        case "d":
+            return nb_f64p if return_pointer else nb_f64
+        case "c":
+            return nb_c64p if return_pointer else nb_c64
+        case "z":
+            return nb_c128p if return_pointer else nb_c128
+        case _:
+            raise ValueError(f"Unsupported BLAS dtype: {blas_dtype}")
+
+
+@intrinsic
+def sptr_to_val(typingctx, data):
+    def impl(context, builder, signature, args):
+        val = builder.load(args[0])
+        return val
+
+    sig = types.float32(types.CPointer(types.float32))
+    return sig, impl
+
+
+@intrinsic
+def dptr_to_val(typingctx, data):
+    def impl(context, builder, signature, args):
+        val = builder.load(args[0])
+        return val
+
+    sig = types.float64(types.CPointer(types.float64))
+    return sig, impl
+
+
+@intrinsic
+def int_ptr_to_val(typingctx, data):
+    def impl(context, builder, signature, args):
+        val = builder.load(args[0])
+        return val
+
+    sig = types.int32(types.CPointer(types.int32))
+    return sig, impl
+
+
+@intrinsic
+def val_to_int_ptr(typingctx, data):
+    def impl(context, builder, signature, args):
+        ptr = cgutils.alloca_once_value(builder, args[0])
+        return ptr
+
+    sig = types.CPointer(types.int32)(types.int32)
+    return sig, impl
+
+
+@intrinsic
+def val_to_sptr(typingctx, data):
+    def impl(context, builder, signature, args):
+        ptr = cgutils.alloca_once_value(builder, args[0])
+        return ptr
+
+    sig = types.CPointer(types.float32)(types.float32)
+    return sig, impl
+
+
+@intrinsic
+def val_to_zptr(typingctx, data):
+    def impl(context, builder, signature, args):
+        ptr = cgutils.alloca_once_value(builder, args[0])
+        return ptr
+
+    sig = types.CPointer(types.complex128)(types.complex128)
+    return sig, impl
+
+
+@intrinsic
+def val_to_dptr(typingctx, data):
+    def impl(context, builder, signature, args):
+        ptr = cgutils.alloca_once_value(builder, args[0])
+        return ptr
+
+    sig = types.CPointer(types.float64)(types.float64)
+    return sig, impl
+
+
+class _LAPACK:
+    """
+    Functions to return type signatures for wrapped LAPACK functions.
+
+    Patterned after https://github.com/numba/numba/blob/bd7ebcfd4b850208b627a3f75d4706000be36275/numba/np/linalg.py#L74
+    """
+
+    def __init__(self):
+        ensure_lapack()
+
+    @classmethod
+    def numba_xtrtrs(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a triangular system of equations of the form A @ X = B or A.T @ X = B.
+
+        Called by scipy.linalg.solve_triangular
+        """
+
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}trtrs"
+
+        @numba_basic.numba_njit
+        def get_trtrs_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "trtrs")
+            return ptr
+
+        trtrs_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # TRANS
+                nb_i32p,  # DIAG
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_ptr,  # A
+                nb_i32p,  # LDA
+                float_ptr,  # B
+                nb_i32p,  # LDB
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def trtrs(UPLO, TRANS, DIAG, N, NRHS, A, LDA, B, LDB, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_trtrs_pointer,
+                func_type_ref=trtrs_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, TRANS, DIAG, N, NRHS, A, LDA, B, LDB, INFO)
+
+        return trtrs
+
+    @classmethod
+    def numba_xpotrf(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the Cholesky factorization of a real symmetric positive definite matrix.
+
+        Called by scipy.linalg.cholesky
+        """
+
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}potrf"
+
+        @numba_basic.numba_njit
+        def get_potrf_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "potrf")
+            return ptr
+
+        potrf_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A
+                nb_i32p,  # LDA
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def potrf(UPLO, N, A, LDA, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_potrf_pointer,
+                func_type_ref=potrf_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, N, A, LDA, INFO)
+
+        return potrf
+
+    @classmethod
+    def numba_xpotrs(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B with a symmetric positive definite matrix A using the Cholesky
+        factorization computed by numba_potrf.
+
+        Called by scipy.linalg.cho_solve
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}potrs"
+
+        @numba_basic.numba_njit
+        def get_potrs_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "potrs")
+            return ptr
+
+        potrs_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def potrs(UPLO, N, NRHS, A, LDA, B, LDB, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_potrs_pointer,
+                func_type_ref=potrs_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, N, NRHS, A, LDA, B, LDB, INFO)
+
+        return potrs
+
+    @classmethod
+    def numba_xgetrf(cls, dtype) -> CPUDispatcher:
+        """
+        Compute partial pivoting LU factorization of a general M-by-N matrix A using row interchanges.
+
+        Called by scipy.linalg.lu_factor
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}getrf"
+
+        @numba_basic.numba_njit
+        def get_getrf_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "getrf")
+            return ptr
+
+        getrf_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # M
+                nb_i32p,  # N
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                nb_i32p,  # IPIV
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def getrf(M, N, A, LDA, IPIV, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_getrf_pointer,
+                func_type_ref=getrf_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(M, N, A, LDA, IPIV, INFO)
+
+        return getrf
+
+    @classmethod
+    def numba_xgetrs(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B or A.T @ X = B with a general N-by-N matrix A using the LU
+        factorization computed by GETRF.
+
+        Called by scipy.linalg.lu_solve
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}getrs"
+
+        @numba_basic.numba_njit
+        def get_getrs_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "getrs")
+            return ptr
+
+        getrs_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # TRANS
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                nb_i32p,  # IPIV
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def getrs(TRANS, N, NRHS, A, LDA, IPIV, B, LDB, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_getrs_pointer,
+                func_type_ref=getrs_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(TRANS, N, NRHS, A, LDA, IPIV, B, LDB, INFO)
+
+        return getrs
+
+    @classmethod
+    def numba_xsysv(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B with a symmetric matrix A using the diagonal pivoting method,
+        factorizing A into LDL^T or UDU^T form, depending on the value of UPLO
+
+        Called by scipy.linalg.solve when assume_a == "sym"
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}sysv"
+
+        @numba_basic.numba_njit
+        def get_sysv_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "sysv")
+            return ptr
+
+        sysv_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                nb_i32p,  # IPIV
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                float_pointer,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def sysv(UPLO, N, NRHS, A, LDA, IPIV, B, LDB, WORK, LWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_sysv_pointer,
+                func_type_ref=sysv_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, N, NRHS, A, LDA, IPIV, B, LDB, WORK, LWORK, INFO)
+
+        return sysv
+
+    @classmethod
+    def numba_xhesv(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B with a Hermitian matrix A using the diagonal pivoting method,
+        factorizing A into LDL^H or UDU^H form, depending on the value of UPLO.
+
+        Called by scipy.linalg.solve when assume_a == "her" with complex inputs.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}hesv"
+
+        @numba_basic.numba_njit
+        def get_hesv_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "hesv")
+            return ptr
+
+        hesv_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                nb_i32p,  # IPIV
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                float_pointer,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def hesv(UPLO, N, NRHS, A, LDA, IPIV, B, LDB, WORK, LWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_hesv_pointer,
+                func_type_ref=hesv_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, N, NRHS, A, LDA, IPIV, B, LDB, WORK, LWORK, INFO)
+
+        return hesv
+
+    @classmethod
+    def numba_xposv(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B with a symmetric positive definite matrix A using the Cholesky
+        factorization computed by potrf.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}posv"
+
+        @numba_basic.numba_njit
+        def get_posv_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "posv")
+            return ptr
+
+        posv_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def posv(UPLO, N, NRHS, A, LDA, B, LDB, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_posv_pointer,
+                func_type_ref=posv_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(UPLO, N, NRHS, A, LDA, B, LDB, INFO)
+
+        return posv
+
+    @classmethod
+    def numba_xgttrf(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the LU factorization of a tridiagonal matrix A using row interchanges.
+
+        Called by scipy.linalg.solve when assume_a == "tri"
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}gttrf"
+
+        @numba_basic.numba_njit
+        def get_gttrf_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gttrf")
+            return ptr
+
+        gttrf_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # N
+                float_pointer,  # DL
+                float_pointer,  # D
+                float_pointer,  # DU
+                float_pointer,  # DU2
+                nb_i32p,  # IPIV
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def gttrf(N, DL, D, DU, DU2, IPIV, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_gttrf_pointer,
+                func_type_ref=gttrf_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(N, DL, D, DU, DU2, IPIV, INFO)
+
+        return gttrf
+
+    @classmethod
+    def numba_xgttrs(cls, dtype) -> CPUDispatcher:
+        """
+        Solve a system of linear equations A @ X = B with a tridiagonal matrix A using the LU factorization computed by numba_gttrf.
+
+        Called by scipy.linalg.solve, when assume_a == "tri"
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}gttrs"
+
+        @numba_basic.numba_njit
+        def get_gttrs_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gttrs")
+            return ptr
+
+        gttrs_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # TRANS
+                nb_i32p,  # N
+                nb_i32p,  # NRHS
+                float_pointer,  # DL
+                float_pointer,  # D
+                float_pointer,  # DU
+                float_pointer,  # DU2
+                nb_i32p,  # IPIV
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def gttrs(TRANS, N, NRHS, DL, D, DU, DU2, IPIV, B, LDB, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_gttrs_pointer,
+                func_type_ref=gttrs_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(TRANS, N, NRHS, DL, D, DU, DU2, IPIV, B, LDB, INFO)
+
+        return gttrs
+
+    @classmethod
+    def numba_xgtcon(cls, dtype) -> CPUDispatcher:
+        """
+        Estimate the reciprocal of the condition number of a tridiagonal matrix A using the LU factorization computed by numba_gttrf.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}gtcon"
+
+        @numba_basic.numba_njit
+        def get_gtcon_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gtcon")
+            return ptr
+
+        gtcon_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # NORM
+                nb_i32p,  # N
+                float_pointer,  # DL
+                float_pointer,  # D
+                float_pointer,  # DU
+                float_pointer,  # DU2
+                nb_i32p,  # IPIV
+                float_pointer,  # ANORM
+                float_pointer,  # RCOND
+                float_pointer,  # WORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def gtcon(NORM, N, DL, D, DU, DU2, IPIV, ANORM, RCOND, WORK, IWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_gtcon_pointer,
+                func_type_ref=gtcon_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(NORM, N, DL, D, DU, DU2, IPIV, ANORM, RCOND, WORK, IWORK, INFO)
+
+        return gtcon
+
+    @classmethod
+    def numba_xgeqrf(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the QR factorization of a general M-by-N matrix A.
+
+        Used in QR decomposition (no pivoting).
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}geqrf"
+
+        @numba_basic.numba_njit
+        def get_geqrf_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "geqrf")
+            return ptr
+
+        geqrf_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # M
+                nb_i32p,  # N
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # TAU
+                float_pointer,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def geqrf(M, N, A, LDA, TAU, WORK, LWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_geqrf_pointer,
+                func_type_ref=geqrf_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(M, N, A, LDA, TAU, WORK, LWORK, INFO)
+
+        return geqrf
+
+    @classmethod
+    def numba_xgeqp3(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the QR factorization with column pivoting of a general M-by-N matrix A.
+
+        Used in QR decomposition with pivoting.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}geqp3"
+
+        @numba_basic.numba_njit
+        def get_geqp3_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "geqp3")
+            return ptr
+
+        if isinstance(dtype, Complex):
+            real_pointer = nb_f64p if dtype is nb_c128 else nb_f32p
+            geqp3_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    nb_i32p,  # JPVT
+                    float_pointer,  # TAU
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    real_pointer,  # RWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def geqp3(M, N, A, LDA, JPVT, TAU, WORK, LWORK, RWORK, INFO):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_geqp3_pointer,
+                    func_type_ref=geqp3_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(M, N, A, LDA, JPVT, TAU, WORK, LWORK, RWORK, INFO)
+
+        else:
+            geqp3_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    nb_i32p,  # JPVT
+                    float_pointer,  # TAU
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def geqp3(M, N, A, LDA, JPVT, TAU, WORK, LWORK, INFO):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_geqp3_pointer,
+                    func_type_ref=geqp3_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(M, N, A, LDA, JPVT, TAU, WORK, LWORK, INFO)
+
+        return geqp3
+
+    @classmethod
+    def numba_xorgqr(cls, dtype) -> CPUDispatcher:
+        """
+        Generate the orthogonal matrix Q from a QR factorization (real types).
+
+        Used in QR decomposition to form Q.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}orgqr"
+
+        @numba_basic.numba_njit
+        def get_orgqr_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "orgqr")
+            return ptr
+
+        orgqr_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # M
+                nb_i32p,  # N
+                nb_i32p,  # K
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # TAU
+                float_pointer,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def orgqr(M, N, K, A, LDA, TAU, WORK, LWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_orgqr_pointer,
+                func_type_ref=orgqr_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(M, N, K, A, LDA, TAU, WORK, LWORK, INFO)
+
+        return orgqr
+
+    @classmethod
+    def numba_xungqr(cls, dtype) -> CPUDispatcher:
+        """
+        Generate the unitary matrix Q from a QR factorization (complex types).
+
+        Used in QR decomposition to form Q for complex types.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}ungqr"
+
+        @numba_basic.numba_njit
+        def get_ungqr_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "ungqr")
+            return ptr
+
+        ungqr_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # M
+                nb_i32p,  # N
+                nb_i32p,  # K
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # TAU
+                float_pointer,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def ungqr(M, N, K, A, LDA, TAU, WORK, LWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_ungqr_pointer,
+                func_type_ref=ungqr_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(M, N, K, A, LDA, TAU, WORK, LWORK, INFO)
+
+        return ungqr
+
+    @classmethod
+    def numba_xgees(cls, dtype):
+        """
+        Compute the eigenvalues and, optionally, the right Schur vectors of a real nonsymmetric matrix A.
+
+        Called by scipy.linalg.schur
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}gees"
+
+        @numba_basic.numba_njit
+        def get_gees_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gees")
+            return ptr
+
+        if isinstance(dtype, Complex):
+            real_pointer = nb_f64p if dtype is nb_c128 else nb_f32p
+            gees_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBVS
+                    nb_i32p,  # SORT
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    nb_i32p,  # SDIM
+                    float_pointer,  # W
+                    float_pointer,  # VS
+                    nb_i32p,  # LDVS
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    real_pointer,  # RWORK
+                    nb_i32p,  # BWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gees(
+                JOBVS,
+                SORT,
+                SELECT,
+                N,
+                A,
+                LDA,
+                SDIM,
+                W,
+                VS,
+                LDVS,
+                WORK,
+                LWORK,
+                RWORK,
+                BWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gees_pointer,
+                    func_type_ref=gees_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBVS,
+                    SORT,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    SDIM,
+                    W,
+                    VS,
+                    LDVS,
+                    WORK,
+                    LWORK,
+                    RWORK,
+                    BWORK,
+                    INFO,
+                )
+
+        else:  # Real case
+            gees_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBVS
+                    nb_i32p,  # SORT
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    nb_i32p,  # SDIM
+                    float_pointer,  # WR
+                    float_pointer,  # WI
+                    float_pointer,  # VS
+                    nb_i32p,  # LDVS
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # BWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gees(
+                JOBVS,
+                SORT,
+                SELECT,
+                N,
+                A,
+                LDA,
+                SDIM,
+                WR,
+                WI,
+                VS,
+                LDVS,
+                WORK,
+                LWORK,
+                BWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gees_pointer,
+                    func_type_ref=gees_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBVS,
+                    SORT,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    SDIM,
+                    WR,
+                    WI,
+                    VS,
+                    LDVS,
+                    WORK,
+                    LWORK,
+                    BWORK,
+                    INFO,
+                )
+
+        return gees
+
+    @classmethod
+    def numba_xtrsyl(cls, dtype):
+        """
+        Solve the Sylvester equation A*X + ISGN*X*B = C or A**T*X + ISGN*X*B**T = C.
+
+        Called by scipy.linalg.solve_sylvester and scipy.linalg.solve_continuous_lyapunov.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+
+        if kind in "ld":
+            real_pointer = float_pointer
+        else:
+            real_pointer = nb_f64p if dtype is nb_c128 else nb_f32p
+
+        unique_func_name = f"scipy.lapack.{kind}trsyl"
+
+        @numba_basic.numba_njit
+        def get_trsyl_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "trsyl")
+            return ptr
+
+        trsyl_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # TRANA
+                nb_i32p,  # TRANB
+                nb_i32p,  # ISGN
+                nb_i32p,  # M
+                nb_i32p,  # N
+                float_pointer,  # A
+                nb_i32p,  # LDA
+                float_pointer,  # B
+                nb_i32p,  # LDB
+                float_pointer,  # C
+                nb_i32p,  # LDC
+                real_pointer,  # SCALE
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def trsyl(TRANA, TRANB, ISGN, M, N, A, LDA, B, LDB, C, LDC, SCALE, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_trsyl_pointer,
+                func_type_ref=trsyl_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(TRANA, TRANB, ISGN, M, N, A, LDA, B, LDB, C, LDC, SCALE, INFO)
+
+        return trsyl
+
+    @classmethod
+    def numba_xgges(cls, dtype):
+        """
+        Compute generalized eigenvalues and, optionally, the left and/or right generalized Schur vectors of a pair
+        of real nonsymmetric matrices (A,B).
+
+        Called by scipy.linalg.qz and scipy.linalg.ordqz.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}gges"
+
+        @numba_basic.numba_njit
+        def get_gges_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gges")
+            return ptr
+
+        if isinstance(dtype, Complex):
+            real_pointer = nb_f64p if dtype is nb_c128 else nb_f32p
+            gges_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBVSL
+                    nb_i32p,  # JOBVSR
+                    nb_i32p,  # SORT
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    float_pointer,  # B
+                    nb_i32p,  # LDB
+                    nb_i32p,  # SDIM
+                    float_pointer,  # ALPHA
+                    float_pointer,  # BETA
+                    float_pointer,  # VSL
+                    nb_i32p,  # LDVSL
+                    float_pointer,  # VSR
+                    nb_i32p,  # LDVSR
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    real_pointer,  # RWORK
+                    nb_i32p,  # BWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gges(
+                JOBVSL,
+                JOBVSR,
+                SORT,
+                SELECT,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                SDIM,
+                ALPHA,
+                BETA,
+                VSL,
+                LDVSL,
+                VSR,
+                LDVSR,
+                WORK,
+                LWORK,
+                RWORK,
+                BWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gges_pointer,
+                    func_type_ref=gges_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBVSL,
+                    JOBVSR,
+                    SORT,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    B,
+                    LDB,
+                    SDIM,
+                    ALPHA,
+                    BETA,
+                    VSL,
+                    LDVSL,
+                    VSR,
+                    LDVSR,
+                    WORK,
+                    LWORK,
+                    RWORK,
+                    BWORK,
+                    INFO,
+                )
+        else:  # Real case
+            gges_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBVSL
+                    nb_i32p,  # JOBVSR
+                    nb_i32p,  # SORT
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    float_pointer,  # B
+                    nb_i32p,  # LDB
+                    nb_i32p,  # SDIM
+                    float_pointer,  # ALPHAR
+                    float_pointer,  # ALPHAI
+                    float_pointer,  # BETA
+                    float_pointer,  # VSL
+                    nb_i32p,  # LDVSL
+                    float_pointer,  # VSR
+                    nb_i32p,  # LDVSR
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # BWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gges(
+                JOBVSL,
+                JOBVSR,
+                SORT,
+                SELECT,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                SDIM,
+                ALPHAR,
+                ALPHAI,
+                BETA,
+                VSL,
+                LDVSL,
+                VSR,
+                LDVSR,
+                WORK,
+                LWORK,
+                BWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gges_pointer,
+                    func_type_ref=gges_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBVSL,
+                    JOBVSR,
+                    SORT,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    B,
+                    LDB,
+                    SDIM,
+                    ALPHAR,
+                    ALPHAI,
+                    BETA,
+                    VSL,
+                    LDVSL,
+                    VSR,
+                    LDVSR,
+                    WORK,
+                    LWORK,
+                    BWORK,
+                    INFO,
+                )
+
+        return gges
+
+    @classmethod
+    def numba_tgsen(cls, dtype):
+        """
+        Reorders the generalized Schur decomposition of a matrix pair (A, B) by their eigenvalues.
+
+        Output is sorted so that a selected cluster of eigenvalues appears in the leading diagonal blocks of the pair
+        (A,B). The leading columns of Q and Z form unitary bases of the corresponding left and right eigenspaces
+        (deflating subspaces). (A, B) must be in generalized Schur canonical form, that is, A and B are both upper
+        triangular.
+
+        Used by scipy.linalg.ordqz.
+        """
+        kind = get_blas_kind(dtype)
+        float_pointer = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}tgsen"
+
+        @numba_basic.numba_njit
+        def get_tgsen_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "tgsen")
+            return ptr
+
+        if isinstance(dtype, Complex):
+            real_pointer = nb_f64p if dtype is nb_c128 else nb_f32p
+            tgsen_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # IJOB
+                    nb_i32p,  # WANTQ
+                    nb_i32p,  # WANTZ
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    float_pointer,  # B
+                    nb_i32p,  # LDB
+                    float_pointer,  # alpha
+                    float_pointer,  # beta
+                    float_pointer,  # Q
+                    nb_i32p,  # LDQ
+                    float_pointer,  # Z
+                    nb_i32p,  # LDZ
+                    nb_i32p,  # M
+                    real_pointer,  # PL
+                    real_pointer,  # PR
+                    real_pointer,  # DIF
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # IWORK
+                    nb_i32p,  # LIWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def tgsen(
+                IJOB,
+                WANTQ,
+                WANTZ,
+                SELECT,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                alpha,
+                beta,
+                Q,
+                LDQ,
+                Z,
+                LDZ,
+                M,
+                PL,
+                PR,
+                DIF,
+                WORK,
+                LWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_tgsen_pointer,
+                    func_type_ref=tgsen_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    IJOB,
+                    WANTQ,
+                    WANTZ,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    B,
+                    LDB,
+                    alpha,
+                    beta,
+                    Q,
+                    LDQ,
+                    Z,
+                    LDZ,
+                    M,
+                    PL,
+                    PR,
+                    DIF,
+                    WORK,
+                    LWORK,
+                    IWORK,
+                    LIWORK,
+                    INFO,
+                )
+        else:  # Real case
+            tgsen_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # IJOB
+                    nb_i32p,  # WANTQ
+                    nb_i32p,  # WANTZ
+                    nb_i32p,  # SELECT
+                    nb_i32p,  # N
+                    float_pointer,  # A
+                    nb_i32p,  # LDA
+                    float_pointer,  # B
+                    nb_i32p,  # LDB
+                    float_pointer,  # ALPHAR
+                    float_pointer,  # ALPHAI
+                    float_pointer,  # BETA
+                    float_pointer,  # Q
+                    nb_i32p,  # LDQ
+                    float_pointer,  # Z
+                    nb_i32p,  # LDZ
+                    nb_i32p,  # M
+                    float_pointer,  # PL
+                    float_pointer,  # PR
+                    float_pointer,  # DIF
+                    float_pointer,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # IWORK
+                    nb_i32p,  # LIWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def tgsen(
+                IJOB,
+                WANTQ,
+                WANTZ,
+                SELECT,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                ALPHAR,
+                ALPHAI,
+                BETA,
+                Q,
+                LDQ,
+                Z,
+                LDZ,
+                M,
+                PL,
+                PR,
+                DIF,
+                WORK,
+                LWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_tgsen_pointer,
+                    func_type_ref=tgsen_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    IJOB,
+                    WANTQ,
+                    WANTZ,
+                    SELECT,
+                    N,
+                    A,
+                    LDA,
+                    B,
+                    LDB,
+                    ALPHAR,
+                    ALPHAI,
+                    BETA,
+                    Q,
+                    LDQ,
+                    Z,
+                    LDZ,
+                    M,
+                    PL,
+                    PR,
+                    DIF,
+                    WORK,
+                    LWORK,
+                    IWORK,
+                    LIWORK,
+                    INFO,
+                )
+
+        return tgsen
+
+    @classmethod
+    def numba_xsyevd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute all eigenvalues and eigenvectors of a real symmetric matrix
+        using a divide-and-conquer algorithm (LAPACK xSYEVD).
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}syevd"
+
+        @numba_basic.numba_njit
+        def get_syevd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "syevd")
+            return ptr
+
+        syevd_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # JOBZ
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A
+                nb_i32p,  # LDA
+                float_ptr,  # W
+                float_ptr,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # IWORK (int array passed as i32 ptr)
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def syevd(JOBZ, UPLO, N, A, LDA, W, WORK, LWORK, IWORK, LIWORK, INFO):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_syevd_pointer,
+                func_type_ref=syevd_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(JOBZ, UPLO, N, A, LDA, W, WORK, LWORK, IWORK, LIWORK, INFO)
+
+        return syevd
+
+    @classmethod
+    def numba_xsygvd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute all eigenvalues and eigenvectors of a generalized real symmetric
+        definite eigenproblem using a divide-and-conquer algorithm (LAPACK xSYGVD).
+
+        Solves A*v = w*B*v (ITYPE=1).
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}sygvd"
+
+        @numba_basic.numba_njit
+        def get_sygvd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "sygvd")
+            return ptr
+
+        sygvd_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # ITYPE
+                nb_i32p,  # JOBZ
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A
+                nb_i32p,  # LDA
+                float_ptr,  # B
+                nb_i32p,  # LDB
+                float_ptr,  # W
+                float_ptr,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def sygvd(
+            ITYPE, JOBZ, UPLO, N, A, LDA, B, LDB, W, WORK, LWORK, IWORK, LIWORK, INFO
+        ):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_sygvd_pointer,
+                func_type_ref=sygvd_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(
+                ITYPE,
+                JOBZ,
+                UPLO,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                W,
+                WORK,
+                LWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            )
+
+        return sygvd
+
+    @classmethod
+    def numba_xheevd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute all eigenvalues and eigenvectors of a complex Hermitian matrix
+        using a divide-and-conquer algorithm (LAPACK xHEEVD).
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        real_ptr = nb_f64p if dtype is nb_c128 else nb_f32p
+        unique_func_name = f"scipy.lapack.{kind}heevd"
+
+        @numba_basic.numba_njit
+        def get_heevd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "heevd")
+            return ptr
+
+        heevd_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # JOBZ
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A (complex)
+                nb_i32p,  # LDA
+                real_ptr,  # W (real eigenvalues)
+                float_ptr,  # WORK (complex)
+                nb_i32p,  # LWORK
+                real_ptr,  # RWORK (real)
+                nb_i32p,  # LRWORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def heevd(
+            JOBZ, UPLO, N, A, LDA, W, WORK, LWORK, RWORK, LRWORK, IWORK, LIWORK, INFO
+        ):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_heevd_pointer,
+                func_type_ref=heevd_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(
+                JOBZ,
+                UPLO,
+                N,
+                A,
+                LDA,
+                W,
+                WORK,
+                LWORK,
+                RWORK,
+                LRWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            )
+
+        return heevd
+
+    @classmethod
+    def numba_xsyevr(cls, dtype) -> CPUDispatcher:
+        """
+        Compute eigenvalues and eigenvectors of a real symmetric matrix using the MRRR algorithm (LAPACK xSYEVR).
+        This is scipy's default driver for eigh.
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        unique_func_name = f"scipy.lapack.{kind}syevr"
+
+        @numba_basic.numba_njit
+        def get_syevr_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "syevr")
+            return ptr
+
+        syevr_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # JOBZ
+                nb_i32p,  # RANGE
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A
+                nb_i32p,  # LDA
+                float_ptr,  # VL
+                float_ptr,  # VU
+                nb_i32p,  # IL
+                nb_i32p,  # IU
+                float_ptr,  # ABSTOL
+                nb_i32p,  # M
+                float_ptr,  # W
+                float_ptr,  # Z
+                nb_i32p,  # LDZ
+                nb_i32p,  # ISUPPZ
+                float_ptr,  # WORK
+                nb_i32p,  # LWORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def syevr(
+            JOBZ,
+            RANGE,
+            UPLO,
+            N,
+            A,
+            LDA,
+            VL,
+            VU,
+            IL,
+            IU,
+            ABSTOL,
+            M,
+            W,
+            Z,
+            LDZ,
+            ISUPPZ,
+            WORK,
+            LWORK,
+            IWORK,
+            LIWORK,
+            INFO,
+        ):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_syevr_pointer,
+                func_type_ref=syevr_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(
+                JOBZ,
+                RANGE,
+                UPLO,
+                N,
+                A,
+                LDA,
+                VL,
+                VU,
+                IL,
+                IU,
+                ABSTOL,
+                M,
+                W,
+                Z,
+                LDZ,
+                ISUPPZ,
+                WORK,
+                LWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            )
+
+        return syevr
+
+    @classmethod
+    def numba_xheevr(cls, dtype) -> CPUDispatcher:
+        """
+        Compute eigenvalues and eigenvectors of a complex Hermitian matrix using the MRRR algorithm (LAPACK xHEEVR).
+        This is scipy's default driver for eigh with complex inputs.
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        real_ptr = nb_f64p if dtype is nb_c128 else nb_f32p
+        unique_func_name = f"scipy.lapack.{kind}heevr"
+
+        @numba_basic.numba_njit
+        def get_heevr_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "heevr")
+            return ptr
+
+        heevr_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # JOBZ
+                nb_i32p,  # RANGE
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A (complex)
+                nb_i32p,  # LDA
+                real_ptr,  # VL
+                real_ptr,  # VU
+                nb_i32p,  # IL
+                nb_i32p,  # IU
+                real_ptr,  # ABSTOL
+                nb_i32p,  # M
+                real_ptr,  # W (real eigenvalues)
+                float_ptr,  # Z (complex eigenvectors)
+                nb_i32p,  # LDZ
+                nb_i32p,  # ISUPPZ
+                float_ptr,  # WORK (complex)
+                nb_i32p,  # LWORK
+                real_ptr,  # RWORK (real)
+                nb_i32p,  # LRWORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def heevr(
+            JOBZ,
+            RANGE,
+            UPLO,
+            N,
+            A,
+            LDA,
+            VL,
+            VU,
+            IL,
+            IU,
+            ABSTOL,
+            M,
+            W,
+            Z,
+            LDZ,
+            ISUPPZ,
+            WORK,
+            LWORK,
+            RWORK,
+            LRWORK,
+            IWORK,
+            LIWORK,
+            INFO,
+        ):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_heevr_pointer,
+                func_type_ref=heevr_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(
+                JOBZ,
+                RANGE,
+                UPLO,
+                N,
+                A,
+                LDA,
+                VL,
+                VU,
+                IL,
+                IU,
+                ABSTOL,
+                M,
+                W,
+                Z,
+                LDZ,
+                ISUPPZ,
+                WORK,
+                LWORK,
+                RWORK,
+                LRWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            )
+
+        return heevr
+
+    @classmethod
+    def numba_xhegvd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute all eigenvalues and eigenvectors of a generalized complex Hermitian
+        definite eigenproblem using a divide-and-conquer algorithm (LAPACK xHEGVD).
+
+        Solves A*v = w*B*v (ITYPE=1).
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        real_ptr = nb_f64p if dtype is nb_c128 else nb_f32p
+        unique_func_name = f"scipy.lapack.{kind}hegvd"
+
+        @numba_basic.numba_njit
+        def get_hegvd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "hegvd")
+            return ptr
+
+        hegvd_function_type = types.FunctionType(
+            types.void(
+                nb_i32p,  # ITYPE
+                nb_i32p,  # JOBZ
+                nb_i32p,  # UPLO
+                nb_i32p,  # N
+                float_ptr,  # A (complex)
+                nb_i32p,  # LDA
+                float_ptr,  # B (complex)
+                nb_i32p,  # LDB
+                real_ptr,  # W (real eigenvalues)
+                float_ptr,  # WORK (complex)
+                nb_i32p,  # LWORK
+                real_ptr,  # RWORK (real)
+                nb_i32p,  # LRWORK
+                nb_i32p,  # IWORK
+                nb_i32p,  # LIWORK
+                nb_i32p,  # INFO
+            )
+        )
+
+        @numba_basic.numba_njit
+        def hegvd(
+            ITYPE,
+            JOBZ,
+            UPLO,
+            N,
+            A,
+            LDA,
+            B,
+            LDB,
+            W,
+            WORK,
+            LWORK,
+            RWORK,
+            LRWORK,
+            IWORK,
+            LIWORK,
+            INFO,
+        ):
+            fn = _call_cached_ptr(
+                get_ptr_func=get_hegvd_pointer,
+                func_type_ref=hegvd_function_type,
+                unique_func_name_lit=unique_func_name,
+            )
+            fn(
+                ITYPE,
+                JOBZ,
+                UPLO,
+                N,
+                A,
+                LDA,
+                B,
+                LDB,
+                W,
+                WORK,
+                LWORK,
+                RWORK,
+                LRWORK,
+                IWORK,
+                LIWORK,
+                INFO,
+            )
+
+        return hegvd
+
+    @classmethod
+    def numba_xgesvd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the singular value decomposition of a general M-by-N matrix using the
+        QR-based algorithm (LAPACK xGESVD).
+
+        Called by scipy.linalg.svd with lapack_driver='gesvd' and numpy.linalg.svd for
+        the non-divide-and-conquer path.
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        is_complex = isinstance(dtype, Complex)
+        real_ptr = nb_f64p if dtype is nb_c128 else nb_f32p
+        unique_func_name = f"scipy.lapack.{kind}gesvd"
+
+        @numba_basic.numba_njit
+        def get_gesvd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gesvd")
+            return ptr
+
+        if is_complex:
+            gesvd_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBU
+                    nb_i32p,  # JOBVT
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_ptr,  # A
+                    nb_i32p,  # LDA
+                    real_ptr,  # S
+                    float_ptr,  # U
+                    nb_i32p,  # LDU
+                    float_ptr,  # VT
+                    nb_i32p,  # LDVT
+                    float_ptr,  # WORK
+                    nb_i32p,  # LWORK
+                    real_ptr,  # RWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gesvd(
+                JOBU, JOBVT, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, RWORK, INFO
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gesvd_pointer,
+                    func_type_ref=gesvd_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBU,
+                    JOBVT,
+                    M,
+                    N,
+                    A,
+                    LDA,
+                    S,
+                    U,
+                    LDU,
+                    VT,
+                    LDVT,
+                    WORK,
+                    LWORK,
+                    RWORK,
+                    INFO,
+                )
+
+        else:
+            gesvd_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBU
+                    nb_i32p,  # JOBVT
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_ptr,  # A
+                    nb_i32p,  # LDA
+                    float_ptr,  # S
+                    float_ptr,  # U
+                    nb_i32p,  # LDU
+                    float_ptr,  # VT
+                    nb_i32p,  # LDVT
+                    float_ptr,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gesvd(
+                JOBU, JOBVT, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, INFO
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gesvd_pointer,
+                    func_type_ref=gesvd_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(JOBU, JOBVT, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, INFO)
+
+        return gesvd
+
+    @classmethod
+    def numba_xgesdd(cls, dtype) -> CPUDispatcher:
+        """
+        Compute the singular value decomposition of a general M-by-N matrix using the
+        divide-and-conquer algorithm (LAPACK xGESDD).
+
+        Called by scipy.linalg.svd (default driver) and numpy.linalg.svd.
+        """
+        kind = get_blas_kind(dtype)
+        float_ptr = _get_nb_float_from_dtype(kind)
+        is_complex = isinstance(dtype, Complex)
+        real_ptr = nb_f64p if dtype is nb_c128 else nb_f32p
+        unique_func_name = f"scipy.lapack.{kind}gesdd"
+
+        @numba_basic.numba_njit
+        def get_gesdd_pointer():
+            with numba.objmode(ptr=types.intp):
+                ptr = get_lapack_ptr(dtype, "gesdd")
+            return ptr
+
+        if is_complex:
+            gesdd_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBZ
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_ptr,  # A
+                    nb_i32p,  # LDA
+                    real_ptr,  # S
+                    float_ptr,  # U
+                    nb_i32p,  # LDU
+                    float_ptr,  # VT
+                    nb_i32p,  # LDVT
+                    float_ptr,  # WORK
+                    nb_i32p,  # LWORK
+                    real_ptr,  # RWORK
+                    nb_i32p,  # IWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gesdd(
+                JOBZ, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, RWORK, IWORK, INFO
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gesdd_pointer,
+                    func_type_ref=gesdd_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(
+                    JOBZ,
+                    M,
+                    N,
+                    A,
+                    LDA,
+                    S,
+                    U,
+                    LDU,
+                    VT,
+                    LDVT,
+                    WORK,
+                    LWORK,
+                    RWORK,
+                    IWORK,
+                    INFO,
+                )
+
+        else:
+            gesdd_function_type = types.FunctionType(
+                types.void(
+                    nb_i32p,  # JOBZ
+                    nb_i32p,  # M
+                    nb_i32p,  # N
+                    float_ptr,  # A
+                    nb_i32p,  # LDA
+                    float_ptr,  # S
+                    float_ptr,  # U
+                    nb_i32p,  # LDU
+                    float_ptr,  # VT
+                    nb_i32p,  # LDVT
+                    float_ptr,  # WORK
+                    nb_i32p,  # LWORK
+                    nb_i32p,  # IWORK
+                    nb_i32p,  # INFO
+                )
+            )
+
+            @numba_basic.numba_njit
+            def gesdd(
+                JOBZ, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, IWORK, INFO
+            ):
+                fn = _call_cached_ptr(
+                    get_ptr_func=get_gesdd_pointer,
+                    func_type_ref=gesdd_function_type,
+                    unique_func_name_lit=unique_func_name,
+                )
+                fn(JOBZ, M, N, A, LDA, S, U, LDU, VT, LDVT, WORK, LWORK, IWORK, INFO)
+
+        return gesdd

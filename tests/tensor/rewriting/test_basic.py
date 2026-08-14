@@ -6,18 +6,20 @@ import pytest
 import pytensor
 import pytensor.scalar as ps
 import pytensor.tensor as pt
-from pytensor import graph_replace, shared
+from pytensor import shared
 from pytensor.compile import optdb
-from pytensor.compile.function import function
+from pytensor.compile.maker import function
 from pytensor.compile.mode import get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp, deep_copy_op
 from pytensor.configdefaults import config
 from pytensor.graph import Op
 from pytensor.graph.basic import Constant, equal_computations
 from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.replace import graph_replace
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
+from pytensor.link.numba import NumbaLinker
 from pytensor.printing import debugprint, pprint
 from pytensor.raise_op import Assert, CheckAndRaise
 from pytensor.scalar import Composite, float64
@@ -69,7 +71,7 @@ from pytensor.tensor.rewriting.basic import (
     local_useless_elemwise,
     topo_constant_folding,
     topo_unconditional_constant_folding,
-    topological_fill_sink,
+    topological_second_sink,
 )
 from pytensor.tensor.rewriting.math import local_lift_transpose_through_dot
 from pytensor.tensor.rewriting.shape import ShapeFeature
@@ -77,12 +79,10 @@ from pytensor.tensor.shape import (
     Reshape,
     Shape_i,
     SpecifyShape,
-    Unbroadcast,
     specify_shape,
-    unbroadcast,
 )
 from pytensor.tensor.subtensor import (
-    AdvancedIncSubtensor1,
+    AdvancedIncSubtensor,
     Subtensor,
     advanced_inc_subtensor,
     advanced_inc_subtensor1,
@@ -113,6 +113,7 @@ from pytensor.tensor.type import (
     vector,
 )
 from tests import unittest_tools as utt
+from tests.unittest_tools import assert_equal_computations
 
 
 rewrite_mode = config.mode
@@ -128,7 +129,7 @@ _specialize_rewrites = RewriteDatabaseQuery(include=["fast_run"])
 _specialize_rewrites.position_cutoff = 2.01
 _specialize_rewrites = optdb.query(_specialize_rewrites)
 
-_fast_run_rewrites = RewriteDatabaseQuery(include=["fast_run"])
+_fast_run_rewrites = RewriteDatabaseQuery(include=["fast_run"], exclude=["inplace"])
 _fast_run_rewrites = optdb.query(_fast_run_rewrites)
 
 
@@ -247,7 +248,7 @@ def test_local_useless_fill():
     assert np.array_equal(res, exp_res)
 
 
-def test_local_fill_to_alloc():
+def test_local_second_to_alloc():
     x = dvector()
     m = dmatrix()
 
@@ -256,8 +257,8 @@ def test_local_fill_to_alloc():
 
     y = pt.fill(m, x)
 
-    mode = rewrite_mode.including("stabilize", "local_fill_to_alloc").excluding(
-        "useless", "local_useless_fill"
+    mode = rewrite_mode.including("stabilize", "local_second_to_alloc").excluding(
+        "useless", "local_useless_fill", "local_useless_alloc"
     )
 
     f = function([m, x], y, mode=mode)
@@ -300,15 +301,20 @@ class TestLocalCanonicalizeAlloc:
             # Error raised by SpecifyShape that is introduced due to static shape inference
             with pytest.raises(
                 AssertionError,
-                match="SpecifyShape: dim 0 of input has shape 3, expected 6.",
+                match="SpecifyShape: dim 0 of input has shape 3, expected 6\\.",
             ):
                 f()
         else:
             assert has_alloc
-            # Error raised by Alloc Op
+            # Error raised by Alloc Op. Numba swapped the two shapes in its message in
+            # 0.66 (numba/numba#10499), so accept them in either order.
             with pytest.raises(
                 ValueError,
-                match=r"could not broadcast input array from shape \(3,7\) into shape \(6,7\)",
+                match=(
+                    r"(could not broadcast input array from shape \(3,7\) into shape \(6,7\)"
+                    r"|cannot assign slice of shape \((3, 7|6, 7)\) "
+                    r"from input of shape \((3, 7|6, 7)\))"
+                ),
             ):
                 f()
 
@@ -321,9 +327,9 @@ class TestLocalCanonicalizeAlloc:
         x = matrix("x")
         y = pt.fill(x, x)
 
-        # The rewrite `locall_fill_to_alloc` should call `pt.alloc`,
+        # The rewrite `locall_second_to_alloc` should call `pt.alloc`,
         # which should return `x` and not `alloc(x, ...)`
-        f = function([x], [y], mode=rewrite_mode.including("local_fill_to_alloc"))
+        f = function([x], [y], mode=rewrite_mode.including("local_second_to_alloc"))
         assert not any(isinstance(node.op, Alloc) for node in f.maker.fgraph.toposort())
 
     def test_basic_tile(self):
@@ -332,7 +338,6 @@ class TestLocalCanonicalizeAlloc:
 
         mode = rewrite_mode.including(
             "local_dimshuffle_lift",
-            "local_useless_dimshuffle_in_reshape",
             "local_alloc_sink_dimshuffle",
         )
         f = function([x], [y], mode=mode)
@@ -402,8 +407,8 @@ class TestLocalUselessIncSubtensorAlloc:
         utt.assert_allclose(r1, r2)
 
         # Check stacktrace was copied over correctly after rewrite was applied
-        assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor1)
-        assert check_stack_trace(f2, ops_to_check=AdvancedIncSubtensor1)
+        assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor)
+        assert check_stack_trace(f2, ops_to_check=AdvancedIncSubtensor)
 
     def test_advanced_inc_subtensor1(self):
         x = vector("x")
@@ -433,7 +438,7 @@ class TestLocalUselessIncSubtensorAlloc:
 
         utt.assert_allclose(r1, r2)
 
-        assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor1)
+        assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor)
         assert check_stack_trace(f2, ops_to_check="all")
 
     def test_incsubtensor(self):
@@ -490,8 +495,8 @@ class TestUselessCheckAndRaise:
 
     def test_local_remove_useless_2(self):
         """Remove `CheckAndRaise` conditions that are always true."""
-        x = scalar()
-        y = scalar()
+        x = scalar("x")
+        y = ps.bool("y")
         fg = FunctionGraph(outputs=[assert_op(x, y, 1)], clone=False)
         fg_res = rewrite_graph(fg, include=["canonicalize", "specialize"])
         topo = fg_res.toposort()
@@ -500,8 +505,8 @@ class TestUselessCheckAndRaise:
 
     def test_local_remove_useless_3(self):
         """Don't remove `CheckAndRaise` conditions that are always false."""
-        x = scalar()
-        y = scalar()
+        x = scalar("x")
+        y = ps.bool("y")
         fg = FunctionGraph(outputs=[assert_op(x, y, 0)], clone=False)
         fg_res = rewrite_graph(fg, include=["canonicalize", "specialize"])
         topo = fg_res.toposort()
@@ -559,51 +564,11 @@ class TestTile:
                 f(data)
 
 
-class TestUnbroadcast:
-    def setup_method(self):
-        self.mode = get_default_mode().including("canonicalize")
-
-    def test_local_useless_unbroadcast(self):
-        x1 = tensor(dtype="float64", shape=(1, 2))
-        x2 = tensor(dtype="float64", shape=(2, 1))
-        unbroadcast_op = Unbroadcast(0)
-
-        f = function([x1], unbroadcast_op(x1), mode=self.mode)
-        assert (
-            sum(isinstance(node.op, Unbroadcast) for node in f.maker.fgraph.toposort())
-            == 1
-        )
-
-        f = function([x2], unbroadcast_op(x2), mode=self.mode)
-        assert (
-            sum(isinstance(node.op, Unbroadcast) for node in f.maker.fgraph.toposort())
-            == 0
-        )
-
-    def test_local_unbroadcast_lift(self):
-        x = tensor(dtype="float64", shape=(1, 1))
-        y = unbroadcast(pt.exp(unbroadcast(x, 0)), 1)
-
-        assert (
-            sum(
-                isinstance(node.op, Unbroadcast)
-                for node in FunctionGraph([x], [y], copy_inputs=False).toposort()
-            )
-            == 2
-        )
-
-        f = function([x], y, mode=self.mode)
-        assert (
-            sum(isinstance(node.op, Unbroadcast) for node in f.maker.fgraph.toposort())
-            == 1
-        )
-
-        np.testing.assert_almost_equal(f([[1]]), np.exp([[1]]))
-
-
 class TestUselessElemwise:
     def setup_method(self):
-        self.mode = get_default_mode().including("canonicalize", "local_fill_to_alloc")
+        self.mode = get_default_mode().including(
+            "canonicalize", "local_second_to_alloc"
+        )
 
     def test_eq(self):
         x = dmatrix()
@@ -825,10 +790,11 @@ class TestConstantFolding:
 
         fg = FunctionGraph(outputs=[out], clone=False)
         # Default constant_folding will raise
-        with pytest.raises(NotImplementedError):
-            topo_constant_folding.apply(fg)
+        topo_constant_folding.apply(fg)
+        assert not isinstance(fg.outputs[0], Constant)
+        assert isinstance(fg.outputs[0].owner.op, OpNoPerform)
 
-        # Unconditional constant folding will be silent
+        # Default and Unconditional constant folding will be silent
         topo_unconditional_constant_folding.apply(fg)
         assert not isinstance(fg.outputs[0], Constant)
         assert isinstance(fg.outputs[0].owner.op, OpNoPerform)
@@ -1248,6 +1214,10 @@ class TestLocalOptAlloc:
         f(5)
 
 
+@pytest.mark.xfail(
+    condition=isinstance(get_default_mode().linker, NumbaLinker),
+    reason="Numba does not support float16",
+)
 class TestLocalOptAllocF16(TestLocalOptAlloc):
     dtype = "float16"
 
@@ -1282,76 +1252,111 @@ def test_local_join_1():
     assert len([n for n in e if isinstance(n.op, Join)]) == 0
     assert f.maker.fgraph.outputs[0].dtype == config.floatX
 
-    # test we don't apply when their is 2 inputs
-    s = join(1, a, a)
+    # Test that join with 2 different inputs remains (not optimized away)
+    s = join(1, a, a[:, ::-1])
     f = function([a], s, mode=rewrite_mode)
-    val = f([[1]])
-    assert np.all(val == [[1]])
+    val = f([[1, 2]])
+    assert np.all(val == [[1, 2, 2, 1]])  # joined along axis 1
     e = f.maker.fgraph.toposort()
-    assert len([n for n in e if isinstance(n.op, Join)]) == 1
+    assert len([n for n in e if isinstance(n.op, Join)]) == 1  # join remains
     assert f.maker.fgraph.outputs[0].dtype == config.floatX
+
+
+def test_local_join_to_tile():
+    """Join(axis, x, x, ...) is rewritten to tile(x, reps) with reps[axis] = k.
+
+    This optimization applies whenever we concatenate the *same* tensor multiple
+    times along a given axis. It replaces the Join/concatenate with a Tile op.
+    """
+
+    # ---- Case 1: joining same vector along axis 0 ----
+    x = vector("x")
+    s = join(0, x, x, x)  # (3n,)
+    f = function([x], s, mode=rewrite_mode)
+
+    test_val = np.array([1.0, 2.0], dtype=config.floatX)
+    result = f(test_val)
+    expected = np.array([1.0, 2.0, 1.0, 2.0, 1.0, 2.0], dtype=config.floatX)
+    assert np.allclose(result, expected)
+
+    # Join should be optimized away
+    ops = f.maker.fgraph.toposort()
+    assert not any(isinstance(n.op, Join) for n in ops)
+
+    # ---- Case 2: joining same matrix along axis 0 ----
+    a = matrix("a")
+    s = join(0, a, a)  # (2m, n)
+    f = function([a], s, mode=rewrite_mode)
+
+    test_mat = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=config.floatX)
+    result = f(test_mat)
+    expected = np.vstack([test_mat, test_mat])
+    assert np.allclose(result, expected)
+
+    ops = f.maker.fgraph.toposort()
+    assert not any(isinstance(n.op, Join) for n in ops)
+
+    # ---- Case 3: joining same matrix along axis 1 ----
+    s = join(1, a, a, a)  # (m, 3n)
+    f = function([a], s, mode=rewrite_mode)
+
+    result = f(test_mat)
+    expected = np.hstack([test_mat, test_mat, test_mat])
+    assert np.allclose(result, expected)
+
+    ops = f.maker.fgraph.toposort()
+    assert not any(isinstance(n.op, Join) for n in ops)
+
+    # ---- Case 4: different tensors -> should NOT optimize ----
+    y = vector("y")
+    s = join(0, x, y)  # inputs differ
+    f = function([x, y], s, mode=rewrite_mode)
+
+    test_vec1 = np.array([1.0, 2.0], dtype=config.floatX)
+    test_vec2 = np.array([3.0, 4.0], dtype=config.floatX)
+    result = f(test_vec1, test_vec2)
+    expected = np.array([1.0, 2.0, 3.0, 4.0], dtype=config.floatX)
+    assert np.allclose(result, expected)
+
+    # Join should still be present since inputs aren't identical
+    ops = f.maker.fgraph.toposort()
+    assert any(isinstance(n.op, Join) for n in ops)
 
 
 def test_local_join_empty():
-    # test for vector, vector, empty to vector
+    # Vector case - empty tensors should be removed
     empty_vec = np.asarray([], dtype=config.floatX)
-    a = vector("a")
-    s = pt.join(0, a, a, empty_vec)
-    f = function([a], s, mode=rewrite_mode)
-    val = f([1])
-    assert np.all(val == [1])
-    e = f.maker.fgraph.toposort()
-    assert len([n for n in e if isinstance(n.op, Join)]) == 1
-    assert all(
-        not isinstance(n.op, Join) or len(n.inputs) == 3
-        for n in e
-        if isinstance(n.op, Join)
-    )
-    assert f.maker.fgraph.outputs[0].dtype == config.floatX
+    vec = vector("vec")
+    s = pt.join(0, vec, vec[::-1], empty_vec)
+    new_s = rewrite_graph(s)
+    assert new_s.dtype == s.dtype
+    # Verify that empty tensors are removed from the join
+    expected = pt.join(0, vec, vec[::-1])
+    assert equal_computations([new_s], [expected])
 
-    # test for matrix join(1,a)
-    empty_mat = np.asarray([[]], dtype=config.floatX)
-    m = matrix("m")
-    s = join(1, empty_mat, m, m, m)
-    f = function([m], s, mode=rewrite_mode)
-    val = f([[1]])
-    assert np.all(val == [[1]])
-    e = f.maker.fgraph.toposort()
-    assert len([n for n in e if isinstance(n.op, Join)]) == 1
-    assert all(
-        not isinstance(n.op, Join) or len(n.inputs) == 4
-        for n in e
-        if isinstance(n.op, Join)
+    # Matrix case - empty tensors should be removed
+    empty_mat = np.zeros((2, 0), dtype=config.floatX)
+    empty_sym_mat = matrix("m", shape=(2, 0))
+    mat = matrix("mat", shape=(2, 10))
+    s = join(1, empty_mat, mat, empty_sym_mat, mat[:, ::-1])
+    new_s = rewrite_graph(s)
+    assert new_s.dtype == s.dtype
+    # Verify that empty tensors are removed from the join
+    expected = join(1, mat, mat[:, ::-1])
+    assert equal_computations([new_s], [expected])
+
+    # Join can be completely removed, but casting and specify_shape are propagated
+    int_mat = matrix("int_mat", dtype=int)
+    s = join(-1, empty_mat, int_mat, empty_sym_mat)
+    new_s = rewrite_graph(s)
+    assert equal_computations(
+        [new_s], [specify_shape(int_mat, (2, None)).astype(s.dtype)]
     )
-    assert f.maker.fgraph.outputs[0].dtype == config.floatX
-    # test for vector, vector, empty to matrix
-    # We can't rewrite this case.
-    s = pt.stack([a, a, empty_vec])
-    f = function([a], s, mode=rewrite_mode)
-    val = f([])
-    assert np.all(val == [1])
-    e = f.maker.fgraph.toposort()
-    assert len([n for n in e if isinstance(n.op, Join)]) == 1
-    assert all(
-        not isinstance(n.op, Join) or len(n.inputs) == 4
-        for n in e
-        if isinstance(n.op, Join)
-    )
-    assert f.maker.fgraph.outputs[0].dtype == config.floatX
-    # test for matrix join(0,a)
-    # We can't rewrite this case.
-    s = join(0, m, np.asarray([[2.0]], dtype=config.floatX), m)
-    f = function([m], s, mode=rewrite_mode)
-    val = f([[1]])
-    assert np.all(val == [[1], [2], [1]])
-    e = f.maker.fgraph.toposort()
-    assert len([n for n in e if isinstance(n.op, Join)]) == 1
-    assert all(
-        not isinstance(n.op, Join) or len(n.inputs) == 4
-        for n in e
-        if isinstance(n.op, Join)
-    )
-    assert f.maker.fgraph.outputs[0].dtype == config.floatX
+
+    # Stack introduces an expand_dims in the join, that's a nonzero dim!
+    s = pt.stack([vec, vec, empty_vec])
+    new_s = rewrite_graph(s)
+    assert equal_computations([new_s], [s])
 
 
 def test_local_join_make_vector():
@@ -1365,7 +1370,7 @@ def test_local_join_make_vector():
     e = f.maker.fgraph.toposort()
     assert len([n for n in e if isinstance(n.op, Join)]) == 1
     assert all(
-        not isinstance(n.op, Join) or len(n.inputs) == 4
+        not isinstance(n.op, Join) or len(n.inputs) == 3
         for n in e
         if isinstance(n.op, Join)
     )
@@ -1628,7 +1633,7 @@ def test_local_merge_alloc():
     output = pt.alloc(pt.alloc(m, y, 1, 1), x, y2, z, w)
     f = function([m, x, y, y2, z, w], output, mode=rewrite_mode)
     topo = f.maker.fgraph.toposort()
-    assert len(topo) == 3
+    assert len(topo) == 4
     assert isinstance(topo[-2].op, Assert)
     assert isinstance(topo[-1].op, Alloc)
     o = f(0.0, 1, 2, 2, 3, 4)
@@ -1685,7 +1690,7 @@ def test_local_useless_alloc():
     useless_alloc.rewrite(g)
 
     topo = g.toposort()
-    assert len(topo) == 3
+    assert len(topo) == 4
     assert isinstance(topo[-2].op, Assert)
     assert isinstance(topo[-1].op, Alloc)
 
@@ -1833,7 +1838,9 @@ class TestLocalElemwiseAlloc:
         z_opt = pytensor.function(
             [x, y],
             z,
-            mode=get_default_mode().including("local_elemwise_alloc"),
+            mode=get_default_mode().including(
+                "local_dimshuffle_alloc", "local_elemwise_alloc"
+            ),
             on_unused_input="ignore",
         )
 
@@ -1930,11 +1937,8 @@ class TestLocalElemwiseAlloc:
             self.alloc_w_dep_broad2 + self.mat,
             mode=self.fast_run_mode,
         )
-        # This graph requires one outer Alloc and an Assert
-        # To make sure `mat` is square since we end up doing
-        # broadcast_to(x, mat[..., None].shape) + mat[None, ...]
         self.verify_op_count(func, 1, Alloc)
-        self.verify_op_count(func, 1, Assert)
+        self.verify_op_count(func, 0, Assert)
 
     def test_remove_alloc_w_dimshuffle(self):
         func = function(
@@ -2036,7 +2040,7 @@ def test_shape_unsafe_tag():
         fn([0, 1], [2, 3, 4]), [0, 1]
 
 
-def test_topological_fill_sink_multi_output_client():
+def test_topological_second_sink_multi_output_client():
     x = float64("x")
     elem_op_with_2_outputs = Elemwise(Composite([x], [x + 1, x + 2]))
 
@@ -2046,13 +2050,13 @@ def test_topological_fill_sink_multi_output_client():
     out = pt.add(*elem_op_with_2_outputs(pt.exp(bcast_x)))
 
     fg = FunctionGraph([x, z], [out], copy_inputs=False)
-    topological_fill_sink.rewrite(fg)
+    topological_second_sink.rewrite(fg)
     [new_out] = fg.outputs
     expected_out = pt.full_like(z, pt.add(*elem_op_with_2_outputs(pt.exp(x))))
     assert equal_computations([new_out], [expected_out])
 
 
-def test_topological_fill_sink_broadcastable_change():
+def test_topological_second_sink_broadcastable_change():
     """Test rewrite doesn't fail after a graph replacement that provides a broadcastable change."""
     a = vector("a", shape=(1,))
     b = vector("b", shape=(1,))
@@ -2063,6 +2067,33 @@ def test_topological_fill_sink_broadcastable_change():
     out = graph_replace(initial_out, {zeros: pt.zeros((1,))}, strict=False)
 
     fg = FunctionGraph([a, b], [out], copy_inputs=False)
-    topological_fill_sink.rewrite(fg)
+    topological_second_sink.rewrite(fg)
     [new_out] = fg.outputs
     assert equal_computations([new_out], [a + b])
+
+
+class TestExtractDiagOfTranspose:
+    """Coverage for ``extract_diag_of_transpose`` in ``rewriting/basic.py``."""
+
+    rewrite_kw = dict(include=("canonicalize", "stabilize", "specialize"))
+
+    def test_extract_diag_of_transpose(self):
+        x = pt.matrix("x", shape=(4, 6))
+        out = pt.diagonal(x.T)
+        rewritten = rewrite_graph(out, **self.rewrite_kw)
+        expected = pt.diagonal(x)
+        assert_equal_computations([rewritten], [expected])
+
+    def test_extract_diag_of_transpose_offset(self):
+        x = pt.matrix("x", shape=(4, 6))
+        out = pt.diagonal(x.T, offset=2)
+        rewritten = rewrite_graph(out, **self.rewrite_kw)
+        expected = pt.diagonal(x, offset=-2)
+        assert_equal_computations([rewritten], [expected])
+
+    def test_extract_diag_of_batched_transpose(self):
+        x = pt.tensor("x", shape=(3, 4, 5))
+        out = pt.diagonal(x.mT, axis1=-2, axis2=-1)
+        rewritten = rewrite_graph(out, **self.rewrite_kw)
+        expected = pt.diagonal(x, axis1=-2, axis2=-1)
+        assert_equal_computations([rewritten], [expected])

@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import pytest
 
@@ -5,88 +7,96 @@ from pytensor.compile import get_mode
 
 
 jax = pytest.importorskip("jax")
-from jax import errors
+from jax.errors import ConcretizationTypeError
 
 import pytensor
 import pytensor.tensor.basic as ptb
+from pytensor.compile.mode import Mode
 from pytensor.configdefaults import config
-from pytensor.graph.fg import FunctionGraph
-from pytensor.graph.op import get_test_value
-from pytensor.tensor.type import iscalar, matrix, scalar, vector
+from pytensor.link.jax.linker import JAXLinker
+from pytensor.tensor.type import matrix, scalar, vector
 from tests.link.jax.test_basic import compare_jax_and_py
-from tests.tensor.test_basic import TestAlloc
+from tests.tensor.test_basic import check_alloc_runtime_broadcast
 
 
 def test_jax_Alloc():
     x = ptb.alloc(0.0, 2, 3)
-    x_fg = FunctionGraph([], [x])
 
-    _, [jax_res] = compare_jax_and_py(x_fg, [])
+    _, [jax_res] = compare_jax_and_py([], [x], [])
 
     assert jax_res.shape == (2, 3)
 
     x = ptb.alloc(1.1, 2, 3)
-    x_fg = FunctionGraph([], [x])
 
-    compare_jax_and_py(x_fg, [])
+    compare_jax_and_py([], [x], [])
 
     x = ptb.AllocEmpty("float32")(2, 3)
-    x_fg = FunctionGraph([], [x])
 
     def compare_shape_dtype(x, y):
-        (x,) = x
-        (y,) = y
-        return x.shape == y.shape and x.dtype == y.dtype
+        assert x.shape == y.shape and x.dtype == y.dtype
 
-    compare_jax_and_py(x_fg, [], assert_fn=compare_shape_dtype)
+    compare_jax_and_py([], [x], [], assert_fn=compare_shape_dtype)
 
     a = scalar("a")
     x = ptb.alloc(a, 20)
-    x_fg = FunctionGraph([a], [x])
 
-    compare_jax_and_py(x_fg, [10.0])
+    compare_jax_and_py([a], [x], [10.0])
 
     a = vector("a")
     x = ptb.alloc(a, 20, 10)
-    x_fg = FunctionGraph([a], [x])
 
-    compare_jax_and_py(x_fg, [np.ones(10, dtype=config.floatX)])
+    compare_jax_and_py([a], [x], [np.ones(10, dtype=config.floatX)])
 
 
 def test_alloc_runtime_broadcast():
-    TestAlloc.check_runtime_broadcast(get_mode("JAX"))
+    check_alloc_runtime_broadcast(get_mode("JAX"))
 
 
 def test_jax_MakeVector():
     x = ptb.make_vector(1, 2, 3)
-    x_fg = FunctionGraph([], [x])
 
-    compare_jax_and_py(x_fg, [])
+    compare_jax_and_py([], [x], [])
 
 
 def test_arange():
     out = ptb.arange(1, 10, 2)
-    fgraph = FunctionGraph([], [out])
-    compare_jax_and_py(fgraph, [])
+
+    compare_jax_and_py([], [out], [])
 
 
 def test_arange_of_shape():
     x = vector("x")
     out = ptb.arange(1, x.shape[-1], 2)
-    fgraph = FunctionGraph([x], [out])
-    compare_jax_and_py(fgraph, [np.zeros((5,))], jax_mode="JAX")
+    compare_jax_and_py([x], [out], [np.zeros((5,))], jax_mode="JAX")
+
+
+def test_arange_of_shape_minimum_compile():
+    # The shape read stays `Subtensor(Shape(x))`, instead of `Shape_i(x)`
+    x = vector("x")
+    out = ptb.arange(1, x.shape[-1], 2)
+    minimum_jax_mode = Mode(linker=JAXLinker(), optimizer=None)
+    compare_jax_and_py([x], [out], [np.zeros((5,))], jax_mode=minimum_jax_mode)
 
 
 def test_arange_nonconcrete():
     """JAX cannot JIT-compile `jax.numpy.arange` when arguments are not concrete values."""
 
     a = scalar("a")
-    a.tag.test_value = 10
+    a_test_value = 10
     out = ptb.arange(a)
 
     with pytest.raises(NotImplementedError):
-        fgraph = FunctionGraph([a], [out])
-        compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])
+        compare_jax_and_py([a], [out], [a_test_value])
+
+
+def test_arange_shape_bound_over_int8():
+    """A shape-derived arange bound above 127 must not be downcast to int8.
+
+    Regression test for https://github.com/pymc-devs/pytensor/issues/2296
+    """
+    x = vector("x")
+    out = ptb.arange(x.shape[-1])
+    compare_jax_and_py([x], [out], [np.zeros(200)], jax_mode="JAX")
 
 
 def test_jax_Join():
@@ -94,16 +104,17 @@ def test_jax_Join():
     b = matrix("b")
 
     x = ptb.join(0, a, b)
-    x_fg = FunctionGraph([a, b], [x])
     compare_jax_and_py(
-        x_fg,
+        [a, b],
+        [x],
         [
             np.c_[[1.0, 2.0, 3.0]].astype(config.floatX),
             np.c_[[4.0, 5.0, 6.0]].astype(config.floatX),
         ],
     )
     compare_jax_and_py(
-        x_fg,
+        [a, b],
+        [x],
         [
             np.c_[[1.0, 2.0, 3.0]].astype(config.floatX),
             np.c_[[4.0, 5.0]].astype(config.floatX),
@@ -111,16 +122,17 @@ def test_jax_Join():
     )
 
     x = ptb.join(1, a, b)
-    x_fg = FunctionGraph([a, b], [x])
     compare_jax_and_py(
-        x_fg,
+        [a, b],
+        [x],
         [
             np.c_[[1.0, 2.0, 3.0]].astype(config.floatX),
             np.c_[[4.0, 5.0, 6.0]].astype(config.floatX),
         ],
     )
     compare_jax_and_py(
-        x_fg,
+        [a, b],
+        [x],
         [
             np.c_[[1.0, 2.0], [3.0, 4.0]].astype(config.floatX),
             np.c_[[5.0, 6.0]].astype(config.floatX),
@@ -132,9 +144,9 @@ class TestJaxSplit:
     def test_basic(self):
         a = matrix("a")
         a_splits = ptb.split(a, splits_size=[1, 2, 3], n_splits=3, axis=0)
-        fg = FunctionGraph([a], a_splits)
         compare_jax_and_py(
-            fg,
+            [a],
+            a_splits,
             [
                 np.zeros((6, 4)).astype(config.floatX),
             ],
@@ -142,9 +154,9 @@ class TestJaxSplit:
 
         a = matrix("a", shape=(6, None))
         a_splits = ptb.split(a, splits_size=[2, a.shape[0] - 2], n_splits=2, axis=0)
-        fg = FunctionGraph([a], a_splits)
         compare_jax_and_py(
-            fg,
+            [a],
+            a_splits,
             [
                 np.zeros((6, 4)).astype(config.floatX),
             ],
@@ -160,12 +172,14 @@ class TestJaxSplit:
         ):
             fn(np.zeros((6, 4), dtype=pytensor.config.floatX))
 
-        a_splits = ptb.split(a, splits_size=[2, 4], n_splits=3, axis=0)
-        fn = pytensor.function([a], a_splits, mode="JAX")
+        # This check is triggered at compile time if splits_size has incompatible static length
+        splits_size = vector("splits_size", shape=(None,), dtype=int)
+        a_splits = ptb.split(a, splits_size=splits_size, n_splits=3, axis=0)
+        fn = pytensor.function([a, splits_size], a_splits, mode="JAX")
         with pytest.raises(
             ValueError, match="Length of splits is not equal to n_splits"
         ):
-            fn(np.zeros((6, 4), dtype=pytensor.config.floatX))
+            fn(np.zeros((6, 4), dtype=pytensor.config.floatX), [2, 2])
 
         a_splits = ptb.split(a, splits_size=[2, 4], n_splits=2, axis=0)
         fn = pytensor.function([a], a_splits, mode="JAX")
@@ -190,38 +204,23 @@ class TestJaxSplit:
             UserWarning, match="Split node does not have constant split positions."
         ):
             fn = pytensor.function([a], a_splits, mode="JAX")
-        # It raises an informative ConcretizationTypeError, but there's an AttributeError that surpasses it
-        with pytest.raises(AttributeError):
+        with pytest.raises(ConcretizationTypeError):
             fn(np.zeros((6, 4), dtype=pytensor.config.floatX))
-
-        split_axis = iscalar("split_axis")
-        a_splits = ptb.split(a, splits_size=[2, 4], n_splits=2, axis=split_axis)
-        with pytest.warns(UserWarning, match="Split node does not have constant axis."):
-            fn = pytensor.function([a, split_axis], a_splits, mode="JAX")
-        # Same as above, an AttributeError surpasses the `TracerIntegerConversionError`
-        # Both errors are included for backwards compatibility
-        with pytest.raises((AttributeError, errors.TracerIntegerConversionError)):
-            fn(np.zeros((6, 6), dtype=pytensor.config.floatX), 0)
 
 
 def test_jax_eye():
     """Tests jaxification of the Eye operator"""
     out = ptb.eye(3)
-    out_fg = FunctionGraph([], [out])
 
-    compare_jax_and_py(out_fg, [])
+    compare_jax_and_py([], [out], [])
 
 
 def test_tri():
     out = ptb.tri(10, 10, 0)
-    fgraph = FunctionGraph([], [out])
-    compare_jax_and_py(fgraph, [])
+
+    compare_jax_and_py([], [out], [])
 
 
-@pytest.mark.skipif(
-    jax.__version__ == "0.4.31",
-    reason="https://github.com/google/jax/issues/22751",
-)
 def test_tri_nonconcrete():
     """JAX cannot JIT-compile `jax.numpy.tri` when arguments are not concrete values."""
 
@@ -230,14 +229,16 @@ def test_tri_nonconcrete():
         scalar("n", dtype="int64"),
         scalar("k", dtype="int64"),
     )
-    m.tag.test_value = 10
-    n.tag.test_value = 10
-    k.tag.test_value = 0
+    m_test_value = 10
+    n_test_value = 10
+    k_test_value = 0
 
     out = ptb.tri(m, n, k)
 
-    # The actual error the user will see should be jax.errors.ConcretizationTypeError, but
-    # the error handler raises an Attribute error first, so that's what this test needs to pass
-    with pytest.raises(AttributeError):
-        fgraph = FunctionGraph([m, n, k], [out])
-        compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])
+    with pytest.raises(
+        NotImplementedError,
+        match=re.escape(
+            "JAX requires the arguments of `jax.numpy.arange` to be constants"
+        ),
+    ):
+        compare_jax_and_py([m, n, k], [out], [m_test_value, n_test_value, k_test_value])

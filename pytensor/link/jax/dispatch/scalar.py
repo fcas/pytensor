@@ -29,10 +29,10 @@ from pytensor.scalar.math import (
     Erfinv,
     GammaIncCInv,
     GammaIncInv,
-    Iv,
     Ive,
     Kve,
     Log1mexp,
+    NdtriExp,
     Psi,
     TriGamma,
 )
@@ -44,7 +44,7 @@ def try_import_tfp_jax_op(op: ScalarOp, jax_op_name: str | None = None) -> Calla
     except ModuleNotFoundError:
         raise NotImplementedError(
             f"No JAX implementation for Op {op.name}. "
-            "Implementation is available if TensorFlow Probability is installed"
+            "Implementation is available if tfp-nightly is installed"
         )
 
     if jax_op_name is None:
@@ -101,19 +101,13 @@ def jax_funcify_ScalarOp(op, node, **kwargs):
         jax_func = getattr(jnp, func_name)
 
     if len(node.inputs) > op.nfunc_spec[1]:
-        # Some Scalar Ops accept multiple number of inputs, behaving as a variadic function,
-        # even though the base Op from `func_name` is specified as a binary Op.
-        # This happens with `Add`, which can work as a `Sum` for multiple scalars.
-        jax_variadic_func = getattr(jnp, op.nfunc_variadic, None)
-        if not jax_variadic_func:
-            raise NotImplementedError(
-                f"Dispatch not implemented for Scalar Op {op} with {len(node.inputs)} inputs"
-            )
+        # Some Scalar Ops (e.g. Add/Mul) accept more inputs than the binary base Op,
+        # behaving as variadic. Fold the binary op, which broadcasts and preserves
+        # dtype; stacking + jnp.sum/prod would upcast bool/int.
+        binary_jax_func = jax_func
 
         def jax_func(*args):
-            return jax_variadic_func(
-                jnp.stack(jnp.broadcast_arrays(*args), axis=0), axis=0
-            )
+            return functools.reduce(binary_jax_func, args)
 
     return jax_func
 
@@ -269,22 +263,37 @@ def jax_funcify_Erfinv(op, **kwargs):
 
 
 @jax_funcify.register(BetaIncInv)
-@jax_funcify.register(Erfcx)
-@jax_funcify.register(Erfcinv)
 def jax_funcify_from_tfp(op, **kwargs):
     tfp_jax_op = try_import_tfp_jax_op(op)
 
     return tfp_jax_op
 
 
-@jax_funcify.register(Iv)
-def jax_funcify_Iv(op, **kwargs):
-    ive = try_import_tfp_jax_op(op, jax_op_name="bessel_ive")
+@jax_funcify.register(Erfcx)
+def jax_funcify_Erfcx(op, **kwargs):
+    if hasattr(jax.scipy.special, "erfcx"):
+        return jax.scipy.special.erfcx
+    # jax < 0.11 has no native erfcx
+    return try_import_tfp_jax_op(op)
 
-    def iv(v, x):
-        return ive(v, x) / jnp.exp(-jnp.abs(jnp.real(x)))
 
-    return iv
+@jax_funcify.register(Erfcinv)
+def jax_funcify_Erfcinv(op, **kwargs):
+    def erfcinv(x):
+        # erfc(z) = 2 ndtr(-z * sqrt(2)), so z = -ndtri(x / 2) / sqrt(2)
+        return -jax.scipy.special.ndtri(x / 2) / jnp.sqrt(2)
+
+    return erfcinv
+
+
+@jax_funcify.register(NdtriExp)
+def jax_funcify_NdtriExp(op, **kwargs):
+    def ndtri_exp(x):
+        # JAX has no ndtri_exp, so this composition loses accuracy where
+        # exp(x) underflows
+        return jax.scipy.special.ndtri(jnp.exp(x))
+
+    return ndtri_exp
 
 
 @jax_funcify.register(Ive)

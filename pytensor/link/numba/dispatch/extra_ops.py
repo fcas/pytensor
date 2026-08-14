@@ -1,14 +1,19 @@
 import warnings
+from hashlib import sha256
 from typing import cast
 
 import numba
 import numpy as np
 
-from pytensor import config
 from pytensor.graph import Apply
 from pytensor.link.numba.dispatch import basic as numba_basic
-from pytensor.link.numba.dispatch.basic import get_numba_type, numba_funcify
-from pytensor.raise_op import CheckAndRaise
+from pytensor.link.numba.dispatch.basic import (
+    generate_fallback_impl,
+    get_numba_type,
+    register_funcify_and_cache_key,
+    register_funcify_default_op_cache_key,
+)
+from pytensor.npy_2_compat import old_np_unique
 from pytensor.tensor import TensorVariable
 from pytensor.tensor.extra_ops import (
     Bartlett,
@@ -23,40 +28,34 @@ from pytensor.tensor.extra_ops import (
 )
 
 
-@numba_funcify.register(Bartlett)
+@register_funcify_default_op_cache_key(Bartlett)
 def numba_funcify_Bartlett(op, **kwargs):
-    @numba_basic.numba_njit(inline="always")
+    @numba_basic.numba_njit
     def bartlett(x):
-        return np.bartlett(numba_basic.to_scalar(x))
+        return np.bartlett(x.item())
 
     return bartlett
 
 
-@numba_funcify.register(CumOp)
+@register_funcify_default_op_cache_key(CumOp)
 def numba_funcify_CumOp(op: CumOp, node: Apply, **kwargs):
     axis = op.axis
     mode = op.mode
     ndim = cast(TensorVariable, node.outputs[0]).ndim
 
-    if axis is not None:
-        if axis < 0:
-            axis = ndim + axis
-        if axis < 0 or axis >= ndim:
-            raise ValueError(f"Invalid axis {axis} for array with ndim {ndim}")
-
-        reaxis_first = (axis, *(i for i in range(ndim) if i != axis))
-        reaxis_first_inv = tuple(np.argsort(reaxis_first))
+    reaxis_first = (axis, *(i for i in range(ndim) if i != axis))
+    reaxis_first_inv = tuple(np.argsort(reaxis_first))
 
     if mode == "add":
-        if axis is None or ndim == 1:
+        if ndim == 1:
 
-            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit
             def cumop(x):
                 return np.cumsum(x)
 
         else:
 
-            @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit(boundscheck=False)
             def cumop(x):
                 out_dtype = x.dtype
                 if x.shape[axis] < 2:
@@ -72,15 +71,15 @@ def numba_funcify_CumOp(op: CumOp, node: Apply, **kwargs):
                 return res.transpose(reaxis_first_inv)
 
     else:
-        if axis is None or ndim == 1:
+        if ndim == 1:
 
-            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit
             def cumop(x):
                 return np.cumprod(x)
 
         else:
 
-            @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit(boundscheck=False)
             def cumop(x):
                 out_dtype = x.dtype
                 if x.shape[axis] < 2:
@@ -93,32 +92,35 @@ def numba_funcify_CumOp(op: CumOp, node: Apply, **kwargs):
                 for m in range(1, x.shape[axis]):
                     res[m] = res[m - 1] * x_axis_first[m]
 
-                return res.transpose(reaxis_first)
+                return res.transpose(reaxis_first_inv)
 
     return cumop
 
 
-@numba_funcify.register(FillDiagonal)
+@register_funcify_default_op_cache_key(FillDiagonal)
 def numba_funcify_FillDiagonal(op, **kwargs):
     @numba_basic.numba_njit
     def filldiagonal(a, val):
+        a = a.copy()
         np.fill_diagonal(a, val)
         return a
 
-    return filldiagonal
+    cache_version = 1
+    return filldiagonal, cache_version
 
 
-@numba_funcify.register(FillDiagonalOffset)
+@register_funcify_default_op_cache_key(FillDiagonalOffset)
 def numba_funcify_FillDiagonalOffset(op, node, **kwargs):
     @numba_basic.numba_njit
     def filldiagonaloffset(a, val, offset):
+        a = a.copy()
         height, width = a.shape
-
+        offset_item = offset.item()
         if offset >= 0:
-            start = numba_basic.to_scalar(offset)
+            start = offset_item
             num_of_step = min(min(width, height), width - offset)
         else:
-            start = -numba_basic.to_scalar(offset) * a.shape[1]
+            start = -offset_item * a.shape[1]
             num_of_step = min(min(width, height), height + offset)
 
         step = a.shape[1] + 1
@@ -130,119 +132,82 @@ def numba_funcify_FillDiagonalOffset(op, node, **kwargs):
         # return a
         return b.reshape(a.shape)
 
-    return filldiagonaloffset
+    cache_version = 1
+    return filldiagonaloffset, cache_version
 
 
-@numba_funcify.register(RavelMultiIndex)
+@register_funcify_default_op_cache_key(RavelMultiIndex)
 def numba_funcify_RavelMultiIndex(op, node, **kwargs):
     mode = op.mode
     order = op.order
+    vec_indices = node.inputs[0].type.ndim > 0
 
-    if order != "C":
-        raise NotImplementedError(
-            "Numba does not implement `order` in `numpy.ravel_multi_index`"
-        )
+    @numba_basic.numba_njit
+    def ravelmultiindex(*inp):
+        shape = inp[-1]
+        # Concatenate indices along last axis
+        stacked_indices = np.stack(inp[:-1], axis=-1)
 
-    if mode == "raise":
+        # Manage invalid indices
+        for i, dim_limit in enumerate(shape):
+            if mode == "wrap":
+                stacked_indices[..., i] %= dim_limit
+            elif mode == "clip":
+                dim_indices = stacked_indices[..., i]
+                # Cannot call np.clip on scalars
+                if vec_indices:
+                    stacked_indices[..., i] = np.clip(dim_indices, 0, dim_limit - 1)
+                else:
+                    stacked_indices[..., i] = max(0, min(dim_indices, dim_limit - 1))
+            else:  # raise
+                dim_indices = stacked_indices[..., i]
+                invalid_indices = (dim_indices < 0) | (dim_indices >= shape[i])
+                # Cannot call np.any on a boolean
+                if vec_indices:
+                    invalid_indices = invalid_indices.any()
+                if invalid_indices:
+                    raise ValueError("invalid entry in coordinates array")
 
-        @numba_basic.numba_njit
-        def mode_fn(*args):
-            raise ValueError("invalid entry in coordinates array")
+        # Calculate Strides based on Order
+        a = np.ones(len(shape), dtype=np.int64)
+        if order == "C":
+            # C-Order: Last dimension moves fastest (Strides: large -> small -> 1)
+            # For shape (3, 4, 5): Multipliers are (20, 5, 1)
+            if len(shape) > 1:
+                a[:-1] = np.cumprod(shape[:0:-1])[::-1]
+        else:  # order == "F"
+            # F-Order: First dimension moves fastest (Strides: 1 -> small -> large)
+            # For shape (3, 4, 5): Multipliers are (1, 3, 12)
+            if len(shape) > 1:
+                a[1:] = np.cumprod(shape[:-1])
 
-    elif mode == "wrap":
+        # Dot product indices with strides
+        # (allow arbitrary left operand ndim and int dtype, which numba matmul doesn't support)
+        return np.asarray((stacked_indices * a).sum(-1))
 
-        @numba_basic.numba_njit(inline="always")
-        def mode_fn(new_arr, i, j, v, d):
-            new_arr[i, j] = v % d
-
-    elif mode == "clip":
-
-        @numba_basic.numba_njit(inline="always")
-        def mode_fn(new_arr, i, j, v, d):
-            new_arr[i, j] = min(max(v, 0), d - 1)
-
-    if node.inputs[0].ndim == 0:
-
-        @numba_basic.numba_njit
-        def ravelmultiindex(*inp):
-            shape = inp[-1]
-            arr = np.stack(inp[:-1])
-
-            new_arr = arr.T.astype(np.float64).copy()
-            for i, b in enumerate(new_arr):
-                if b < 0 or b >= shape[i]:
-                    mode_fn(new_arr, i, 0, b, shape[i])
-
-            a = np.ones(len(shape), dtype=np.float64)
-            a[: len(shape) - 1] = np.cumprod(shape[-1:0:-1])[::-1]
-            return np.array(a.dot(new_arr.T), dtype=np.int64)
-
-    else:
-
-        @numba_basic.numba_njit
-        def ravelmultiindex(*inp):
-            shape = inp[-1]
-            arr = np.stack(inp[:-1])
-
-            new_arr = arr.T.astype(np.float64).copy()
-            for i, b in enumerate(new_arr):
-                # no strict argument to this zip because numba doesn't support it
-                for j, (d, v) in enumerate(zip(shape, b)):  # noqa: B905
-                    if v < 0 or v >= d:
-                        mode_fn(new_arr, i, j, v, d)
-
-            a = np.ones(len(shape), dtype=np.float64)
-            a[: len(shape) - 1] = np.cumprod(shape[-1:0:-1])[::-1]
-            return a.dot(new_arr.T).astype(np.int64)
-
-    return ravelmultiindex
+    cache_version = 1
+    return ravelmultiindex, cache_version
 
 
-@numba_funcify.register(Repeat)
+@register_funcify_default_op_cache_key(Repeat)
 def numba_funcify_Repeat(op, node, **kwargs):
     axis = op.axis
+    a, _ = node.inputs
 
-    use_python = False
-
-    if axis is not None:
-        use_python = True
-
-    if use_python:
-        warnings.warn(
-            (
-                "Numba will use object mode to allow the "
-                "`axis` argument to `numpy.repeat`."
-            ),
-            UserWarning,
-        )
-
-        ret_sig = get_numba_type(node.outputs[0].type)
+    # Numba only supports axis=None, which in our case is when axis is 0 and the input is a vector
+    if axis == 0 and a.type.ndim == 1:
 
         @numba_basic.numba_njit
         def repeatop(x, repeats):
-            with numba.objmode(ret=ret_sig):
-                ret = np.repeat(x, repeats, axis)
-            return ret
+            return np.repeat(x, repeats)
+
+        return repeatop
 
     else:
-        repeats_ndim = node.inputs[1].ndim
-
-        if repeats_ndim == 0:
-
-            @numba_basic.numba_njit(inline="always")
-            def repeatop(x, repeats):
-                return np.repeat(x, repeats.item())
-
-        else:
-
-            @numba_basic.numba_njit(inline="always")
-            def repeatop(x, repeats):
-                return np.repeat(x, repeats)
-
-    return repeatop
+        return generate_fallback_impl(op, node)
 
 
-@numba_funcify.register(Unique)
+@register_funcify_default_op_cache_key(Unique)
 def numba_funcify_Unique(op, node, **kwargs):
     axis = op.axis
 
@@ -260,7 +225,7 @@ def numba_funcify_Unique(op, node, **kwargs):
 
     if not use_python:
 
-        @numba_basic.numba_njit(inline="always")
+        @numba_basic.numba_njit
         def unique(x):
             return np.unique(x)
 
@@ -281,48 +246,78 @@ def numba_funcify_Unique(op, node, **kwargs):
         @numba_basic.numba_njit
         def unique(x):
             with numba.objmode(ret=ret_sig):
-                ret = np.unique(x, return_index, return_inverse, return_counts, axis)
+                ret = old_np_unique(
+                    x,
+                    return_index=return_index,
+                    return_inverse=return_inverse,
+                    return_counts=return_counts,
+                    axis=axis,
+                )
             return ret
 
-    return unique
+    cache_version = 1
+    return unique, cache_version
 
 
-@numba_funcify.register(UnravelIndex)
+@register_funcify_and_cache_key(UnravelIndex)
 def numba_funcify_UnravelIndex(op, node, **kwargs):
-    order = op.order
+    out_ndim = node.outputs[0].type.ndim
 
-    if order != "C":
-        raise NotImplementedError(
-            "Numba does not support the `order` argument in `numpy.unravel_index`"
-        )
+    if out_ndim == 0:
+        # Creating a tuple of 0d arrays in numba is basically impossible without codegen, so just go to obj_mode
+        return generate_fallback_impl(op, node=node), None
+
+    c_order = op.order == "C"
+    inp_ndim = node.inputs[0].type.ndim
+    transpose_axes = (inp_ndim, *range(inp_ndim))
+
+    @numba_basic.numba_njit
+    def unravelindex(indices, shape):
+        a = np.ones(len(shape), dtype=np.int64)
+        if c_order:
+            # C-Order: Reverse shape (ignore dim0), cumulative product, then reverse back
+            # Strides: [dim1*dim2, dim2, 1]
+            a[1:] = shape[:0:-1]
+            a = np.cumprod(a)[::-1]
+        else:
+            # F-Order: Standard shape, cumulative product
+            # Strides: [1, dim0, dim0*dim1]
+            a[1:] = shape[:-1]
+            a = np.cumprod(a)
+
+        # Broadcast with a and shape on the last axis
+        unraveled_coords = (indices[..., None] // a) % shape
+
+        # Then transpose it to the front
+        # Numba doesn't have moveaxis (why would it), so we use transpose
+        # res = np.moveaxis(res, -1, 0)
+        unraveled_coords = unraveled_coords.transpose(transpose_axes)
+
+        # This should be a tuple, but the array can be unpacked
+        # into multiple variables with the same effect by the outer function
+        # (special case for single entry is handled with an outer function below)
+        return unraveled_coords
+
+    cache_version = 1
+    cache_key = sha256(
+        str((type(op), op.order, len(node.outputs), cache_version)).encode()
+    ).hexdigest()
 
     if len(node.outputs) == 1:
 
-        @numba_basic.numba_njit(inline="always")
-        def maybe_expand_dim(arr):
-            return arr
+        @numba_basic.numba_njit
+        def unravel_index_single_item(arr, shape):
+            # Unpack single entry
+            (res,) = unravelindex(arr, shape)
+            return res
+
+        return unravel_index_single_item, cache_key
 
     else:
-
-        @numba_basic.numba_njit(inline="always")
-        def maybe_expand_dim(arr):
-            return np.expand_dims(arr, 1)
-
-    @numba_basic.numba_njit
-    def unravelindex(arr, shape):
-        a = np.ones(len(shape), dtype=np.int64)
-        a[1:] = shape[:0:-1]
-        a = np.cumprod(a)[::-1]
-
-        # PyTensor actually returns a `tuple` of these values, instead of an
-        # `ndarray`; however, this `ndarray` result should be able to be
-        # unpacked into a `tuple`, so this discrepancy shouldn't really matter
-        return ((maybe_expand_dim(arr) // a) % shape).T
-
-    return unravelindex
+        return unravelindex, cache_key
 
 
-@numba_funcify.register(SearchsortedOp)
+@register_funcify_default_op_cache_key(SearchsortedOp)
 def numba_funcify_Searchsorted(op, node, **kwargs):
     side = op.side
 
@@ -349,23 +344,8 @@ def numba_funcify_Searchsorted(op, node, **kwargs):
 
     else:
 
-        @numba_basic.numba_njit(inline="always")
+        @numba_basic.numba_njit
         def searchsorted(a, v):
             return np.searchsorted(a, v, side)
 
     return searchsorted
-
-
-@numba_funcify.register(CheckAndRaise)
-def numba_funcify_CheckAndRaise(op, node, **kwargs):
-    error = op.exc_type
-    msg = op.msg
-
-    @numba_basic.numba_njit
-    def check_and_raise(x, *conditions):
-        for cond in conditions:
-            if not cond:
-                raise error(msg)
-        return x
-
-    return check_and_raise

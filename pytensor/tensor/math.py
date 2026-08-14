@@ -5,10 +5,11 @@ from textwrap import dedent
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from numpy.core.numeric import normalize_axis_tuple
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from pytensor import config, printing
 from pytensor import scalar as ps
+from pytensor.gradient import DisconnectedType, disconnected_type
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import Op
 from pytensor.graph.replace import _vectorize_node
@@ -20,33 +21,34 @@ from pytensor.scalar.basic import BinaryScalarOp
 from pytensor.tensor import TensorLike
 from pytensor.tensor.basic import (
     alloc,
-    arange,
     as_tensor_variable,
     cast,
     concatenate,
     constant,
     expand_dims,
+    ones_like,
     stack,
     switch,
 )
-from pytensor.tensor.blockwise import Blockwise, vectorize_node_fallback
+from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.elemwise import (
     CAReduce,
     Elemwise,
     get_normalized_batch_axes,
     scalar_elemwise,
 )
-from pytensor.tensor.shape import shape, specify_broadcastable
+from pytensor.tensor.shape import shape, specify_shape
 from pytensor.tensor.type import (
     DenseTensorType,
     complex_dtypes,
     continuous_dtypes,
     discrete_dtypes,
+    float_dtypes,
     int_dtypes,
     tensor,
     uint_dtypes,
 )
-from pytensor.tensor.utils import as_list, normalize_reduce_axis
+from pytensor.tensor.utils import normalize_reduce_axis
 from pytensor.tensor.variable import (
     TensorVariable,
     _tensor_py_operators,
@@ -160,7 +162,7 @@ class Argmax(COp):
             c_axis = np.int64(self.axis[0])
         else:
             # The value here doesn't matter, it won't be used
-            c_axis = np.int64(-1)
+            c_axis = 0
         return self.params_type.get_params(c_axis=c_axis)
 
     def make_node(self, x):
@@ -209,7 +211,7 @@ class Argmax(COp):
         fail = sub["fail"]
         params = sub["params"]
         if self.axis is None:
-            axis_code = "axis = NPY_MAXDIMS;"
+            axis_code = "axis = NPY_RAVEL_AXIS;"
         else:
             if len(self.axis) != 1:
                 raise NotImplementedError()
@@ -249,9 +251,9 @@ class Argmax(COp):
         """
 
     def c_code_cache_version(self):
-        return (2,)
+        return (3,)
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         (ishape,) = shapes
         if self.axis is None:
             return [()]
@@ -262,11 +264,11 @@ class Argmax(COp):
         )
         return [rval]
 
-    def R_op(self, inputs, eval_points):
+    def pushforward(self, inputs, outputs, eval_points):
         raise ValueError("Argmax is non-diifferentiable")
 
-    def grad(self, inp, grads):
-        (x,) = inp
+    def pullback(self, inputs, outputs, output_grads):
+        (x,) = inputs
 
         return [x.zeros_like()]
 
@@ -356,7 +358,10 @@ def max_and_argmax(a, axis=None, keepdims=False):
 
 class FixedOpCAReduce(CAReduce):
     def __str__(self):
-        return f"{type(self).__name__}{{{self._axis_str()}}}"
+        if self.dtype != self.acc_dtype:
+            return f"{type(self).__name__}{{{self._axis_str()}, acc={self.acc_dtype}}}"
+        else:
+            return f"{type(self).__name__}{{{self._axis_str()}}}"
 
 
 class NonZeroDimsCAReduce(FixedOpCAReduce):
@@ -394,33 +399,39 @@ class NonZeroDimsCAReduce(FixedOpCAReduce):
         return setup, alloc, loop, cast
 
 
-class Max(NonZeroDimsCAReduce):
-    nfunc_spec = ("max", 1, 1)
+class MaxAndMinCAReduce(NonZeroDimsCAReduce):
+    """Base class for the :class:`Max` and :class:`Min` reduction ``Op``\\s.
 
-    def __init__(self, axis):
-        super().__init__(ps.scalar_maximum, axis)
+    A maximum and a minimum reduction differ only in *which* element along the
+    reduced axes is selected; *how* derivatives propagate through that
+    selection is identical. In both cases the (weak) derivative routes through
+    the position(s) of the input that attain the reduced output. Keeping the
+    differentiation rules in a single place therefore avoids duplication and
+    guarantees that :class:`Max` and :class:`Min` stay consistent.
+
+    Subclasses only need to bind the appropriate scalar ``Op`` (``maximum`` or
+    ``minimum``) in their ``__init__`` and set ``nfunc_spec``.
+    """
 
     def clone(self, **kwargs):
         axis = kwargs.get("axis", self.axis)
         return type(self)(axis=axis)
 
-    def L_op(self, inputs, outputs, grads):
-        # The strict sense mathematical gradient of the maximum function is
-        # not calculated here for it is not defined at every point where some
-        # coordinates are identical. However, since the latter set has null
-        # Lebesgue measure, the result may be interpreted as weak gradient.
-
-        # @note: This function should work correctly for L{vector}s.
-        # (x, y), (gz, gw)
-        # gz*dz/dx + gw*dw/dx, gz*dz/dy + gw*dw/dy
-        # gMax * dMax/dx + gArgMax * dArgMax/dx,
-        # gMax * dMax/daxis + gArgMax * dArgMax/daxis
-        # g_max has one less dimension than x, so you need to complete
-        # g_max to x's shape when axis=0 the broadcasting mechanism
-        # does it automatically
+    def pullback(self, inputs, outputs, output_grads):
+        # The strict-sense mathematical gradient of a maximum/minimum reduction
+        # is not defined at points where the extremum is attained by more than
+        # one coordinate. However, since that set has null Lebesgue measure, the
+        # result below may be interpreted as a weak gradient: the cotangent is
+        # routed to *every* position that attains the extremum (i.e. where the
+        # input equals the reduced output). This rule is identical for `Max` and
+        # `Min`, which is why it lives on the shared base class.
+        #
+        # `out`/`g_out` have one fewer dimension than `x` along each reduced
+        # axis, so we re-insert those axes (`expand_dims`) to let broadcasting
+        # spread the cotangent back over `x`'s shape.
         [x] = inputs
         [out] = outputs
-        [g_out] = grads
+        [g_out] = output_grads
 
         axis = tuple(range(x.ndim)) if self.axis is None else self.axis
         out_pad = expand_dims(out, axis)
@@ -430,32 +441,42 @@ class Max(NonZeroDimsCAReduce):
         g_x = eq(out_pad, x) * g_out_pad
         return (g_x,)
 
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            return [None, None]
-        if len(self.axis) != 1:
-            raise ValueError("R_op supported for max only for one axis!")
-        if self.axis[0] > 1:
-            raise ValueError("R_op supported for max only when axis is 0 or 1")
-        if inputs[0].ndim != 2:
-            raise ValueError("R_op supported for max only when input is a matrix")
-        max_pos = Argmax(self.axis).make_node(*inputs).outputs
-        # print(eval_points[0].eval())
-        if self.axis[0] == 0:
-            return [eval_points[0][max_pos, arange(eval_points[0].shape[1])], None]
-        else:
-            return [eval_points[0][arange(eval_points[0].shape[0]), max_pos], None]
+    def pushforward(self, inputs, outputs, tangents):
+        # Forward-mode is the exact transpose of `pullback`: the output tangent
+        # is gathered from the input tangent at the extremum position(s) and
+        # summed over the reduced axes. For a unique extremum (the almost-
+        # everywhere case) this simply selects the tangent of the winning
+        # element; on the zero-measure tie set it sums their tangents, which is
+        # precisely what makes it the transpose of `pullback` (and keeps
+        # forward- and reverse-mode consistent). Working for any number of
+        # reduced axes and input dimensions, this also generalises the previous
+        # matrix-only implementation.
+        [x] = inputs
+        [out] = outputs
+        [x_dot] = tangents
+
+        if isinstance(x_dot.type, DisconnectedType):
+            return [disconnected_type()]
+
+        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
+        out_pad = expand_dims(out, axis)
+
+        out_dot = (eq(out_pad, x) * x_dot).sum(axis=axis)
+        return [out_dot]
 
 
-class Min(NonZeroDimsCAReduce):
+class Max(MaxAndMinCAReduce):
+    nfunc_spec = ("max", 1, 1)
+
+    def __init__(self, axis):
+        super().__init__(ps.maximum, axis)
+
+
+class Min(MaxAndMinCAReduce):
     nfunc_spec = ("min", 1, 1)
 
     def __init__(self, axis):
-        super().__init__(ps.scalar_minimum, axis)
-
-    def clone(self, **kwargs):
-        axis = kwargs.get("axis", self.axis)
-        return type(self)(axis=axis)
+        super().__init__(ps.minimum, axis)
 
 
 def max(x, axis=None, keepdims=False):
@@ -589,37 +610,228 @@ def isneginf(x):
 
 @scalar_elemwise
 def lt(a, b):
-    """a < b"""
+    """a < b
+
+    Computes element-wise less than comparison between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where a < b,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.lt(x, y))
+    >>> f([1, 2, 3], [2, 2, 2])
+    array([ True, False, False])
+    """
 
 
 @scalar_elemwise
 def gt(a, b):
-    """a > b"""
+    """a > b
+
+    Computes element-wise greater than comparison between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where a > b,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.gt(x, y))
+    >>> f([1, 2, 3], [0, 2, 4])
+    array([ True, False, False])
+    """
 
 
 @scalar_elemwise
 def le(a, b):
-    """a <= b"""
+    """a <= b
+
+    Computes element-wise less than or equal comparison between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where a <= b,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.le(x, y))
+    >>> f([1, 2, 3], [2, 2, 2])
+    array([ True,  True, False])
+    """
 
 
 @scalar_elemwise
 def ge(a, b):
-    """a >= b"""
+    """a >= b
+
+    Computes element-wise greater than or equal comparison between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where a >= b,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.ge(x, y))
+    >>> f([1, 2, 3], [0, 2, 4])
+    array([ True,  True, False])
+    """
 
 
 @scalar_elemwise
 def eq(a, b):
-    """a == b"""
+    """a == b
+
+    Computes element-wise equality between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where elements are equal,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.eq(x, y))
+    >>> f([1, 2, 3], [1, 4, 3])
+    array([ True, False,  True])
+
+    Notes
+    -----
+    Due to Python rules, it is not possible to overload the equality symbol `==` for hashable objects and have it return something other than a boolean,
+    so `eq` must always be used to compute the Elemwise equality of TensorVariables (which are hashable).
+    """
 
 
 @scalar_elemwise
 def neq(a, b):
-    """a != b"""
+    """a != b
+
+    Computes element-wise inequality comparison between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where a != b,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> f = pytensor.function([x, y], pt.neq(x, y))
+    >>> f([1, 2, 3], [1, 4, 3])
+    array([False,  True, False])
+
+    Notes
+    -----
+    Due to Python rules, it is not possible to overload the inequality symbol `!=` for hashable objects and have it return something other than a boolean,
+    so `neq` must always be used to compute the Elemwise inequality of TensorVariables (which are hashable).
+    """
 
 
 @scalar_elemwise
 def isnan(a):
-    """isnan(a)"""
+    """isnan(a)
+
+    Computes element-wise detection of NaN values.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where elements are NaN,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.isnan(x))
+    >>> f([1, np.nan, 3])
+    array([False,  True, False])
+    """
 
 
 # Rename isnan to isnan_ to allow to bypass it when not needed.
@@ -639,7 +851,31 @@ def isnan(a):
 
 @scalar_elemwise
 def isinf(a):
-    """isinf(a)"""
+    """isinf(a)
+
+    Computes element-wise detection of infinite values.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where elements are infinite,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.isinf(x))
+    >>> f([1, np.inf, -np.inf, 3])
+    array([False,  True,  True, False])
+    """
 
 
 # Rename isnan to isnan_ to allow to bypass it when not needed.
@@ -657,6 +893,39 @@ def isinf(a):
     return isinf_(a)
 
 
+def isfinite(a):
+    """isfinite(a)
+
+    Computes element-wise detection of finite values (i.e., not NaN or infinite).
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor of type bool, with 1 (True) where elements are finite,
+        and 0 (False) elsewhere.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.isfinite(x))
+    >>> f([1, np.inf, -np.inf, np.nan, 3])
+    array([ True, False, False, False,  True])
+    """
+    a = as_tensor_variable(a)
+    if a.dtype in discrete_dtypes:
+        return ones_like(a, dtype="bool")
+
+    return ~isnan_(a) & ~isinf_(a)
+
+
 def allclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
     """
     Implement Numpy's ``allclose`` on tensors.
@@ -665,9 +934,9 @@ def allclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
 
     Parameters
     ----------
-    a : tensor
+    a : TensorLike
         Input to compare.
-    b : tensor
+    b : TensorLike
         Input to compare.
     rtol : float
         The relative tolerance parameter.
@@ -704,9 +973,9 @@ def isclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
 
     Parameters
     ----------
-    a : tensor
+    a : TensorLike
         Input to compare.
-    b : tensor
+    b : TensorLike
         Input to compare.
     rtol : float
         The relative tolerance parameter.
@@ -804,22 +1073,140 @@ def isclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
 
 @scalar_elemwise
 def and_(a, b):
-    """bitwise a & b"""
+    """bitwise a & b
+
+    Computes element-wise bitwise AND operation between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the bitwise AND of corresponding elements in a and b.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x", dtype="int32")
+    >>> y = pt.vector("y", dtype="int32")
+    >>> f = pytensor.function([x, y], pt.and_(x, y))
+    >>> f([1, 2, 3], [4, 2, 1])
+    array([0, 2, 1], dtype=int32)
+
+    Notes
+    -----
+    This function can also be used for logical AND operations
+    on boolean tensors.
+    """
 
 
 @scalar_elemwise
 def or_(a, b):
-    """bitwise a | b"""
+    """bitwise a | b
+
+    Computes element-wise bitwise OR operation between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the bitwise OR of corresponding elements in a and b.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x", dtype="int32")
+    >>> y = pt.vector("y", dtype="int32")
+    >>> f = pytensor.function([x, y], pt.or_(x, y))
+    >>> f([1, 2, 3], [4, 2, 1])
+    array([5, 2, 3], dtype=int32)
+
+    Notes
+    -----
+    This function can also be used for logical OR operations
+    on boolean tensors.
+    """
 
 
 @scalar_elemwise
 def xor(a, b):
-    """bitwise a ^ b"""
+    """bitwise a ^ b
+
+    Computes element-wise bitwise XOR (exclusive OR) operation between two tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    b : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the bitwise XOR of corresponding elements in a and b.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x", dtype="int32")
+    >>> y = pt.vector("y", dtype="int32")
+    >>> f = pytensor.function([x, y], pt.xor(x, y))
+    >>> f([1, 2, 3], [4, 2, 1])
+    array([5, 0, 2], dtype=int32)
+
+    Notes
+    -----
+    For boolean tensors, it computes the logical XOR
+    (true when exactly one input is true).
+    """
 
 
 @scalar_elemwise
 def invert(a):
-    """bitwise ~a"""
+    """bitwise ~a
+
+    Computes element-wise bitwise inversion (NOT) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the bitwise negation of each element in a.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x", dtype="int8")
+    >>> f = pytensor.function([x], pt.invert(x))
+    >>> f([0, 1, 2, 3])
+    array([-1, -2, -3, -4], dtype=int8)
+
+    Notes
+    -----
+    For boolean tensors, this function computes the logical NOT.
+
+    For integers, this inverts the bits in the binary representation.
+    """
 
 
 ##########################
@@ -837,52 +1224,320 @@ pprint.assign(abs, printing.PatternPrinter(("|%(0)s|", -1000)))
 
 @scalar_elemwise
 def exp(a):
-    """e^`a`"""
+    """e^`a`
+
+    Computes the element-wise exponential of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the exponential of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.exp(x))
+    >>> f([0, 1, 2])
+    array([1., 2.71828183, 7.3890561 ])
+
+    """
 
 
 @scalar_elemwise
 def exp2(a):
-    """2^`a`"""
+    """2^`a`
+
+    Computes element-wise base-2 exponential of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with 2 raised to the power of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.exp2(x))
+    >>> f([0, 1, 2, 3])
+    array([1., 2., 4., 8.])
+
+    Notes
+    -----
+    This operation is equivalent to `2**a` but may be more numerically stable
+    for some values. It corresponds to NumPy's `np.exp2` function.
+    """
 
 
 @scalar_elemwise
 def expm1(a):
-    """e^`a` - 1"""
+    """e^`a` - 1
+
+    Computes element-wise exponential of a tensor minus 1: exp(a) - 1.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with exp(x) - 1 computed for each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.expm1(x))
+    >>> f([-1, 0, 1])
+    array([-0.63212056,  0.        ,  1.71828183])
+
+    Notes
+    -----
+    This function is more accurate than the naive computation of exp(x) - 1
+    for small values of x (where exp(x) is close to 1). It corresponds to
+    NumPy's `np.expm1` function.
+    """
 
 
 @scalar_elemwise
 def neg(a):
-    """-a"""
+    """-a
+
+    Computes element-wise negation of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the negative of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.neg(x))
+    >>> f([1, -2, 3])
+    array([-1,  2, -3])
+
+    Notes
+    -----
+    This is equivalent to the arithmetic operation `-a` but works within
+    the PyTensor computational graph. For complex numbers, this computes
+    the complex negative.
+    """
 
 
 @scalar_elemwise
 def reciprocal(a):
-    """1.0/a"""
+    """1.0/a
+
+    Computes element-wise reciprocal (1/x) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the reciprocal of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.reciprocal(x))
+    >>> f([1, 2, 4])
+    array([1.  , 0.5 , 0.25])
+
+    Notes
+    -----
+    This is equivalent to 1/a but is often more numerically stable.
+    Division by zero will result in the appropriate IEEE floating point values
+    (inf or -inf) or in an error depending on the backend.
+    """
 
 
 @scalar_elemwise
 def log(a):
-    """base e logarithm of a"""
+    """base e logarithm of a
+
+    Computes the element-wise natural logarithm of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the natural logarithm of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.log(x))
+    >>> f([1, 2.7, 10])
+    array([0., 0.99325178, 2.30258509])
+
+    """
 
 
 @scalar_elemwise
 def log2(a):
-    """base 2 logarithm of a"""
+    """base 2 logarithm of a
+
+    Computes element-wise base-2 logarithm of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the base-2 logarithm of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.log2(x))
+    >>> f([1, 2, 4, 8])
+    array([0., 1., 2., 3.])
+
+    Notes
+    -----
+    This function computes log(x)/log(2) but may be more numerically accurate
+    than the naive computation.
+    """
 
 
 @scalar_elemwise
 def log10(a):
-    """base 10 logarithm of a"""
+    """base 10 logarithm of a
+
+    Computes element-wise base-10 logarithm of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the base-10 logarithm of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.log10(x))
+    >>> f([1, 10, 100, 1000])
+    array([0., 1., 2., 3.])
+
+    Notes
+    -----
+    This function computes log(x)/log(10) but may be more numerically accurate
+    than the naive computation.
+    """
 
 
 @scalar_elemwise
 def log1p(a):
-    """log(1+a)"""
+    """log(1+a)
+
+    Computes element-wise natural logarithm of 1 plus a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the natural logarithm of (1 + a) for each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.log1p(x))
+    >>> f([0, 1e-7, 1, 3])
+    array([0.0000000e+00, 1.0000050e-07, 6.9314718e-01, 1.3862944e+00])
+
+    Notes
+    -----
+    This function is more accurate than the naive computation of log(1+x)
+    for small values of x (close to zero).
+    """
 
 
 @scalar_elemwise
 def sign(a):
-    """sign of a"""
+    """sign of a
+
+    Computes element-wise sign of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the sign of each element in `a`: -1 for negative values,
+        0 for zero, and 1 for positive values.
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.sign(x))
+    >>> f([-2, 0, 3])
+    array([-1.,  0.,  1.])
+
+    Notes
+    -----
+    For complex inputs, this function
+    returns the sign of the magnitude.
+    """
 
 
 def sgn(a):
@@ -897,17 +1552,83 @@ def sgn(a):
 
 @scalar_elemwise
 def ceil(a):
-    """ceiling of a"""
+    """ceiling of a
+
+    Computes element-wise ceiling (smallest integer greater than or equal to x) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the ceiling of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.ceil(x))
+    >>> f([1.5, 2.0, -3.7])
+    array([ 2.,  2., -3.])
+    """
 
 
 @scalar_elemwise
 def floor(a):
-    """floor of a"""
+    """floor of a
+
+    Computes element-wise floor (largest integer less than or equal to x) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the floor of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.floor(x))
+    >>> f([1.5, 2.0, -3.7])
+    array([ 1.,  2., -4.])
+    """
 
 
 @scalar_elemwise
 def trunc(a):
-    """trunc of a"""
+    """trunc of a
+
+    Computes element-wise truncation (the integer part) of a tensor, effectively rounding downward.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the truncated value (integer part) of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.trunc(x))
+    >>> f([1.5, 2.0, -3.7])
+    array([ 1.,  2., -3.])
+    """
 
 
 def iround(a, mode=None):
@@ -920,13 +1641,6 @@ def round(a, mode=None):
     Default to half_to_even."""
     if mode is None:
         mode = "half_to_even"
-        if config.warn__round:
-            warnings.warn(
-                "pytensor.tensor.round() changed its default from"
-                " `half_away_from_zero` to `half_to_even` to have"
-                " the same default as NumPy. Use the PyTensor flag"
-                " `warn__round=False` to disable this warning."
-            )
     if mode == "half_away_from_zero":
         return round_half_away_from_zero(a)
     elif mode == "half_to_even":
@@ -947,7 +1661,33 @@ def round_half_away_from_zero(a):
 
 @scalar_elemwise
 def sqr(a):
-    """square of a"""
+    """square of a
+
+    Computes element-wise square (x²) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the square of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.sqr(x))
+    >>> f([-2, 0, 3])
+    array([4, 0, 9])
+
+    Notes
+    -----
+    This is equivalent to a**2 or a*a, but may be computed more efficiently.
+    """
 
 
 def cov(m, y=None, rowvar=True, bias=False, ddof=None, fweights=None, aweights=None):
@@ -1018,92 +1758,603 @@ def cov(m, y=None, rowvar=True, bias=False, ddof=None, fweights=None, aweights=N
 
 @scalar_elemwise
 def sqrt(a):
-    """square root of a"""
+    """square root of a
+
+    Computes element-wise square root of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor (should contain non-negative values)
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the square root of each element in `a`
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.sqrt(x))
+    >>> f([0, 1, 4, 9])
+    array([0., 1., 2., 3.])
+
+    Notes
+    -----
+    For negative inputs, the behavior depends on the backend, typically
+    resulting in NaN values.
+    """
 
 
-@scalar_elemwise
 def deg2rad(a):
-    """convert degree a to radian"""
+    """convert degree a to radian
+
+    Computes element-wise conversion from degrees to radians.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor in degrees
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with values converted to radians
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.deg2rad(x))
+    >>> f([0, 90, 180, 270, 360])
+    array([0.        , 1.57079633, 3.14159265, 4.71238898, 6.28318531])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.deg2rad` function.
+    The conversion formula is: radians = degrees * (π / 180)
+    """
+    a = as_tensor_variable(a)
+    (out_type,) = ps.upgrade_to_float(ps.get_scalar_type(a.type.dtype))
+    return a * np.asarray(np.pi / 180, dtype=out_type.dtype)
 
 
-@scalar_elemwise
 def rad2deg(a):
-    """convert radian a to degree"""
+    """convert radian a to degree
+
+    Computes element-wise conversion from radians to degrees.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor in radians
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with values converted to degrees
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.rad2deg(x))
+    >>> f([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
+    array([  0.,  90., 180., 270., 360.])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.rad2deg` function.
+    The conversion formula is: degrees = radians * (180 / π)
+    """
+    a = as_tensor_variable(a)
+    (out_type,) = ps.upgrade_to_float(ps.get_scalar_type(a.type.dtype))
+    return a * np.asarray(180 / np.pi, dtype=out_type.dtype)
 
 
 @scalar_elemwise
 def cos(a):
-    """cosine of a"""
+    """cosine of a
+
+    Computes element-wise cosine of a tensor in radians.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor in radians
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the cosine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.cos(x))
+    >>> f([0, np.pi / 2, np.pi])
+    array([ 1.000000e+00,  6.123234e-17, -1.000000e+00])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.cos` function.
+    """
 
 
 @scalar_elemwise
 def arccos(a):
-    """arccosine of a"""
+    """arccosine of a
+
+    Computes element-wise inverse cosine (arc cosine) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor (values should be in the range [-1, 1])
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the arc cosine of each element in radians,
+        in the range [0, π]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arccos(x))
+    >>> f([1, 0, -1])
+    array([0.        , 1.57079633, 3.14159265])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arccos` function.
+    The values returned are in the range [0, π]. Input values outside
+    the domain [-1, 1] will produce NaN outputs.
+    """
 
 
 @scalar_elemwise
 def sin(a):
-    """sine of a"""
+    """sine of a
+
+    Computes element-wise sine of a tensor in radians.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor in radians
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the sine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.sin(x))
+    >>> f([0, np.pi / 2, np.pi])
+    array([ 0.00000000e+00,  1.00000000e+00,  1.22464680e-16])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.sin` function.
+    """
 
 
 @scalar_elemwise
 def arcsin(a):
-    """arcsine of a"""
+    """arcsine of a
+
+    Computes element-wise inverse sine (arc sine) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor (values should be in the range [-1, 1])
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the arc sine of each element in radians,
+        in the range [-π/2, π/2]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arcsin(x))
+    >>> f([-1, 0, 1])
+    array([-1.57079633,  0.        ,  1.57079633])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arcsin` function.
+    The values returned are in the range [-π/2, π/2]. Input values outside
+    the domain [-1, 1] will produce NaN outputs.
+    """
 
 
 @scalar_elemwise
 def tan(a):
-    """tangent of a"""
+    """tangent of a
+
+    Computes element-wise tangent of a tensor in radians.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor in radians
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the tangent of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.tan(x))
+    >>> f([0, np.pi / 4, np.pi / 2 - 1e-10])  # Avoiding exact π/2 which is undefined
+    array([0.00000000e+00, 1.00000000e+00, 1.25655683e+10])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.tan` function.
+    Tangent is undefined at π/2 + nπ where n is an integer.
+    """
 
 
 @scalar_elemwise
 def arctan(a):
-    """arctangent of a"""
+    """arctangent of a
+
+    Computes element-wise inverse tangent (arc tangent) of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the arc tangent of each element in radians,
+        in the range [-π/2, π/2]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arctan(x))
+    >>> f([-1, 0, 1])
+    array([-0.78539816,  0.        ,  0.78539816])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arctan` function.
+    The values returned are in the range [-π/2, π/2].
+    For the two-argument inverse tangent function, see `arctan2`.
+    """
 
 
 @scalar_elemwise
 def arctan2(a, b):
-    """arctangent of a / b"""
+    """arctangent of a / b
+
+    Computes element-wise arc tangent of two values, taking into account
+    the quadrant based on the signs of the inputs.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor, representing the numerator (y-coordinates)
+    b : TensorLike
+        Second input tensor, representing the denominator (x-coordinates)
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the arc tangent of a/b in radians, in the range [-π, π]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> y = pt.vector("y")
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([y, x], pt.arctan2(y, x))
+    >>> f([1, -1, 0, 0], [1, -1, 1, -1])
+    array([ 0.78539816, -2.35619449,  0.        ,  3.14159265])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arctan2` function.
+    The returned values are in the range [-π, π].
+
+    This function is similar to calculating the arc tangent of a/b, except
+    that the signs of both arguments are used to determine the quadrant of
+    the result.
+    """
 
 
 @scalar_elemwise
 def cosh(a):
-    """hyperbolic cosine of a"""
+    """hyperbolic cosine of a
+
+    Computes element-wise hyperbolic cosine of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic cosine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.cosh(x))
+    >>> f([0, 1, 2])
+    array([1.        , 1.54308063, 3.76219569])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.cosh` function.
+    The hyperbolic cosine is defined as: cosh(x) = (exp(x) + exp(-x))/2
+    """
 
 
 @scalar_elemwise
 def arccosh(a):
-    """hyperbolic arc cosine of a"""
+    """hyperbolic arc cosine of a
+
+    Computes element-wise inverse hyperbolic cosine of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor (values should be ≥ 1)
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic arc cosine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arccosh(x))
+    >>> f([1, 2, 10])
+    array([0.        , 1.31695789, 2.99322285])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arccosh` function.
+    The domain is [1, inf]; values outside this range will produce NaN outputs.
+    """
 
 
 @scalar_elemwise
 def sinh(a):
-    """hyperbolic sine of a"""
+    """hyperbolic sine of a
+
+    Computes element-wise hyperbolic sine of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic sine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.sinh(x))
+    >>> f([0, 1, 2])
+    array([0.        , 1.17520119, 3.62686041])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.sinh` function.
+    The hyperbolic sine is defined as: sinh(x) = (exp(x) - exp(-x))/2
+    """
 
 
 @scalar_elemwise
 def arcsinh(a):
-    """hyperbolic arc sine of a"""
+    """hyperbolic arc sine of a
+
+    Computes element-wise inverse hyperbolic sine of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic arc sine of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arcsinh(x))
+    >>> f([-1, 0, 1])
+    array([-0.88137359,  0.        ,  0.88137359])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arcsinh` function.
+    The inverse hyperbolic sine is defined for all real numbers.
+    """
 
 
 @scalar_elemwise
 def tanh(a):
-    """hyperbolic tangent of a"""
+    """hyperbolic tangent of a
+
+    Computes element-wise hyperbolic tangent of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic tangent of each element,
+        with values in the range [-1, 1]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.tanh(x))
+    >>> f([-1, 0, 1])
+    array([-0.76159416,  0.        ,  0.76159416])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.tanh` function.
+    The hyperbolic tangent is defined as: tanh(x) = sinh(x)/cosh(x)
+    """
 
 
 @scalar_elemwise
 def arctanh(a):
-    """hyperbolic arc tangent of a"""
+    """hyperbolic arc tangent of a
+
+    Computes element-wise inverse hyperbolic tangent of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor (values should be in the range [-1, 1])
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the hyperbolic arc tangent of each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.arctanh(x))
+    >>> f([-0.5, 0, 0.5])
+    array([-0.54930614,  0.        ,  0.54930614])
+
+    Notes
+    -----
+    This function corresponds to NumPy's `np.arctanh` function.
+    The domain of arctanh is [-1, 1]; values outside this range
+    will produce NaN outputs.
+    """
 
 
 @scalar_elemwise
 def erf(a):
-    """error function"""
+    """error function
+
+    Computes the element-wise error function of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the error function evaluated at each element,
+        with values in the range [-1, 1]
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.erf(x))
+    >>> f([-1, 0, 1])
+    array([-0.84270079,  0.        ,  0.84270079])
+
+    Notes
+    -----
+    This function corresponds to SciPy's `scipy.special.erf` function.
+    The error function is defined as:
+    erf(x) = (2/√π) * ∫(0 to x) exp(-t²) dt
+    """
 
 
 @scalar_elemwise
 def erfc(a):
-    """complementary error function"""
+    """complementary error function
+
+    Computes the element-wise complementary error function of a tensor.
+
+    Parameters
+    ----------
+    a : TensorLike
+        Input tensor
+
+    Returns
+    -------
+    TensorVariable
+        Output tensor with the complementary error function evaluated at each element
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> f = pytensor.function([x], pt.erfc(x))
+    >>> f([-1, 0, 1])
+    array([1.84270079, 1.        , 0.15729921])
+
+    Notes
+    -----
+    This function corresponds to SciPy's `scipy.special.erfc` function.
+    The complementary error function is defined as:
+    erfc(x) = 1 - erf(x) = (2/√π) * ∫(x to ∞) exp(-t²) dt
+    """
 
 
 @scalar_elemwise
@@ -1119,6 +2370,11 @@ def erfinv(a):
 @scalar_elemwise
 def erfcinv(a):
     """inverse complementary error function"""
+
+
+@scalar_elemwise
+def ndtri_exp(a):
+    """inverse standard normal cdf of the exponent of a"""
 
 
 @scalar_elemwise
@@ -1154,9 +2410,10 @@ def polygamma(n, x):
     """Polygamma function of order n evaluated at x"""
 
 
-@scalar_elemwise
 def chi2sf(x, k):
     """chi squared survival function"""
+    warnings.warn("chi2sf is deprecated. Use `gammaincc(k / 2, x / 2)` instead")
+    return gammaincc(k / 2, x / 2)
 
 
 @scalar_elemwise
@@ -1169,14 +2426,14 @@ def gammaincc(k, x):
     """Regularized upper gamma function"""
 
 
-@scalar_elemwise
 def gammau(k, x):
     """Upper incomplete gamma function."""
+    return gammaincc(k, x) * gamma(k)
 
 
-@scalar_elemwise
 def gammal(k, x):
     """Lower incomplete gamma function."""
+    return gammainc(k, x) * gamma(k)
 
 
 @scalar_elemwise
@@ -1219,9 +2476,14 @@ def i1(x):
     """Modified Bessel function of the first kind of order 1."""
 
 
-@scalar_elemwise
 def iv(v, x):
-    """Modified Bessel function of the first kind of order v (real)."""
+    """Modified Bessel function of the first kind of order v (real).
+
+    Computed as ``ive(v, x) * exp(abs(x))`` for numerical consistency with
+    ``ive``. For large ``x``, prefer working in log-space:
+    ``log(iv(v, x)) == log(ive(v, x)) + abs(x)`` to avoid overflow.
+    """
+    return ive(v, x) * exp(abs(x))
 
 
 @scalar_elemwise
@@ -1237,6 +2499,11 @@ def kve(v, x):
 def kv(v, x):
     """Modified Bessel function of the second kind of real order v."""
     return kve(v, x) * exp(-x)
+
+
+def kn(n, x):
+    """Modified Bessel function of the second kind of integer order v."""
+    return kv(n, x)
 
 
 @scalar_elemwise
@@ -1286,9 +2553,10 @@ def imag(z):
 _tensor_py_operators.imag = property(imag, doc=imag.__doc__)
 
 
-@scalar_elemwise
 def angle(z):
     """Return polar-coordinate angle of complex-valued tensor `z`"""
+    z = as_tensor_variable(z)
+    return arctan2(imag(z), real(z))
 
 
 @scalar_elemwise  # numpy.complex cannot build tensors
@@ -1311,9 +2579,14 @@ def conjugate(x):
 conj = conjugate
 
 
-@scalar_elemwise
 def complex_from_polar(abs, angle):
     """Return complex-valued tensor from polar coordinate specification."""
+    warnings.warn(
+        "complex_from_polar is deprecated and will be removed in a future release. "
+        "Use `complex(abs * cos(angle), abs * sin(angle))` instead.",
+        FutureWarning,
+    )
+    return complex(abs * cos(angle), abs * sin(angle))
 
 
 def mean(input, axis=None, dtype=None, keepdims=False, acc_dtype=None):
@@ -1507,7 +2780,7 @@ def median(x: TensorLike, axis=None) -> TensorVariable:
 
     Parameters
     ----------
-    x: TensorVariable
+    x: TensorLike
         The input tensor.
     axis: None or int or (list of int) (see `Sum`)
         Compute the median along this axis of the tensor.
@@ -1543,15 +2816,70 @@ def median(x: TensorLike, axis=None) -> TensorVariable:
     return ifelse(even_k, even_median, odd_median, name="median")
 
 
-@scalar_elemwise(symbolname="scalar_maximum")
+@scalar_elemwise
 def maximum(x, y):
-    """elemwise maximum. See max for the maximum in one tensor"""
+    """elemwise maximum. See max for the maximum in one tensor
+
+    Computes element-wise maximum of two tensors.
+
+    Parameters
+    ----------
+    x : TensorLike
+        First input tensor
+    y : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorLike
+        Output tensor with the maximum of corresponding elements in x and y
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> a = pt.vector("a")
+    >>> b = pt.vector("b")
+    >>> f = pytensor.function([a, b], pt.maximum(a, b))
+    >>> f([1, 3, 5], [2, 3, 4])
+    array([2, 3, 5])
+
+    Notes
+    -----
+    This computes the element-wise maximum, while `max(x)` computes the
+    maximum value over all elements in a single tensor.
+    """
     # see decorator for function body
 
 
-@scalar_elemwise(symbolname="scalar_minimum")
+@scalar_elemwise
 def minimum(x, y):
-    """elemwise minimum. See min for the minimum in one tensor"""
+    """elemwise minimum. See min for the minimum in one tensor
+
+    Computes element-wise minimum of two tensors.
+
+    Parameters
+    ----------
+    x : TensorLike
+        First input tensor
+    y : TensorLike
+        Second input tensor
+
+    Returns
+    -------
+    TensorLike
+        Output tensor with the minimum of corresponding elements in x and y
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> a = pt.vector("a")
+    >>> b = pt.vector("b")
+    >>> f = pytensor.function([a, b], pt.minimum(a, b))
+    >>> f([1, 3, 5], [2, 3, 4])
+    array([1, 3, 4])
+    """
     # see decorator for function body
 
 
@@ -1562,7 +2890,33 @@ def divmod(x, y):
 
 @scalar_elemwise
 def add(a, *other_terms):
-    """elementwise addition"""
+    """elementwise addition
+
+    Computes element-wise addition of tensors.
+
+    Parameters
+    ----------
+    a : TensorLike
+        First input tensor
+    *other_terms : tensors
+        Other tensors to add
+
+    Returns
+    -------
+    TensorLike
+        Output tensor with the elementwise sum of all inputs
+
+    Examples
+    --------
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.vector("x")
+    >>> y = pt.vector("y")
+    >>> z = pt.vector("z")
+    >>> f = pytensor.function([x, y, z], pt.add(x, y, z))
+    >>> f([1, 2], [3, 4], [5, 6])
+    array([ 9, 12])
+    """
     # see decorator for function body
 
 
@@ -1686,9 +3040,7 @@ pprint.assign(pow, printing.OperatorPrinter("**", 1, "right"))
 
 class Dot(Op):
     """
-    Computes the dot product of two variables. For two matrices, this is
-    equivalent to matrix multiplication. For two vectors, this is the inner
-    product.
+    Computes the dot product of two matrices variables
 
     Notes
     -----
@@ -1701,134 +3053,87 @@ class Dot(Op):
 
     """
 
+    gufunc_signature = "(m,n),(n,p)->(m,p)"
+    gufunc_spec = ("matmul", 2, 1)
     __props__ = ()
 
-    # the rationale for Dot22 is related to getting GEMM Ops into the
-    # graph.  See Dot22 in tensor.blas for details.
+    def make_node(self, x, y):
+        x = as_tensor_variable(x)
+        y = as_tensor_variable(y)
 
-    def make_node(self, *inputs):
-        inputs = list(map(as_tensor_variable, inputs))
-
-        if len(inputs) != 2:
-            raise TypeError(f"Two arguments required, {len(inputs)} given ")
-        if inputs[0].ndim not in (1, 2):
+        if x.type.ndim != 2:
             raise TypeError(
-                "Input 0 (0-indexed) must have ndim of "
-                f"1 or 2, {int(inputs[0].ndim)} given. Consider calling "
-                "pytensor.tensor.dot instead."
+                f"Dot Op expects a 2D tensor as input 0, got {x} with {x.type.ndim} dimensions"
             )
-        if inputs[1].ndim not in (1, 2):
+        if y.type.ndim != 2:
             raise TypeError(
-                "Input 1 (0-indexed) must have ndim of "
-                f"1 or 2, {int(inputs[1].ndim)} given. Consider calling "
-                "pytensor.tensor.dot instead."
+                f"Dot Op expects a 2D tensor as input 1, got {y} with {y.type.ndim} dimensions"
             )
 
-        sx, sy = (input.type.shape for input in inputs)
-        if len(sy) == 2:
-            sz = sx[:-1] + sy[-1:]
-        elif len(sy) == 1:
-            sz = sx[:-1]
+        sx, sy = x.type.shape, y.type.shape
+        if sx[-1] is not None and sy[0] is not None and sx[-1] != sy[0]:
+            raise ValueError(
+                f"Incompatible shared dimension for dot product: {sx}, {sy}"
+            )
+        out_shape = (sx[0], sy[1])
+        out_dtype = ps.upcast(x.type.dtype, y.type.dtype)
+        outputs = [tensor(dtype=out_dtype, shape=out_shape)]
+        return Apply(self, [x, y], outputs)
 
-        i_dtypes = [input.type.dtype for input in inputs]
-        outputs = [tensor(dtype=ps.upcast(*i_dtypes), shape=sz)]
-        return Apply(self, inputs, outputs)
+    def perform(self, node, inputs, output_storage):
+        output_storage[0][0] = np.matmul(*inputs)
 
-    def perform(self, node, inp, out):
-        x, y = inp
-        (z,) = out
+    def pullback(self, inputs, outputs, output_grads):
+        x, y = inputs
+        (gz,) = output_grads
 
-        # the asarray is here because dot between two vectors
-        # gives a numpy float object but we need to return a 0d
-        # ndarray
-        z[0] = np.asarray(np.dot(x, y))
-
-    def grad(self, inp, grads):
-        x, y = inp
-        (gz,) = grads
-        xdim, ydim, gdim = x.type.ndim, y.type.ndim, gz.type.ndim
-
-        # grad is scalar, so x is vector and y is vector
-        if gdim == 0:
-            xgrad = gz * y
-            ygrad = gz * x
-
-        # x is vector, y is matrix, grad is vector
-        elif xdim == 1 and ydim == 2:
-            xgrad = dot(gz, y.T)
-            ygrad = outer(x.T, gz)
-
-        # x is matrix, y is vector, grad is vector
-        elif xdim == 2 and ydim == 1:
-            xgrad = outer(gz, y.T)
-            ygrad = dot(x.T, gz)
-
-        # x is matrix, y is matrix, grad is matrix
-        elif xdim == ydim == 2:
-            xgrad = dot(gz, y.T)
-            ygrad = dot(x.T, gz)
+        xgrad = self(gz, y.T)
+        ygrad = self(x.T, gz)
 
         # If x or y contain broadcastable dimensions but only one of
         # them know that a matching dimensions is broadcastable, the
         # above code don't always return the right broadcast pattern.
         # This cause problem down the road. See gh-1461.
-        if xgrad.broadcastable != x.broadcastable:
-            xgrad = specify_broadcastable(
-                xgrad, *(ax for (ax, b) in enumerate(x.type.broadcastable) if b)
-            )
-        if ygrad.broadcastable != y.broadcastable:
-            ygrad = specify_broadcastable(
-                ygrad, *(ax for (ax, b) in enumerate(y.type.broadcastable) if b)
-            )
+        if xgrad.type.shape != x.type.shape:
+            xgrad = specify_shape(xgrad, x.type.shape)
+        if ygrad.type.shape != y.type.shape:
+            ygrad = specify_shape(ygrad, y.type.shape)
 
-        rval = xgrad, ygrad
+        if xgrad.type.dtype not in float_dtypes:
+            raise TypeError("Dot grad x output must be a float type")
+        if ygrad.type.dtype not in float_dtypes:
+            raise TypeError("Dot grad y output must be a float type")
 
-        for elem in rval:
-            assert elem.dtype.find("float") != -1
+        return xgrad, ygrad
 
-        return rval
-
-    def R_op(self, inputs, eval_points):
+    def pushforward(self, inputs, outputs, eval_points):
         # R_op for a \dot b evaluated at c for a and d for b is
         # simply c \dot b + a \dot d
 
         assert len(inputs) == 2
         assert len(eval_points) == 2
-        if eval_points[0] is None and eval_points[1] is None:
-            return [None]
+        if isinstance(eval_points[0].type, DisconnectedType) and isinstance(
+            eval_points[1].type, DisconnectedType
+        ):
+            return [disconnected_type()]
 
-        if eval_points[0]:
+        if not isinstance(eval_points[0].type, DisconnectedType):
             t1 = self(eval_points[0], inputs[1])
-        if eval_points[1]:
+        if not isinstance(eval_points[1].type, DisconnectedType):
             t2 = self(inputs[0], eval_points[1])
 
-        if eval_points[0] and eval_points[1]:
+        if not isinstance(eval_points[0].type, DisconnectedType) and not isinstance(
+            eval_points[1].type, DisconnectedType
+        ):
             return [t1 + t2]
-        elif eval_points[0]:
+        elif not isinstance(eval_points[0].type, DisconnectedType):
             return [t1]
         else:
             return [t2]
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         xshp, yshp = shapes
-        x, y = node.inputs
-
-        # vector / vector
-        if x.ndim == 1 and y.ndim == 1:
-            return [()]
-        # matrix / vector
-        if x.ndim == 2 and y.ndim == 1:
-            return [xshp[:-1]]
-        # vector / matrix
-        if x.ndim == 1 and y.ndim == 2:
-            return [yshp[-1:]]
-        # matrix / matrix
-        if x.ndim == 2 and y.ndim == 2:
-            return [xshp[:-1] + yshp[-1:]]
-        raise NotImplementedError()
-
-    def __str__(self):
-        return "dot"
+        return [[xshp[0], yshp[1]]]
 
 
 _dot = Dot()
@@ -1910,134 +3215,24 @@ def dense_dot(a, b):
     elif a.ndim > 2 or b.ndim > 2:
         return tensordot(a, b, [[a.ndim - 1], [np.maximum(0, b.ndim - 2)]])
     else:
-        return _dot(a, b)
+        row_vector = a.ndim == 1
+        if row_vector:
+            # Promote to row matrix
+            a = a[None]
 
+        col_vector = b.ndim == 1
+        if col_vector:
+            # Promote to column matrix
+            b = b[:, None]
 
-def _tensordot_as_dot(a, b, axes, dot, batched):
-    """
-    Reduces a tensor dot product to a matrix or vector dot product. Based
-    on code from Tijmen Tieleman's gnumpy
-    (http://www.cs.toronto.edu/~tijmen/gnumpy.html).
-
-    Please see the documentation of tensordot for the meaning of the a, b
-    and axes arguments.
-
-    :param dot: a function that accepts two symbolic variables and computes
-                the appropriate dot product (e.g. dot, batched_dot)
-    :type dot: function
-
-    :param batched: whether to treat the first axis of a and b as a batch
-                    axis.  If so, this axis will be preserved in the output,
-                    allowing this function to be used also for batched
-                    tensor dot products.
-    :type batched: boolean
-
-    :returns: a tensor with shape equal to the concatenation of a's shape
-              (less any dimensions that were summed over) and b's shape
-              (less the first dimension and any dimensions that were summed
-              over).
-    :rtype: symbolic tensor
-    """
-    a, b = as_tensor_variable(a), as_tensor_variable(b)
-
-    if not np.isscalar(axes) and len(axes) != 2:
-        raise ValueError(
-            "Axes should be an integer or a "
-            f"list/tuple of len 2 ({axes} was provided)"
-        )
-
-    # if 'axes' is a number of axes to multiply and sum over (trailing axes
-    # of a, leading axes of b), we can just reshape and use dot.
-    elif np.isscalar(axes):
-        axes = int(axes)
-
-        for operand_name, operand in (("a", a), ("b", b)):
-            if axes > operand.ndim:
-                raise ValueError(
-                    f"axes can not be larger than the dimension of {operand_name} "
-                    f"({operand_name}.ndim={operand.ndim}, axes={axes})"
-                )
-            if batched and axes == operand.ndim:
-                raise ValueError(
-                    "axes to sum over must not include the batch axis "
-                    f"of {operand_name} ({operand_name}.ndim={operand.ndim}, axes={axes})"
-                )
-
-        batch_axes = 1 if batched else 0
-        a_outaxes = slice(0, a.ndim - axes)
-        b_outaxes = slice(batch_axes + axes, b.ndim)
-        outshape = concatenate([a.shape[a_outaxes], b.shape[b_outaxes]])
-        outbcast = a.broadcastable[a_outaxes] + b.broadcastable[b_outaxes]
-        outndim = len(outbcast)
-
-        a_shape = [1] * 2
-        b_shape = [1] * 2
-
-        # compute total size of summed axes
-        for i in range(0, axes):
-            a_shape[1] *= a.shape[-(i + 1)]
-            b_shape[0] *= b.shape[batch_axes + i]
-        # compute total size of other axes
-        for i in range(0, a.ndim - axes - batch_axes):
-            a_shape[0] *= a.shape[batch_axes + i]
-        for i in range(0, b.ndim - axes - batch_axes):
-            b_shape[1] *= b.shape[-(i + 1)]
-
-        if batched:
-            a_shape.insert(0, a.shape[0])
-            b_shape.insert(0, b.shape[0])
-
-        a_reshaped = a.reshape(a_shape)
-        b_reshaped = b.reshape(b_shape)
-
-        out_reshaped = dot(a_reshaped, b_reshaped)
-        out = out_reshaped.reshape(outshape, ndim=outndim)
-        # Make sure the broadcastable pattern of the result is correct,
-        # since some shape information can be lost in the reshapes.
-        if out.type.broadcastable != outbcast:
-            out = specify_broadcastable(
-                out, *(ax for (ax, b) in enumerate(outbcast) if b)
-            )
+        out = _dot(a, b)
+        if row_vector:
+            # If we promoted a to a row matrix, we need to squeeze the first dimension
+            out = out.squeeze(0)
+        if col_vector:
+            # If we promoted b to a column matrix, we need to squeeze the last dimension
+            out = out.squeeze(-1)
         return out
-
-    # if 'axes' is a list, transpose a and b such that the summed axes of a
-    # are last and the summed axes of b are first.
-    else:
-        axes = [as_list(axes_) for axes_ in axes]
-
-        if len(axes[0]) != len(axes[1]):
-            raise ValueError("Axes elements must have the same length.")
-
-        for i, (operand_name, operand) in enumerate((("a", a), ("b", b))):
-            if len(axes[i]) > operand.ndim:
-                raise ValueError(
-                    f"axes[{i}] should be array_like with length less than "
-                    f"the dimensions of {operand_name} ({operand_name}.ndim={operand.ndim}, len(axes[0])={len(axes[i])})."
-                )
-            if len(axes[i]) > 0 and np.max(axes[i]) >= operand.ndim:
-                raise ValueError(
-                    f"axes[{i}] contains dimensions greater than or equal "
-                    f"to {operand_name}.ndim ({operand_name}.ndim={operand.ndim}, max(axes[0])={np.max(np.array(axes[i]))})."
-                )
-            if batched and 0 in axes[i]:
-                raise ValueError(
-                    "axes to sum over must not contain the batch axis "
-                    f"(axes[{i}]={axes[i]})"
-                )
-
-        batch_axes = [0] if batched else []
-        other_axes = [
-            [x for x in range(operand.ndim) if x not in axes[i] and x not in batch_axes]
-            for i, operand in enumerate((a, b))
-        ]
-
-        a_shuffled = a.dimshuffle(batch_axes + other_axes[0] + axes[0])
-        b_shuffled = b.dimshuffle(batch_axes + axes[1] + other_axes[1])
-
-        # now that a and b are in the right order, recur with integer axes
-        return _tensordot_as_dot(
-            a_shuffled, b_shuffled, len(axes[0]), dot=dot, batched=batched
-        )
 
 
 def tensordot(
@@ -2057,7 +3252,7 @@ def tensordot(
 
     Parameters
     ----------
-    a, b : tensor_like
+    a, b : TensorLike
         Tensors to "dot".
 
     axes : int or (2,) array_like
@@ -2070,7 +3265,7 @@ def tensordot(
 
     Returns
     -------
-    output : TensorVariable
+    output : TensorLike
         The tensor dot product of the input.
         Its shape will be equal to the concatenation of `a` and `b` shapes
         (ignoring the dimensions that were summed over given in ``a_axes``
@@ -2152,13 +3347,11 @@ def tensordot(
     a = as_tensor_variable(a)
     b = as_tensor_variable(b)
     runtime_shape_a = a.shape
-    bcast_a = a.broadcastable
     static_shape_a = a.type.shape
-    ndim_a = a.ndim
+    ndim_a = a.type.ndim
     runtime_shape_b = b.shape
-    bcast_b = b.broadcastable
     static_shape_b = b.type.shape
-    ndim_b = b.ndim
+    ndim_b = b.type.ndim
     if na != nb:
         raise ValueError(
             "The number of axes supplied for tensordot must be equal for each tensor. "
@@ -2166,48 +3359,67 @@ def tensordot(
         )
     axes_a = list(normalize_axis_tuple(axes_a, ndim_a))
     axes_b = list(normalize_axis_tuple(axes_b, ndim_b))
+
+    # The operation is only valid if the original dimensions match in length
+    # The ravelling of the dimensions to coerce the operation into a single dot
+    # could mask such errors, so we add an Assert if needed.
     must_assert_runtime = False
-    for k in range(na):
-        ax_a = axes_a[k]
-        ax_b = axes_b[k]
-        if (bcast_a[ax_a] != bcast_b[ax_b]) or (
+    for ax_a, ax_b in zip(axes_a, axes_b, strict=True):
+        if (
             static_shape_a[ax_a] is not None
             and static_shape_b[ax_b] is not None
             and static_shape_a[ax_a] != static_shape_b[ax_b]
         ):
             raise ValueError(
-                "Input arrays have inconsistent broadcastable pattern or type shape along the axes "
+                "Input arrays have inconsistent type shape along the axes "
                 "that are to be reduced with tensordot."
             )
         elif static_shape_a[ax_a] is None or static_shape_b[ax_b] is None:
             if must_assert_runtime:
                 a = Assert(
                     "Input array shape along reduced axes of tensordot are not equal"
-                )(a, eq(a.shape[ax_a], b.shape[ax_b]))
+                )(a, eq(runtime_shape_a[ax_a], runtime_shape_b[ax_b]))
             must_assert_runtime = True
 
-    # Move the axes to sum over to the end of "a"
-    # and to the front of "b"
-    notin = [k for k in range(ndim_a) if k not in axes_a]
-    newaxes_a = notin + axes_a
-    N2 = 1
-    for axis in axes_a:
-        N2 *= runtime_shape_a[axis]
-    newshape_a = (-1, N2)
-    olda = [runtime_shape_a[axis] for axis in notin]
+    # Convert tensordot into a stacked dot product.
+    # We stack the summed axes and the non-summed axes of each tensor separately,
+    # and place the summed axes at the end of a and the beginning of b
+    non_summed_axes_a = [k for k in range(ndim_a) if k not in axes_a]
+    non_summed_dims_a = [runtime_shape_a[axis] for axis in non_summed_axes_a]
+    transpose_axes_a = non_summed_axes_a + axes_a
+    # We only need a reshape when we need to combine summed or non-summed dims
+    # or introduce a new dimension (expand_dims) when doing a non-scalar outer product (len(axes) = 0)
+    a_needs_reshape = (ndim_a != 0) and (
+        (len(non_summed_axes_a) > 1) or (len(axes_a) != 1)
+    )
 
-    notin = [k for k in range(ndim_b) if k not in axes_b]
-    newaxes_b = axes_b + notin
-    N2 = 1
-    for axis in axes_b:
-        N2 *= runtime_shape_b[axis]
-    newshape_b = (N2, -1)
-    oldb = [runtime_shape_b[axis] for axis in notin]
+    non_summed_axes_b = [k for k in range(ndim_b) if k not in axes_b]
+    non_summed_dims_b = [runtime_shape_b[axis] for axis in non_summed_axes_b]
+    transpose_axes_b = axes_b + non_summed_axes_b
+    b_needs_reshape = (ndim_b != 0) and (
+        (len(non_summed_axes_b) > 1) or (len(axes_b) != 1)
+    )
 
-    at = a.transpose(newaxes_a).reshape(newshape_a)
-    bt = b.transpose(newaxes_b).reshape(newshape_b)
-    res = _dot(at, bt)
-    return res.reshape(olda + oldb)
+    # summed_size_a and summed_size_b must be the same,
+    # but to facilitate reasoning about useless reshapes we compute both from their shapes
+    at = a.transpose(transpose_axes_a)
+    if a_needs_reshape:
+        non_summed_size_a = variadic_mul(*non_summed_dims_a)
+        summed_size_a = variadic_mul(*[runtime_shape_a[axis] for axis in axes_a])
+        at = at.reshape((non_summed_size_a, summed_size_a))
+
+    bt = b.transpose(transpose_axes_b)
+    if b_needs_reshape:
+        non_summed_size_b = variadic_mul(*non_summed_dims_b)
+        summed_size_b = variadic_mul(*[runtime_shape_b[axis] for axis in axes_b])
+        bt = bt.reshape((summed_size_b, non_summed_size_b))
+
+    res = dot(at, bt)
+
+    if a_needs_reshape or b_needs_reshape:
+        res = res.reshape(non_summed_dims_a + non_summed_dims_b)
+
+    return res
 
 
 def outer(x, y):
@@ -2244,8 +3456,8 @@ class All(FixedOpCAReduce):
         ret = super().make_node(input)
         return ret
 
-    def grad(self, inp, grads):
-        (x,) = inp
+    def pullback(self, inputs, outputs, output_grads):
+        (x,) = inputs
         return [x.zeros_like(config.floatX)]
 
     def clone(self, **kwargs):
@@ -2274,8 +3486,8 @@ class Any(FixedOpCAReduce):
         ret = super().make_node(input)
         return ret
 
-    def grad(self, inp, grads):
-        (x,) = inp
+    def pullback(self, inputs, outputs, output_grads):
+        (x,) = inputs
         return [x.zeros_like(config.floatX)]
 
     def clone(self, **kwargs):
@@ -2304,13 +3516,13 @@ class Sum(FixedOpCAReduce):
             upcast_discrete_output=True,
         )
 
-    def L_op(self, inp, out, grads):
-        (x,) = inp
+    def pullback(self, inputs, outputs, output_grads):
+        (x,) = inputs
 
-        if out[0].dtype not in continuous_dtypes:
+        if outputs[0].dtype not in continuous_dtypes:
             return [x.zeros_like(dtype=config.floatX)]
 
-        (gz,) = grads
+        (gz,) = output_grads
         gz = as_tensor_variable(gz)
         axis = self.axis
         if axis is None:
@@ -2328,11 +3540,11 @@ class Sum(FixedOpCAReduce):
         gx = Elemwise(ps.second)(x, gz.dimshuffle(new_dims))
         return [gx]
 
-    def R_op(self, inputs, eval_points):
+    def pushforward(self, inputs, outputs, eval_points):
         # There is just one element in inputs and eval_points, the axis are
         # part of self
-        if None in eval_points:
-            return [None]
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return [disconnected_type()]
         return self(*eval_points, return_list=True)
 
     def clone(self, **kwargs):
@@ -2395,7 +3607,7 @@ class Prod(FixedOpCAReduce):
         )
         self.no_zeros_in_input = no_zeros_in_input
 
-    def L_op(self, inp, out, grads):
+    def pullback(self, inp, out, grads):
         """
         The grad of this Op could be very easy, if it is was not for the case
         where zeros are present in a given "group" (ie. elements reduced
@@ -2611,7 +3823,7 @@ class ProdWithoutZeros(FixedOpCAReduce):
             upcast_discrete_output=True,
         )
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         from pytensor.gradient import grad_not_implemented
 
         (a,) = inp
@@ -2679,58 +3891,7 @@ def power(x, y):
     return x**y
 
 
-def logaddexp(*xs):
-    """Logarithm of the sum of exponentiations of the inputs.
-
-    See ``numpy.logaddexp``.
-
-    Parameters
-    ----------
-    xs : symbolic tensors
-        Input
-
-    Returns
-    -------
-    tensor
-
-    """
-
-    return log(add(*[exp(x) for x in xs]))
-
-
-def logsumexp(x, axis=None, keepdims=False):
-    """Compute the log of the sum of exponentials of input elements.
-
-    See ``scipy.special.logsumexp``.
-
-    Parameters
-    ----------
-    x : symbolic tensor
-        Input
-
-    axis : None or int or tuple of ints, optional
-        Axis or axes over which the sum is taken. By default axis is None,
-        and all elements are summed.
-
-    keepdims : bool, optional
-        If this is set to True, the axes which are reduced are left in the
-        result as dimensions with size one. With this option, the result will
-        broadcast correctly against the original array.
-
-    Returns
-    -------
-    tensor
-
-    """
-
-    return log(sum(exp(x), axis=axis, keepdims=keepdims))
-
-
-_matrix_matrix_matmul = Blockwise(
-    _dot,
-    signature="(m,k),(k,n)->(m,n)",
-    gufunc_spec=("numpy.matmul", 2, 1),
-)
+_matmul = Blockwise(_dot, name="Matmul")
 
 
 def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None):
@@ -2780,13 +3941,161 @@ def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None
     if x1.type.ndim == 0 or x2.type.ndim == 0:
         raise ValueError("matmul operand cannot be scalar")
     if x1.type.ndim == 1 and x2.type.ndim == 1:
-        out = _dot(x1, x2)
+        out = vecdot(x1, x2)
     elif x1.type.ndim == 1:
-        out = _matrix_matrix_matmul(x1[None], x2).squeeze(-2)
+        out = vecmat(x1, x2)
     elif x2.type.ndim == 1:
-        out = _matrix_matrix_matmul(x1, x2[:, None]).squeeze(-1)
+        out = matvec(x1, x2)
     else:
-        out = _matrix_matrix_matmul(x1, x2)
+        out = _matmul(x1, x2)
+
+    if dtype is not None:
+        out = out.astype(dtype)
+
+    return out
+
+
+def vecdot(
+    x1: TensorLike,
+    x2: TensorLike,
+    dtype: Optional["DTypeLike"] = None,
+) -> TensorVariable:
+    """Compute the vector dot product of two arrays.
+
+    Parameters
+    ----------
+    x1, x2
+        Input arrays with the same shape.
+    dtype
+        The desired data-type for the result. If not given, then the type will
+        be determined as the minimum type required to hold the objects in the
+        sequence.
+
+    Returns
+    -------
+    TensorVariable
+        The vector dot product of the inputs.
+
+    Notes
+    -----
+    This is equivalent to `numpy.vecdot` and computes the dot product of
+    vectors along the last axis of both inputs. Broadcasting is supported
+    across all other dimensions.
+
+    Examples
+    --------
+    >>> import pytensor.tensor as pt
+    >>> # Vector dot product with shape (5,) inputs
+    >>> x = pt.vector("x", shape=(5,))  # shape (5,)
+    >>> y = pt.vector("y", shape=(5,))  # shape (5,)
+    >>> z = pt.vecdot(x, y)  # scalar output
+    >>> # Equivalent to numpy.vecdot(x, y)
+    >>>
+    >>> # With batched inputs of shape (3, 5)
+    >>> x_batch = pt.matrix("x", shape=(3, 5))  # shape (3, 5)
+    >>> y_batch = pt.matrix("y", shape=(3, 5))  # shape (3, 5)
+    >>> z_batch = pt.vecdot(x_batch, y_batch)  # shape (3,)
+    >>> # Equivalent to numpy.vecdot(x_batch, y_batch)
+    """
+    out = matmul(x1[..., None, :], x2[..., :, None]).squeeze((-2, -1))
+
+    if dtype is not None:
+        out = out.astype(dtype)
+
+    return out
+
+
+def matvec(
+    x1: TensorLike, x2: TensorLike, dtype: Optional["DTypeLike"] = None
+) -> TensorVariable:
+    """Compute the matrix-vector product.
+
+    Parameters
+    ----------
+    x1
+        Input array for the matrix with shape (..., M, K).
+    x2
+        Input array for the vector with shape (..., K).
+    dtype
+        The desired data-type for the result. If not given, then the type will
+        be determined as the minimum type required to hold the objects in the
+        sequence.
+
+    Returns
+    -------
+    TensorVariable
+        The matrix-vector product with shape (..., M).
+
+    Notes
+    -----
+    This is equivalent to `numpy.matvec` and computes the matrix-vector product
+    with broadcasting over batch dimensions.
+
+    Examples
+    --------
+    >>> import pytensor.tensor as pt
+    >>> # Matrix-vector product
+    >>> A = pt.matrix("A", shape=(3, 4))  # shape (3, 4)
+    >>> v = pt.vector("v", shape=(4,))  # shape (4,)
+    >>> result = pt.matvec(A, v)  # shape (3,)
+    >>> # Equivalent to numpy.matvec(A, v)
+    >>>
+    >>> # Batched matrix-vector product
+    >>> batched_A = pt.tensor3("A", shape=(2, 3, 4))  # shape (2, 3, 4)
+    >>> batched_v = pt.matrix("v", shape=(2, 4))  # shape (2, 4)
+    >>> result = pt.matvec(batched_A, batched_v)  # shape (2, 3)
+    >>> # Equivalent to numpy.matvec(batched_A, batched_v)
+    """
+    out = matmul(x1, x2[..., None]).squeeze(-1)
+
+    if dtype is not None:
+        out = out.astype(dtype)
+
+    return out
+
+
+def vecmat(
+    x1: TensorLike, x2: TensorLike, dtype: Optional["DTypeLike"] = None
+) -> TensorVariable:
+    """Compute the vector-matrix product.
+
+    Parameters
+    ----------
+    x1
+        Input array for the vector with shape (..., K).
+    x2
+        Input array for the matrix with shape (..., K, N).
+    dtype
+        The desired data-type for the result. If not given, then the type will
+        be determined as the minimum type required to hold the objects in the
+        sequence.
+
+    Returns
+    -------
+    TensorVariable
+        The vector-matrix product with shape (..., N).
+
+    Notes
+    -----
+    This is equivalent to `numpy.vecmat` and computes the vector-matrix product
+    with broadcasting over batch dimensions.
+
+    Examples
+    --------
+    >>> import pytensor.tensor as pt
+    >>> # Vector-matrix product
+    >>> v = pt.vector("v", shape=(3,))
+    >>> A = pt.matrix("A", shape=(3, 4))
+    >>> result = pt.vecmat(v, A)  # shape (4,)
+    >>> # Equivalent to numpy.vecmat(v, A)
+    >>>
+    >>> # Batched vector-matrix product
+    >>> batched_v = pt.matrix("v", shape=(2, 3))
+    >>> batched_A = pt.tensor3("A", shape=(2, 3, 4))
+    >>> result = pt.vecmat(batched_v, batched_A)  # shape (2, 4)
+    >>> # Equivalent to numpy.vecmat(batched_v, batched_A)
+    """
+    out = matmul(x2.mT, x1[..., None]).squeeze(-1)
 
     if dtype is not None:
         out = out.astype(dtype)
@@ -2795,14 +4104,8 @@ def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None
 
 
 @_vectorize_node.register(Dot)
-def vectorize_node_dot_to_matmul(op, node, batched_x, batched_y):
-    old_x, old_y = node.inputs
-    if old_x.type.ndim == 2 and old_y.type.ndim == 2:
-        # If original input is equivalent to a matrix-matrix product,
-        # return specialized Matmul Op to avoid unnecessary new Ops.
-        return matmul(batched_x, batched_y).owner
-    else:
-        return vectorize_node_fallback(op, node, batched_x, batched_y)
+def vectorize_node_dot(op, node, batched_x, batched_y):
+    return matmul(batched_x, batched_y).owner
 
 
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
@@ -2877,150 +4180,154 @@ equal = eq
 not_equal = neq
 
 __all__ = [
-    "max_and_argmax",
-    "max",
-    "matmul",
-    "argmax",
-    "min",
-    "argmin",
-    "smallest",
-    "largest",
-    "lt",
-    "less",
-    "gt",
-    "greater",
-    "le",
-    "less_equal",
-    "ge",
-    "greater_equal",
-    "eq",
-    "equal",
-    "neq",
-    "not_equal",
-    "isnan",
-    "isinf",
-    "isposinf",
-    "isneginf",
-    "allclose",
-    "isclose",
-    "and_",
-    "bitwise_and",
-    "or_",
-    "bitwise_or",
-    "xor",
-    "bitwise_xor",
-    "invert",
-    "bitwise_not",
     "abs",
-    "exp",
-    "exp2",
-    "expm1",
-    "neg",
-    "reciprocal",
-    "log",
-    "log2",
-    "log10",
-    "log1p",
-    "sgn",
-    "sign",
-    "ceil",
-    "floor",
-    "trunc",
-    "iround",
-    "round",
-    "round_half_to_even",
-    "round_half_away_from_zero",
-    "sqr",
-    "square",
-    "cov",
-    "sqrt",
-    "deg2rad",
-    "rad2deg",
-    "cos",
+    "add",
+    "all",
+    "allclose",
+    "and_",
+    "angle",
+    "any",
     "arccos",
-    "sin",
+    "arccosh",
     "arcsin",
-    "tan",
+    "arcsinh",
     "arctan",
     "arctan2",
-    "cosh",
-    "arccosh",
-    "sinh",
-    "arcsinh",
-    "tanh",
     "arctanh",
+    "argmax",
+    "argmin",
+    "betainc",
+    "betaincinv",
+    "bitwise_and",
+    "bitwise_not",
+    "bitwise_or",
+    "bitwise_xor",
+    "ceil",
+    "ceil_intdiv",
+    "chi2sf",
+    "clip",
+    "complex",
+    "complex_from_polar",
+    "conj",
+    "conjugate",
+    "cos",
+    "cosh",
+    "cov",
+    "deg2rad",
+    "dense_dot",
+    "digamma",
+    "divmod",
+    "dot",
+    "eq",
+    "equal",
     "erf",
     "erfc",
+    "erfcinv",
     "erfcx",
     "erfinv",
-    "erfcinv",
-    "owens_t",
+    "exp",
+    "exp2",
+    "expit",
+    "expm1",
+    "floor",
+    "floor_div",
     "gamma",
-    "gammaln",
-    "psi",
-    "digamma",
-    "tri_gamma",
-    "polygamma",
-    "chi2sf",
     "gammainc",
     "gammaincc",
-    "gammau",
-    "gammal",
-    "gammaincinv",
     "gammainccinv",
+    "gammaincinv",
+    "gammal",
+    "gammaln",
+    "gammau",
+    "ge",
+    "greater",
+    "greater_equal",
+    "gt",
+    "hyp2f1",
+    "i0",
+    "i1",
+    "imag",
+    "int_div",
+    "invert",
+    "iround",
+    "isclose",
+    "isfinite",
+    "isinf",
+    "isnan",
+    "isneginf",
+    "isposinf",
+    "iv",
+    "ive",
     "j0",
     "j1",
     "jv",
-    "i0",
-    "i1",
-    "iv",
-    "ive",
+    "kn",
     "kv",
     "kve",
-    "sigmoid",
-    "expit",
-    "softplus",
-    "log1pexp",
+    "largest",
+    "le",
+    "less",
+    "less_equal",
+    "log",
     "log1mexp",
-    "betainc",
-    "betaincinv",
-    "real",
-    "imag",
-    "angle",
-    "complex",
-    "conj",
-    "conjugate",
-    "complex_from_polar",
-    "sum",
-    "prod",
+    "log1p",
+    "log1pexp",
+    "log2",
+    "log10",
+    "lt",
+    "matmul",
+    "matvec",
+    "max",
+    "max_and_argmax",
+    "maximum",
     "mean",
     "median",
-    "var",
-    "std",
-    "std",
-    "maximum",
+    "min",
     "minimum",
-    "divmod",
-    "add",
-    "sub",
-    "mul",
-    "true_div",
-    "int_div",
-    "floor_div",
-    "ceil_intdiv",
     "mod",
-    "pow",
-    "clip",
-    "dot",
-    "dense_dot",
-    "tensordot",
-    "outer",
-    "any",
-    "all",
-    "ptp",
-    "power",
-    "logaddexp",
-    "logsumexp",
-    "hyp2f1",
+    "mul",
     "nan_to_num",
+    "ndtri_exp",
+    "neg",
+    "neq",
+    "not_equal",
+    "or_",
+    "outer",
+    "owens_t",
+    "polygamma",
+    "pow",
+    "power",
+    "prod",
+    "psi",
+    "ptp",
+    "rad2deg",
+    "real",
+    "reciprocal",
+    "round",
+    "round_half_away_from_zero",
+    "round_half_to_even",
+    "sgn",
+    "sigmoid",
+    "sign",
+    "sin",
+    "sinh",
+    "smallest",
+    "softplus",
+    "sqr",
+    "sqrt",
+    "square",
+    "std",
+    "std",
+    "sub",
+    "sum",
+    "tan",
+    "tanh",
+    "tensordot",
+    "tri_gamma",
+    "true_div",
+    "trunc",
+    "var",
+    "vecdot",
+    "vecmat",
+    "xor",
 ]

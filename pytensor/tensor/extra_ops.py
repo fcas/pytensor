@@ -1,28 +1,29 @@
-import warnings
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
+from textwrap import dedent
 
 import numpy as np
-from numpy.core.multiarray import normalize_axis_index
+from numpy.lib.array_utils import normalize_axis_index
 
 import pytensor
 import pytensor.scalar.basic as ps
 from pytensor.gradient import (
-    DisconnectedType,
     _float_zeros_like,
     disconnected_type,
     grad_undefined,
 )
 from pytensor.graph.basic import Apply, Constant, Variable
 from pytensor.graph.op import Op
+from pytensor.graph.replace import _vectorize_node
 from pytensor.link.c.op import COp
 from pytensor.link.c.params_type import ParamsType
 from pytensor.link.c.type import EnumList, Generic
+from pytensor.npy_2_compat import old_np_unique
 from pytensor.raise_op import Assert
-from pytensor.scalar import int32 as int_t
+from pytensor.scalar import int64 as int_t
 from pytensor.scalar import upcast
 from pytensor.tensor import TensorLike, as_tensor_variable
 from pytensor.tensor import basic as ptb
-from pytensor.tensor.basic import alloc, second
+from pytensor.tensor.basic import alloc, join, second
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.math import abs as pt_abs
 from pytensor.tensor.math import all as pt_all
@@ -41,8 +42,9 @@ from pytensor.tensor.math import (
 from pytensor.tensor.math import max as pt_max
 from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.shape import Shape_i
-from pytensor.tensor.subtensor import advanced_inc_subtensor1, set_subtensor
-from pytensor.tensor.type import TensorType, dvector, int_dtypes, integer_dtypes, vector
+from pytensor.tensor.subtensor import advanced_inc_subtensor, set_subtensor
+from pytensor.tensor.type import TensorType, dvector, int_dtypes, integer_dtypes
+from pytensor.tensor.utils import normalize_reduce_axis
 from pytensor.tensor.variable import TensorVariable
 from pytensor.utils import LOCAL_BITWIDTH, PYTHON_INT_BITWIDTH
 
@@ -72,7 +74,7 @@ class CpuContiguous(COp):
         assert x.flags["C_CONTIGUOUS"]
         y[0] = x
 
-    def grad(self, inputs, dout):
+    def pullback(self, inputs, outputs, dout):
         return [ptb.as_tensor_variable(dout[0])]
 
     def c_code(self, node, name, inames, onames, sub):
@@ -147,7 +149,7 @@ class SearchsortedOp(COp):
                 raise TypeError("sorter must be an integer vector", sorter.type)
             return Apply(self, [x, v, sorter], [out_type()])
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         return [shapes[1]]
 
     def perform(self, node, inputs, output_storage):
@@ -206,10 +208,10 @@ class SearchsortedOp(COp):
     def c_code_cache_version(self):
         return (2,)
 
-    def grad(self, inputs, output_gradients):
+    def pullback(self, inputs, outputs, output_gradients):
         num_ins = len(inputs)
         if num_ins == 3:
-            x, v, sorter = inputs
+            x, v, _sorter = inputs
         else:
             x, v = inputs
 
@@ -287,29 +289,28 @@ class CumOp(COp):
     __props__ = ("axis", "mode")
     check_input = False
     params_type = ParamsType(
-        c_axis=int_t, mode=EnumList(("MODE_ADD", "add"), ("MODE_MUL", "mul"))
+        axis=int_t, mode=EnumList(("MODE_ADD", "add"), ("MODE_MUL", "mul"))
     )
 
-    def __init__(self, axis: int | None = None, mode="add"):
+    def __init__(self, axis: int, mode="add"):
         if mode not in ("add", "mul"):
             raise ValueError(f'{type(self).__name__}: Unknown mode "{mode}"')
-        if not (isinstance(axis, int) or axis is None):
-            raise TypeError("axis must be an integer or None.")
+        if not isinstance(axis, int):
+            raise TypeError(f"axis must be an integer, got {axis} of type {type(axis)}")
+        if axis < 0:
+            raise ValueError(f"axis must be non-negative, got {axis}")
         self.axis = axis
         self.mode = mode
 
-    c_axis = property(lambda self: np.MAXDIMS if self.axis is None else self.axis)
-
     def make_node(self, x):
         x = ptb.as_tensor_variable(x)
-        out_type = x.type()
 
-        if self.axis is None:
-            out_type = vector(dtype=x.dtype)  # Flatten
-        elif self.axis >= x.ndim or self.axis < -x.ndim:
-            raise ValueError(f"axis(={self.axis}) out of bounds")
+        if self.axis >= x.type.ndim:
+            raise ValueError(
+                f"axis(={self.axis}) out of bounds for variable {x} with {x.type.ndim} ndims"
+            )
 
-        return Apply(self, [x], [out_type])
+        return Apply(self, [x], [x.type()])
 
     def perform(self, node, inputs, output_storage):
         x = inputs[0]
@@ -319,20 +320,9 @@ class CumOp(COp):
         else:
             z[0] = np.cumprod(x, axis=self.axis)
 
-    def grad(self, inputs, output_gradients):
+    def pullback(self, inputs, outputs, output_gradients):
         (x,) = inputs
         (gi,) = output_gradients
-
-        if self.axis is None:
-            if self.mode == "add":
-                return [cumsum(gi[::-1])[::-1].reshape(x.shape)]
-            elif self.mode == "mul":
-                fx = cumprod(x, axis=self.axis)
-                return [cumsum((fx * gi)[::-1])[::-1].reshape(x.shape) / x]
-            else:
-                raise NotImplementedError(
-                    f'{type(self).__name__}: unknown gradient for mode "{self.mode}"'
-                )
 
         reverse_slicing = [slice(None, None, None)] * gi.ndim
         reverse_slicing[self.axis] = slice(None, None, -1)
@@ -349,10 +339,7 @@ class CumOp(COp):
                 f'{type(self).__name__}: unknown gradient for mode "{self.mode}"'
             )
 
-    def infer_shape(self, fgraph, node, shapes):
-        if self.axis is None:
-            return [(prod(shapes[0]),)]  # Flatten
-
+    def infer_shape(self, node, shapes):
         return shapes
 
     def c_code(self, node, name, inames, onames, sub):
@@ -361,51 +348,43 @@ class CumOp(COp):
         fail = sub["fail"]
         params = sub["params"]
 
-        code = f"""
-                int axis = {params}->c_axis;
-                if (axis == 0 && PyArray_NDIM({x}) == 1)
-                    axis = NPY_MAXDIMS;
-                npy_intp shape[1] = {{ PyArray_SIZE({x}) }};
-                if(axis == NPY_MAXDIMS && !({z} && PyArray_DIMS({z})[0] == shape[0]))
-                {{
-                    Py_XDECREF({z});
-                    {z} = (PyArrayObject*) PyArray_SimpleNew(1, shape, PyArray_TYPE((PyArrayObject*) py_{x}));
-                }}
+        return dedent(
+            f"""
+            int axis = {params}->axis;
 
-                else if(axis != NPY_MAXDIMS && !({z} && PyArray_CompareLists(PyArray_DIMS({z}), PyArray_DIMS({x}), PyArray_NDIM({x}))))
-                {{
-                    Py_XDECREF({z});
-                    {z} = (PyArrayObject*) PyArray_SimpleNew(PyArray_NDIM({x}), PyArray_DIMS({x}), PyArray_TYPE({x}));
-                }}
+            if (!({z} && PyArray_CompareLists(PyArray_DIMS({z}), PyArray_DIMS({x}), PyArray_NDIM({x}))))
+            {{
+                Py_XDECREF({z});
+                {z} = (PyArrayObject*) PyArray_SimpleNew(PyArray_NDIM({x}), PyArray_DIMS({x}), PyArray_TYPE({x}));
+                if (!{z}){{ {fail} }};
+            }}
 
-                if (!{z})
+            {{
+
+                PyObject * t = NULL;
+                if({params}->mode == MODE_ADD)
+                    t = PyArray_CumSum({x}, axis, PyArray_TYPE({x}), {z});
+                else if({params}->mode == MODE_MUL)
+                    t = PyArray_CumProd({x}, axis, PyArray_TYPE({x}), {z});
+
+                if (!t){{
                     {fail};
-                {{
-
-                    PyObject * t = NULL;
-                    if({params}->mode == MODE_ADD)
-                        t = PyArray_CumSum(
-                            {x}, axis,
-                            PyArray_TYPE({x}), {z});
-                    else if({params}->mode == MODE_MUL)
-                        t = PyArray_CumProd(
-                            {x}, axis,
-                            PyArray_TYPE({x}), {z});
-
-                    if (!t){{
-                       {fail};
-                    }}
-                    // Because PyArray_CumSum/CumProd returns a newly created reference on t.
-                    Py_XDECREF(t);
                 }}
-            """
 
-        return code
+                // Because PyArray_CumSum/CumProd returns a newly created reference on t.
+                Py_XDECREF(t);
+            }}
+            """
+        )
 
     def c_code_cache_version(self):
-        return (8,)
+        return (11,)
 
     def __str__(self):
+        if self.mode == "add":
+            return f"Cumsum{{axis={self.axis}}}"
+        elif self.mode == "mul":
+            return f"Cumprod{{axis={self.axis}}}"
         return f"{self.__class__.__name__}{{{self.axis}, {self.mode}}}"
 
 
@@ -426,6 +405,12 @@ def cumsum(x, axis=None):
     .. versionadded:: 0.7
 
     """
+    x = ptb.as_tensor_variable(x)
+    if axis is None:
+        x = x.ravel()
+        axis = 0
+    else:
+        axis = normalize_axis_index(axis, x.ndim)
     return CumOp(axis=axis, mode="add")(x)
 
 
@@ -446,25 +431,22 @@ def cumprod(x, axis=None):
     .. versionadded:: 0.7
 
     """
+    x = ptb.as_tensor_variable(x)
+    if axis is None:
+        x = x.ravel()
+        axis = 0
+    else:
+        axis = normalize_axis_index(axis, x.ndim)
     return CumOp(axis=axis, mode="mul")(x)
 
 
-class CumsumOp(Op):
-    __props__ = ("axis",)
-
-    def __new__(typ, *args, **kwargs):
-        obj = object.__new__(CumOp, *args, **kwargs)
-        obj.mode = "add"
-        return obj
-
-
-class CumprodOp(Op):
-    __props__ = ("axis",)
-
-    def __new__(typ, *args, **kwargs):
-        obj = object.__new__(CumOp, *args, **kwargs)
-        obj.mode = "mul"
-        return obj
+@_vectorize_node.register(CumOp)
+def vectorize_cum_op(op: CumOp, node: Apply, batch_x):
+    """Vectorize the CumOp to work on a batch of inputs."""
+    [original_x] = node.inputs
+    batch_ndim = batch_x.ndim - original_x.ndim
+    # op.axis is already normalized and non-negative
+    return type(op)(axis=op.axis + batch_ndim, mode=op.mode).make_node(batch_x)
 
 
 def diff(x, n=1, axis=-1):
@@ -546,10 +528,10 @@ def bincount(x, weights=None, minlength=None, assert_nonneg=False):
     # since out[x] raises an exception if the indices (x) are int8.
     if weights is None:
         out = ptb.zeros([max_value], dtype=x.dtype)
-        out = advanced_inc_subtensor1(out, 1, x)
+        out = advanced_inc_subtensor(out, 1, x)
     else:
         out = ptb.zeros([max_value], dtype=weights.dtype)
-        out = advanced_inc_subtensor1(out, weights, x)
+        out = advanced_inc_subtensor(out, weights, x)
     return out
 
 
@@ -594,11 +576,7 @@ def squeeze(x, axis=None):
     elif not isinstance(axis, Collection):
         axis = (axis,)
 
-    # scalar inputs are treated as 1D regarding axis in this `Op`
-    try:
-        axis = np.core.numeric.normalize_axis_tuple(axis, ndim=max(1, _x.ndim))
-    except np.AxisError:
-        raise np.AxisError(axis, ndim=_x.ndim)
+    axis = normalize_reduce_axis(axis, ndim=_x.ndim)
 
     if not axis:
         # Nothing to do
@@ -646,187 +624,210 @@ class Repeat(Op):
 
     __props__ = ("axis",)
 
-    def __init__(self, axis=None):
+    def __init__(self, axis: int):
+        if isinstance(axis, int):
+            if axis < 0:
+                raise ValueError(
+                    f"Repeat Op only accepts positive integer axis, got {axis}. "
+                    "Use the helper `pt.repeat` to handle negative axis."
+                )
+        elif axis is None:
+            raise ValueError(
+                "Repeat Op only accepts positive integer axis. "
+                "Use the helper `pt.repeat` to handle axis=None."
+            )
+        else:
+            raise TypeError(
+                f"Invalid type for axis {axis}, expected int got {type(axis)}"
+            )
+
         self.axis = axis
 
     def make_node(self, x, repeats):
         x = ptb.as_tensor_variable(x)
-        repeats = ptb.as_tensor_variable(repeats)
+        repeats = ptb.as_tensor_variable(repeats, dtype="int64")
 
-        if repeats.dtype not in integer_dtypes:
-            raise TypeError("repeats.dtype must be an integer.")
+        if repeats.type.ndim != 1:
+            if repeats.type.ndim == 0:
+                raise ValueError(
+                    f"repeats {repeats} must have 1 dimension, got 0. Use the helper `pt.repeat` to handle scalar repeats."
+                )
+            else:
+                raise ValueError(
+                    f"repeats {repeats} must have 1 dimension, got {repeats.type.ndim}"
+                )
+
+        if repeats.type.dtype not in integer_dtypes:
+            raise TypeError(
+                f"repeats {repeats} dtype must be an integer, got {repeats.type.dtype}."
+            )
 
         # Some dtypes are not supported by numpy's implementation of repeat.
         # Until another one is available, we should fail at graph construction
         # time, not wait for execution.
-        ptr_bitwidth = LOCAL_BITWIDTH
-        if ptr_bitwidth == 64:
-            numpy_unsupported_dtypes = ("uint64",)
-        if ptr_bitwidth == 32:
-            numpy_unsupported_dtypes = ("uint32", "int64", "uint64")
-
-        if repeats.dtype in numpy_unsupported_dtypes:
+        numpy_unsupported_dtypes = (
+            ("uint64",) if LOCAL_BITWIDTH == 64 else ("uint64", "uint32", "int64")
+        )
+        if repeats.type.dtype in numpy_unsupported_dtypes:
             raise TypeError(
-                (
-                    f"dtypes {numpy_unsupported_dtypes!s} are not supported by numpy.repeat "
-                    "for the 'repeats' parameter, "
-                ),
-                repeats.dtype,
+                f"repeats {repeats} dtype {repeats.type.dtype} are not supported by numpy.repeat"
             )
 
-        if self.axis is None:
-            out_shape = [None]
-        else:
+        shape = list(x.type.shape)
+        axis_input_dim_length = shape[self.axis]
+        axis_output_dim_length = None
+
+        if axis_input_dim_length is not None:
+            # If we have a static dim and constant repeats we can infer the length of the output dim
+            # Right now we only support homogenous constant repeats
             try:
                 const_reps = ptb.get_underlying_scalar_constant_value(repeats)
             except NotScalarConstantError:
-                const_reps = None
-            if const_reps == 1:
-                out_shape = x.type.shape
+                pass
             else:
-                out_shape = list(x.type.shape)
-                out_shape[self.axis] = None
+                axis_output_dim_length = int(const_reps * axis_input_dim_length)
 
-        out_type = TensorType(
-            x.dtype, shape=tuple(1 if s == 1 else None for s in out_shape)
-        )
+        shape[self.axis] = axis_output_dim_length
 
+        out_type = TensorType(x.dtype, shape=shape)
         return Apply(self, [x, repeats], [out_type()])
 
     def perform(self, node, inputs, output_storage):
-        x = inputs[0]
-        repeats = inputs[1]
-        z = output_storage[0]
-        z[0] = np.repeat(x, repeats=repeats, axis=self.axis)
+        [x, repeats] = inputs
+        output_storage[0][0] = np.repeat(x, repeats=repeats, axis=self.axis)
 
     def connection_pattern(self, node):
         return [[True], [False]]
 
-    def grad(self, inputs, gout):
+    def pullback(self, inputs, outputs, gout):
         (x, repeats) = inputs
         (gz,) = gout
-        if repeats.ndim == 0:
-            if self.axis is None:
-                axis = x.ndim
-            else:
-                if self.axis >= 0:
-                    axis = self.axis + 1
-                else:
-                    axis = self.axis + x.ndim + 1
+        axis = self.axis
 
-            shape = [x.shape[k] for k in range(x.ndim)]
-            shape.insert(axis, repeats)
+        # Use IncSubtensor to sum the gradients that belong to the repeated entries of x
+        axis_size = x.shape[axis]
+        repeated_arange = repeat(ptb.arange(axis_size), repeats, axis=0)
 
-            return [
-                gz.reshape(shape, ndim=x.ndim + 1).sum(axis=axis),
-                DisconnectedType()(),
-            ]
-        elif repeats.ndim == 1:
-            # For this implementation, we would need to specify the length
-            # of repeats in order to split gz in the right way to sum
-            # the good part.
-            raise NotImplementedError()
-        else:
-            raise ValueError()
+        # Move the axis to repeat to front for easier indexing
+        x_transpose = ptb.moveaxis(x, axis, 0)
+        gz_transpose = ptb.moveaxis(gz, axis, 0)
+        gx_transpose = ptb.zeros_like(x_transpose)[repeated_arange].inc(gz_transpose)
+        gx = ptb.moveaxis(gx_transpose, 0, axis)
 
-    def infer_shape(self, fgraph, node, ins_shapes):
+        return [gx, disconnected_type()]
+
+    def infer_shape(self, node, ins_shapes):
         i0_shapes = ins_shapes[0]
         repeats = node.inputs[1]
         out_shape = list(i0_shapes)
+        axis = self.axis
 
         # uint64 shape are not supported.
         dtype = None
         if repeats.dtype in ("uint8", "uint16", "uint32"):
             dtype = "int64"
-        if self.axis is None:
-            if repeats.ndim == 0:
-                if len(i0_shapes) == 0:
-                    out_shape = [repeats]
-                else:
-                    res = 1
-                    for d in i0_shapes:
-                        res = res * d
-                    out_shape = (res * repeats,)
-            else:
-                out_shape = [pt_sum(repeats, dtype=dtype)]
-        else:
-            if repeats.ndim == 0:
-                out_shape[self.axis] = out_shape[self.axis] * repeats
-            else:
-                out_shape[self.axis] = pt_sum(repeats, dtype=dtype)
+
+        out_shape[axis] = pt_sum(repeats, dtype=dtype)
         return [out_shape]
 
 
-def repeat(x, repeats, axis=None):
-    """Repeat elements of an array.
+def repeat(
+    a: TensorLike, repeats: TensorLike, axis: int or None = None
+) -> TensorVariable:
+    """Repeat elements of a tensor.
 
-    It returns an array which has the same shape as `x`, except along the given
-    `axis`. The `axis` parameter is used to specify the axis along which values
-    are repeated. By default, a flattened version of `x` is used.
+    See :func:`numpy.repeat` for more information.
 
-    The number of repetitions for each element is `repeats`.  `repeats` is
-    broadcasted to fit the length of the given `axis`.
 
     Parameters
     ----------
-    x
-        Input data, tensor variable.
-    repeats
-        int, scalar or tensor variable
+    a: tensor_like
+        Input tensor
+    repeats: tensor_like
+        The number of repetitions for each element. repeats is broadcasted to fit the shape of the given axis.
     axis : int, optional
+        The axis along which to repeat values. By default, use the flattened input array, and return a flat output array.
 
-    See Also
+    Returns
+    -------
+    repeated_tensor: TensorVariable
+        Output tensor which as the same shape as a, except along the given axis
+
+    Examples
     --------
-    tensor.tile
+
+    .. testcode::
+
+        import pytensor.tensor as pt
+
+        a = pt.arange(4).reshape((2, 2))
+        out = pt.repeat(a, repeats=[2, 3], axis=0)
+        print(out.eval())
+
+    .. testoutput::
+
+        [[0 1]
+         [0 1]
+         [2 3]
+         [2 3]
+         [2 3]]
+
+    When axis is None, the array is first flattened and then repeated
+
+    .. testcode::
+
+        import pytensor.tensor as pt
+
+        a = pt.arange(4).reshape((2, 2))
+        out = pt.repeat(a, repeats=[2, 3, 0, 1], axis=None)
+        print(out.eval())
+
+    .. testoutput::
+
+        [0 0 1 1 1 3]
+
 
     .. versionadded:: 0.6
 
     """
+    a = ptb.as_tensor_variable(a)
+
+    if axis is None:
+        axis = 0
+        a = a.flatten()
+    else:
+        axis = normalize_axis_index(axis, a.ndim)
+
     repeats = ptb.as_tensor_variable(repeats, dtype=np.int64)
 
     if repeats.ndim > 1:
         raise ValueError("The dimension of repeats should not exceed 1.")
 
-    if repeats.ndim == 1 and not repeats.broadcastable[0]:
-        return Repeat(axis=axis)(x, repeats)
-    else:
-        if repeats.ndim == 1:
-            repeats = repeats[0]
+    if repeats.type.broadcastable == (True,):
+        # This behaves the same as scalar repeat
+        repeats = repeats.squeeze()
 
-        if x.dtype == "uint64":
+    if repeats.ndim == 1:
+        # We only use the Repeat Op for vector repeats
+        return Repeat(axis=axis)(a, repeats)
+    else:
+        if a.dtype == "uint64":
+            # Multiplying int64 (shape) by uint64 (repeats) yields a float64
+            # Which is not valid for the `reshape` operation at the end
             raise TypeError("repeat doesn't support dtype uint64")
 
-        if axis is None:
-            axis = 0
-            x = x.flatten()
-        else:
-            if axis >= x.ndim:
-                raise ValueError("Axis should not exceed x.ndim-1.")
-            if axis < 0:
-                axis = x.ndim + axis
+        # Scalar repeat, we implement this with canonical Ops broadcast + reshape
+        a_shape = a.shape
 
-        shape = [x.shape[i] for i in range(x.ndim)]
+        # Replicate a along a new axis (axis+1) repeats times
+        broadcast_shape = list(a_shape)
+        broadcast_shape.insert(axis + 1, repeats)
+        broadcast_a = broadcast_to(ptb.expand_dims(a, axis + 1), broadcast_shape)
 
-        # shape_ is the shape of the intermediate tensor which has
-        # an additional dimension comparing to x. We use alloc to
-        # allocate space for this intermediate tensor to replicate x
-        # along that additional dimension.
-        shape_ = shape[:]
-        shape_.insert(axis + 1, repeats)
-
-        # shape is now the shape of output, where shape[axis] becomes
-        # shape[axis]*repeats.
-        shape[axis] = shape[axis] * repeats
-
-        # dims_ is the dimension of that intermediate tensor.
-        dims_ = list(np.arange(x.ndim))
-        dims_.insert(axis + 1, "x")
-
-        # After the original tensor is duplicated along the additional
-        # dimension, we reshape it to the expected output shape, and
-        # return the output z.
-        z = ptb.alloc(x.dimshuffle(*dims_), *shape_).reshape(shape)
-        return z
+        # Reshape broadcast_a to the final shape, merging axis and axis+1
+        repeat_shape = list(a_shape)
+        repeat_shape[axis] = repeat_shape[axis] * repeats
+        return broadcast_a.reshape(repeat_shape)
 
 
 class Bartlett(Op):
@@ -847,12 +848,12 @@ class Bartlett(Op):
         (out,) = out_
         out[0] = np.bartlett(M)
 
-    def infer_shape(self, fgraph, node, in_shapes):
+    def infer_shape(self, node, in_shapes):
         temp = node.inputs[0]
         M = ptb.switch(lt(temp, 0), ptb.cast(0, temp.dtype), temp)
         return [[M]]
 
-    def grad(self, inputs, output_grads):
+    def pullback(self, inputs, outputs, output_grads):
         return [None for i in inputs]
 
 
@@ -890,7 +891,7 @@ class FillDiagonal(Op):
     # See function fill_diagonal for docstring
     __props__ = ()
 
-    def infer_shape(self, fgraph, node, in_shapes):
+    def infer_shape(self, node, in_shapes):
         return [in_shapes[0]]
 
     def make_node(self, a, val):
@@ -929,14 +930,14 @@ class FillDiagonal(Op):
 
         output_storage[0][0] = a
 
-    def grad(self, inp, cost_grad):
+    def pullback(self, inp, outputs, cost_grad):
         """
         Notes
         -----
         The gradient is currently implemented for matrices only.
 
         """
-        a, val = inp
+        a, _val = inp
         grad = cost_grad[0]
         if a.dtype.startswith("complex"):
             return [None, None]
@@ -991,7 +992,7 @@ class FillDiagonalOffset(Op):
     # See function fill_diagonal_offset for docstring
     __props__ = ()
 
-    def infer_shape(self, fgraph, node, in_shapes):
+    def infer_shape(self, node, in_shapes):
         return [in_shapes[0]]
 
     def make_node(self, a, val, offset):
@@ -1056,18 +1057,18 @@ class FillDiagonalOffset(Op):
 
         output_storage[0][0] = a
 
-    def grad(self, inp, cost_grad):
+    def pullback(self, inp, outputs, cost_grad):
         """
         Notes
         -----
         The gradient is currently implemented for matrices only.
         """
-        a, val, offset = inp
+        a, _val, offset = inp
         grad = cost_grad[0]
         height, width = grad.shape
 
         if a.dtype.startswith("complex"):
-            return [None, None]
+            return [None, None, None]
 
         # only valid for matrices
         wr_a = fill_diagonal_offset(grad, 0, offset)
@@ -1163,6 +1164,9 @@ class Unique(Op):
     """
     Wraps `numpy.unique`.
 
+    The indices returned when `return_inverse` is True are ravelled
+    to match the behavior of `numpy.unique` from before numpy version 2.0.
+
     Examples
     --------
     >>> import numpy as np
@@ -1208,17 +1212,21 @@ class Unique(Op):
 
         outputs = [TensorType(dtype=x.dtype, shape=out_shape)()]
         typ = TensorType(dtype="int64", shape=(None,))
+
         if self.return_index:
             outputs.append(typ())
+
         if self.return_inverse:
             outputs.append(typ())
+
         if self.return_counts:
             outputs.append(typ())
+
         return Apply(self, [x], outputs)
 
     def perform(self, node, inputs, output_storage):
         [x] = inputs
-        outs = np.unique(
+        outs = old_np_unique(
             x,
             return_index=self.return_index,
             return_inverse=self.return_inverse,
@@ -1231,7 +1239,7 @@ class Unique(Op):
         else:
             output_storage[0][0] = outs
 
-    def infer_shape(self, fgraph, node, i0_shapes):
+    def infer_shape(self, node, i0_shapes):
         [x_shape] = i0_shapes
         shape0_op = Shape_i(0)
         out_shapes = [(shape0_op(out),) for out in node.outputs]
@@ -1243,9 +1251,14 @@ class Unique(Op):
             out_shapes[0] = tuple(shape)
 
         if self.return_inverse:
-            shape = prod(x_shape) if self.axis is None else x_shape[axis]
             return_index_out_idx = 2 if self.return_index else 1
-            out_shapes[return_index_out_idx] = (shape,)
+
+            if self.axis is not None:
+                shape = (x_shape[axis],)
+            else:
+                shape = (prod(x_shape),)
+
+            out_shapes[return_index_out_idx] = shape
 
         return out_shapes
 
@@ -1289,16 +1302,14 @@ class UnravelIndex(Op):
         if dims.ndim != 1:
             raise TypeError("dims must be a 1D array")
 
+        out_type = indices.type.clone(dtype="int64")
         return Apply(
             self,
             [indices, dims],
-            [
-                TensorType(dtype="int64", shape=(None,) * indices.type.ndim)()
-                for i in range(ptb.get_vector_length(dims))
-            ],
+            [out_type() for _i in range(ptb.get_vector_length(dims))],
         )
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         return [input_shapes[0]] * len(node.outputs)
 
     def perform(self, node, inp, out):
@@ -1358,8 +1369,7 @@ class RavelMultiIndex(Op):
         self.order = order
 
     def make_node(self, *inp):
-        multi_index = [ptb.as_tensor_variable(i) for i in inp[:-1]]
-        dims = ptb.as_tensor_variable(inp[-1])
+        *multi_index, dims = map(ptb.as_tensor_variable, inp)
 
         for i in multi_index:
             if i.dtype not in int_dtypes:
@@ -1369,19 +1379,20 @@ class RavelMultiIndex(Op):
         if dims.ndim != 1:
             raise TypeError("dims must be a 1D array")
 
+        out_type = multi_index[0].type.clone(dtype="int64")
         return Apply(
             self,
             [*multi_index, dims],
-            [TensorType(dtype="int64", shape=(None,) * multi_index[0].type.ndim)()],
+            [out_type()],
         )
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         return [input_shapes[0]]
 
     def perform(self, node, inp, out):
-        multi_index, dims = inp[:-1], inp[-1]
+        *multi_index, dims = inp
         res = np.ravel_multi_index(multi_index, dims, mode=self.mode, order=self.order)
-        out[0][0] = np.asarray(res, node.outputs[0].dtype)
+        out[0][0] = np.asarray(res, "int64")
 
 
 def ravel_multi_index(multi_index, dims, mode="raise", order="C"):
@@ -1488,7 +1499,7 @@ def broadcast_shape_iter(
             (one,) * (max_dims - len(a))
             + tuple(
                 one
-                if sh == 1 or isinstance(sh, Constant) and sh.value == 1
+                if sh == 1 or (isinstance(sh, Constant) and sh.value == 1)
                 else (ps.as_scalar(sh) if not isinstance(sh, Variable) else sh)
                 for sh in a
             )
@@ -1522,14 +1533,17 @@ def broadcast_shape_iter(
             # Only one shape might not be broadcastable in this dimension
             result_dims.extend(non_bcast_shapes)
         else:
-            # More than one shape might not be broadcastable in this dimension
-            nonconst_nb_shapes: set[int] = set()
-            const_nb_shapes: set[Variable] = set()
+            # More than one shape might not be broadcastable in this dimension.
+            # ``nonconst_nb_shapes`` is a dict (used as ordered set) so iteration
+            # order is deterministic across processes — set iteration is
+            # hash-randomized and would yield non-deterministic graphs.
+            const_nb_shapes: set[int] = set()
+            nonconst_nb_shapes: dict[Variable, None] = {}
             for shape in non_bcast_shapes:
                 if isinstance(shape, Constant):
                     const_nb_shapes.add(shape.value.item())
                 else:
-                    nonconst_nb_shapes.add(shape)
+                    nonconst_nb_shapes[shape] = None
 
             if len(const_nb_shapes) > 1:
                 raise ValueError(
@@ -1538,7 +1552,7 @@ def broadcast_shape_iter(
 
             if len(const_nb_shapes) == 1:
                 (first_length,) = const_nb_shapes
-                other_lengths = nonconst_nb_shapes
+                other_lengths = list(nonconst_nb_shapes)
                 first_length = ps.as_scalar(first_length)
             else:
                 first_length, *other_lengths = nonconst_nb_shapes
@@ -1569,23 +1583,6 @@ def broadcast_shape_iter(
                 result_dims.append(_runtime_broadcast_assert(result_dim, condition))
 
     return tuple(result_dims)
-
-
-def _check_deprecated_inputs(stop, end, num, steps):
-    if end is not None:
-        warnings.warn(
-            "The 'end' parameter is deprecated and will be removed in a future version. Use 'stop' instead.",
-            DeprecationWarning,
-        )
-        stop = end
-    if steps is not None:
-        warnings.warn(
-            "The 'steps' parameter is deprecated and will be removed in a future version. Use 'num' instead.",
-            DeprecationWarning,
-        )
-        num = steps
-
-    return stop, num
 
 
 def _linspace_core(
@@ -1658,8 +1655,6 @@ def linspace(
     retstep: bool = False,
     dtype: str | None = None,
     axis: int = 0,
-    end: TensorLike | None = None,
-    steps: TensorLike | None = None,
 ) -> TensorVariable | tuple[TensorVariable, TensorVariable]:
     """
     Return evenly spaced numbers over a specified interval.
@@ -1694,19 +1689,6 @@ def linspace(
         Axis along which to generate samples. Ignored if both `start` and `end` have dimension 0. By default, axis=0
         will insert the samples on a new left-most dimension. To insert samples on a right-most dimension, use axis=-1.
 
-    end:  int, float or TensorVariable
-        .. warning::
-            The "end" parameter is deprecated and will be removed in a future version. Use "stop" instead.
-        The end value of the sequence, unless `endpoint` is set to False.
-        In that case, the sequence consists of all but the last of `num + 1` evenly spaced samples, such that `end` is
-        excluded.
-
-    steps: float, int, or TensorVariable
-        .. warning::
-            The "steps" parameter is deprecated and will be removed in a future version. Use "num" instead.
-
-        Number of samples to generate. Must be non-negative
-
     Returns
     -------
     samples: TensorVariable
@@ -1717,7 +1699,6 @@ def linspace(
     """
     if dtype is None:
         dtype = pytensor.config.floatX
-    end, num = _check_deprecated_inputs(stop, end, num, steps)
     start, stop = broadcast_arrays(start, stop)
 
     ls = _linspace_core(
@@ -1728,6 +1709,10 @@ def linspace(
         retstep=retstep,
         axis=axis,
     )
+
+    if retstep:
+        samples, step = ls
+        return samples.astype(dtype), step
 
     return ls.astype(dtype)
 
@@ -1740,8 +1725,6 @@ def geomspace(
     endpoint: bool = True,
     dtype: str | None = None,
     axis: int = 0,
-    end: TensorLike | None = None,
-    steps: TensorLike | None = None,
 ) -> TensorVariable:
     """
     Return numbers spaced evenly on a log scale (a geometric progression).
@@ -1781,19 +1764,6 @@ def geomspace(
         Axis along which to generate samples. Ignored if both `start` and `end` have dimension 0. By default, axis=0
         will insert the samples on a new left-most dimension. To insert samples on a right-most dimension, use axis=-1.
 
-    end:  int, float or TensorVariable
-        .. warning::
-            The "end" parameter is deprecated and will be removed in a future version. Use "stop" instead.
-        The end value of the sequence, unless `endpoint` is set to False.
-        In that case, the sequence consists of all but the last of `num + 1` evenly spaced samples, such that `end` is
-        excluded.
-
-    steps: float, int, or TensorVariable
-        .. warning::
-            The "steps" parameter is deprecated and will be removed in a future version. Use "num" instead.
-
-        Number of samples to generate. Must be non-negative
-
     Returns
     -------
     samples: TensorVariable
@@ -1802,7 +1772,6 @@ def geomspace(
     """
     if dtype is None:
         dtype = pytensor.config.floatX
-    stop, num = _check_deprecated_inputs(stop, end, num, steps)
     start, stop = broadcast_arrays(start, stop)
     start, stop, base = _broadcast_base_with_inputs(start, stop, base, axis)
 
@@ -1841,8 +1810,6 @@ def logspace(
     endpoint: bool = True,
     dtype: str | None = None,
     axis: int = 0,
-    end: TensorLike | None = None,
-    steps: TensorLike | None = None,
 ) -> TensorVariable:
     """
     Return numbers spaced evenly on a log scale.
@@ -1877,18 +1844,6 @@ def logspace(
         Axis along which to generate samples. Ignored if both `start` and `end` have dimension 0. By default, axis=0
         will insert the samples on a new left-most dimension. To insert samples on a right-most dimension, use axis=-1.
 
-    end:  int float or TensorVariable
-        .. warning::
-            The "end" parameter is deprecated and will be removed in a future version. Use "stop" instead.
-        The end value of the sequence, unless `endpoint` is set to False.
-        In that case, the sequence consists of all but the last of `num + 1` evenly spaced samples, such that `end` is
-        excluded.
-
-    steps: int or TensorVariable
-        .. warning::
-            The "steps" parameter is deprecated and will be removed in a future version. Use "num" instead.
-        Number of samples to generate. Must be non-negative
-
     Returns
     -------
     samples: TensorVariable
@@ -1897,7 +1852,6 @@ def logspace(
     """
     if dtype is None:
         dtype = pytensor.config.floatX
-    stop, num = _check_deprecated_inputs(stop, end, num, steps)
     start, stop = broadcast_arrays(start, stop)
     start, stop, base = _broadcast_base_with_inputs(start, stop, base, axis)
 
@@ -1914,7 +1868,7 @@ def logspace(
 
 
 def broadcast_to(
-    x: TensorVariable, shape: TensorVariable | tuple[Variable, ...]
+    x: TensorLike, shape: TensorLike | Sequence[TensorLike]
 ) -> TensorVariable:
     """Broadcast an array to a new shape.
 
@@ -1960,25 +1914,62 @@ def broadcast_arrays(*args: TensorVariable) -> tuple[TensorVariable, ...]:
     return brodacasted_vars
 
 
+def concat_with_broadcast(tensor_list, axis=0):
+    """
+    Concatenate a list of tensors, broadcasting the non-concatenated dimensions to align.
+    """
+    if not tensor_list:
+        raise ValueError("Cannot concatenate an empty list of tensors.")
+
+    ndim = tensor_list[0].ndim
+    if not all(t.ndim == ndim for t in tensor_list):
+        raise TypeError(
+            "Only tensors with the same number of dimensions can be concatenated. "
+            f"Input ndims were: {[x.ndim for x in tensor_list]}"
+        )
+
+    axis = normalize_axis_index(axis=axis, ndim=ndim)
+    non_concat_shape = [1 if i != axis else None for i in range(ndim)]
+
+    for tensor_inp in tensor_list:
+        for i, (bcast, sh) in enumerate(
+            zip(tensor_inp.type.broadcastable, tensor_inp.shape)
+        ):
+            if bcast or i == axis:
+                continue
+            non_concat_shape[i] = sh
+
+    assert non_concat_shape.count(None) == 1
+
+    bcast_tensor_inputs = []
+    for tensor_inp in tensor_list:
+        # We modify the concat_axis in place, as we don't need the list anywhere else
+        non_concat_shape[axis] = tensor_inp.shape[axis]
+        bcast_tensor_inputs.append(broadcast_to(tensor_inp, non_concat_shape))
+
+    return join(axis, *bcast_tensor_inputs)
+
+
 __all__ = [
-    "searchsorted",
-    "cumsum",
-    "cumprod",
-    "diff",
-    "bincount",
-    "squeeze",
-    "compress",
-    "repeat",
     "bartlett",
-    "fill_diagonal",
-    "fill_diagonal_offset",
-    "unique",
-    "unravel_index",
-    "ravel_multi_index",
+    "bincount",
+    "broadcast_arrays",
     "broadcast_shape",
     "broadcast_to",
+    "compress",
+    "concat_with_broadcast",
+    "cumprod",
+    "cumsum",
+    "diff",
+    "fill_diagonal",
+    "fill_diagonal_offset",
     "geomspace",
-    "logspace",
     "linspace",
-    "broadcast_arrays",
+    "logspace",
+    "ravel_multi_index",
+    "repeat",
+    "searchsorted",
+    "squeeze",
+    "unique",
+    "unravel_index",
 ]

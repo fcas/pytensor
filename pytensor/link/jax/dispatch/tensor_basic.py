@@ -17,16 +17,16 @@ from pytensor.tensor.basic import (
     ScalarFromTensor,
     Split,
     TensorFromScalar,
-    Tri,
-    get_underlying_scalar_constant_value,
+    get_scalar_constant_value,
 )
 from pytensor.tensor.exceptions import NotScalarConstantError
-from pytensor.tensor.shape import Shape_i
+from pytensor.tensor.shape import Shape, Shape_i
+from pytensor.tensor.subtensor import Subtensor
 
 
-ARANGE_CONCRETE_VALUE_ERROR = """JAX requires the arguments of `jax.numpy.arange`
-to be constants. The graph that you defined thus cannot be JIT-compiled
-by JAX. An example of a graph that can be compiled to JAX:
+ARANGE_CONCRETE_VALUE_ERROR = """JAX requires the arguments of `jax.numpy.arange` to be constants.
+The graph that you defined thus cannot be JIT-compiled by JAX.
+An example of a graph that can be compiled to JAX:
 >>> import pytensor.tensor as pt
 >>> pt.arange(1, 10, 2)
 """
@@ -63,13 +63,21 @@ def jax_funcify_ARange(op, node, **kwargs):
     arange_args = node.inputs
     constant_args = []
     for arg in arange_args:
-        if arg.owner and isinstance(arg.owner.op, Shape_i):
-            constant_args.append(None)
-        elif isinstance(arg, Constant):
-            constant_args.append(arg.value)
-        else:
-            # TODO: This might be failing without need (e.g., if arg = shape(x)[-1] + 1)!
-            raise NotImplementedError(ARANGE_CONCRETE_VALUE_ERROR)
+        # Under JAX tracing an array's shape is concrete, so any element of it is a
+        # valid ``arange`` bound
+        match arg.owner_op_and_inputs:
+            case (Shape_i(), *_):
+                constant_args.append(None)
+            case (Subtensor(), shape_var, *_) if isinstance(shape_var.owner_op, Shape):
+                constant_args.append(None)
+            case _ if isinstance(arg, Constant):
+                # Cast to the Op's dtype: PyTensor types integer literals (e.g. 0/1 arange
+                # start/step) as int8, and jnp.arange bounds-checks stop against the argument dtype,
+                # overflowing for stop > 127.
+                constant_args.append(np.asarray(arg.value, op.dtype))
+            case _:
+                # TODO: This might be failing without need (e.g., if arg = shape(x)[-1] + 1)!
+                raise NotImplementedError(ARANGE_CONCRETE_VALUE_ERROR)
 
     constant_start, constant_stop, constant_step = constant_args
 
@@ -84,36 +92,25 @@ def jax_funcify_ARange(op, node, **kwargs):
 
 @jax_funcify.register(Join)
 def jax_funcify_Join(op, **kwargs):
-    def join(axis, *tensors):
+    axis = op.axis
+
+    def join(*tensors):
         # tensors could also be tuples, and in this case they don't have a ndim
         tensors = [jnp.asarray(tensor) for tensor in tensors]
-        view = op.view
-        if (view != -1) and all(
-            tensor.shape[axis] == 0 for tensor in tensors[0:view] + tensors[view + 1 :]
-        ):
-            return tensors[view]
-
-        else:
-            return jnp.concatenate(tensors, axis=axis)
+        return jnp.concatenate(tensors, axis=axis)
 
     return join
 
 
 @jax_funcify.register(Split)
 def jax_funcify_Split(op: Split, node, **kwargs):
-    _, axis, splits = node.inputs
-    try:
-        constant_axis = get_underlying_scalar_constant_value(axis)
-    except NotScalarConstantError:
-        constant_axis = None
-        warnings.warn(
-            "Split node does not have constant axis. Jax implementation will likely fail"
-        )
+    _x, splits = node.inputs
+    axis = op.axis
 
     try:
         constant_splits = np.array(
             [
-                get_underlying_scalar_constant_value(splits[i])
+                get_scalar_constant_value(splits[i])
                 for i in range(get_vector_length(splits))
             ]
         )
@@ -123,23 +120,21 @@ def jax_funcify_Split(op: Split, node, **kwargs):
             "Split node does not have constant split positions. Jax implementation will likely fail"
         )
 
-    def split(x, axis, splits):
-        if constant_axis is not None:
-            axis = constant_axis
+    def split(x, splits):
+        if len(splits) != op.len_splits:
+            raise ValueError("Length of splits is not equal to n_splits")
+
         if constant_splits is not None:
             splits = constant_splits
             cumsum_splits = np.cumsum(splits[:-1])
+            if (splits < 0).any():
+                raise ValueError("Split sizes cannot be negative")
+            if splits.sum() != x.shape[axis]:
+                raise ValueError(
+                    f"Split sizes do not sum up to input length along axis: {x.shape[axis]}"
+                )
         else:
             cumsum_splits = jnp.cumsum(splits[:-1])
-
-        if len(splits) != op.len_splits:
-            raise ValueError("Length of splits is not equal to n_splits")
-        if np.sum(splits) != x.shape[axis]:
-            raise ValueError(
-                f"Split sizes do not sum up to input length along axis: {x.shape[axis]}"
-            )
-        if np.any(splits < 0):
-            raise ValueError("Split sizes cannot be negative")
 
         return jnp.split(x, cumsum_splits, axis=axis)
 
@@ -190,19 +185,3 @@ def jax_funcify_ScalarFromTensor(op, **kwargs):
         return jnp.array(x).flatten()[0]
 
     return scalar_from_tensor
-
-
-@jax_funcify.register(Tri)
-def jax_funcify_Tri(op, node, **kwargs):
-    # node.inputs is N, M, k
-    const_args = [getattr(x, "data", None) for x in node.inputs]
-
-    def tri(*args):
-        # args is N, M, k
-        args = [
-            x if const_x is None else const_x
-            for x, const_x in zip(args, const_args, strict=True)
-        ]
-        return jnp.tri(*args, dtype=op.dtype)
-
-    return tri

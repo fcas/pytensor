@@ -1,26 +1,32 @@
-from pytensor.graph.rewriting.basic import copy_stack_trace, node_rewriter
-from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import Sum, exp, log, true_div
-from pytensor.tensor.math import sum as pt_sum
+from pytensor.graph.rewriting.basic import (
+    PatternNodeRewriter,
+    copy_stack_trace,
+    node_rewriter,
+)
+from pytensor.graph.rewriting.unify import OpPattern
+from pytensor.scalar.basic import Exp
+from pytensor.tensor.elemwise import DimShuffle, Elemwise
+from pytensor.tensor.math import Sum, add, exp, log, sub, true_div
 from pytensor.tensor.rewriting.basic import register_stabilize
-from pytensor.tensor.rewriting.math import local_mul_canonizer
-from pytensor.tensor.special import Softmax, SoftmaxGrad, log_softmax
+from pytensor.tensor.special import (
+    LogSoftmax,
+    LogSumExp,
+    Softmax,
+    log_softmax,
+    logaddexp,
+    logsumexp,
+)
 from pytensor.tensor.subtensor import (
-    AdvancedIncSubtensor,
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     Subtensor,
 )
-from pytensor.tensor.type import (
-    values_eq_approx_remove_inf,
-    values_eq_approx_remove_nan,
-)
+from pytensor.tensor.type import values_eq_approx_remove_inf
+from pytensor.tensor.utils import normalize_reduce_axis
 
 
 subtensor_ops = (
     Subtensor,
     AdvancedSubtensor,
-    AdvancedSubtensor1,
 )
 
 
@@ -71,105 +77,108 @@ def local_logsoftmax(fgraph, node):
     return [ret]
 
 
-@register_stabilize
-@node_rewriter([SoftmaxGrad])
-def local_logsoftmax_grad(fgraph, node):
-    """
-    Detect Log(Softmax(x))'s grad and replace it with LogSoftmax(x)'s grad
+# Exp(LogSoftmax(x)) -> Softmax(x)
+local_exp_log_softmax = PatternNodeRewriter(
+    (exp, (OpPattern(LogSoftmax, axis="axis"), "x")),
+    (OpPattern(Softmax, axis="axis"), "x"),
+    name="local_exp_log_softmax",
+)
+register_stabilize(local_exp_log_softmax)
 
-    Note: only grad is affected
+
+# x - logsumexp(x, axis, keepdims=True) -> LogSoftmax(x)
+# The shared "axis" makes the DimShuffle match only when it re-expands the reduced axes
+local_log_softmax_from_logsumexp = PatternNodeRewriter(
+    (
+        sub,
+        "x",
+        (
+            OpPattern(DimShuffle, is_expand_dims=True, augment="axis"),
+            (OpPattern(LogSumExp, axis="axis"), "x"),
+        ),
+    ),
+    (OpPattern(LogSoftmax, axis="axis"), "x"),
+    name="local_log_softmax_from_logsumexp",
+)
+register_stabilize(local_log_softmax_from_logsumexp)
+
+
+@register_stabilize("symbolic_op_recognition", "fast_compile")
+@node_rewriter([true_div])
+def local_softmax_stabilize(fgraph, node):
+    """Detect exp(x) / sum(exp(x), keepdims=True) and replace with Softmax(x)."""
+    numerator, denominator = node.inputs
+
+    if not numerator.type.dtype.startswith("float"):
+        return
+
+    match numerator.owner_op_and_inputs:
+        case Elemwise(Exp()), x:
+            pass
+        case _:
+            return None
+
+    # Denominator may be wrapped in a DimShuffle (from keepdims=True)
+    match denominator.owner_op_and_inputs:
+        case DimShuffle(), sum_var:
+            pass
+        case _:
+            sum_var = denominator
+
+    match sum_var.owner_op_and_inputs:
+        case (Sum(axis=axis), exp_x) if exp_x is numerator:
+            pass
+        case _:
+            return None
+
+    ret = Softmax(axis=normalize_reduce_axis(axis, x.type.ndim, normalize_none=True))(x)
+    copy_stack_trace(node.outputs, ret)
+    return [ret]
+
+
+@register_stabilize("symbolic_op_recognition", "fast_compile")
+@node_rewriter([log])
+def local_log_add_exp(fgraph, node):
+    """``log(exp(x) + exp(y) + exp(z)) -> logaddexp(x, y, z)``.
+
+    TODO: in canonicalize, change log10 and log2 -> log
     """
-    if (
-        node.inputs[0].owner is not None
-        and node.inputs[0].owner.op == true_div
-        and len(node.inputs[0].owner.inputs) >= 2
-        and node.inputs[0].owner.inputs[1].owner is not None
-        and isinstance(node.inputs[0].owner.inputs[1].owner.op, Softmax)
-        and node.inputs[1] == node.inputs[0].owner.inputs[1]
-        and not (
-            # skip if it will be optimized by
-            # local_advanced_indexing_crossentropy_onehot_grad
-            node.inputs[0].owner.op == true_div
-            and node.inputs[0].owner.inputs[0].owner is not None
-            and isinstance(
-                node.inputs[0].owner.inputs[0].owner.op, AdvancedIncSubtensor
-            )
-            # the rewrite only applies to legacy SoftmaxGrad
-            and node.op == SoftmaxGrad(axis=-1)
-            and node.inputs[0].owner.inputs[1].ndim == 2
-        )
+    z = node.inputs[0]
+    if z.owner and z.owner.op == add:
+        zi = z.owner.inputs
+        pre_exp = [x.owner.inputs[0] for x in zi if x.owner and x.owner.op == exp]
+        # all arguments to add are exp(<something>)
+        if len(pre_exp) == len(zi):
+            return [logaddexp(*pre_exp)]
+
+
+@register_stabilize("symbolic_op_recognition", "fast_compile")
+@node_rewriter([log])
+def local_log_sum_exp(fgraph, node):
+    """``log(sum_i(exp(x_i))) -> logsumexp(x)``."""
+    sum_node = node.inputs[0].owner
+    # If the sum has keepdims=True, there might be a dimshuffle
+    if sum_node and isinstance(sum_node.op, DimShuffle):
+        dimshuffle_op = sum_node.op
+        sum_node = sum_node.inputs[0].owner
+    else:
+        dimshuffle_op = None
+
+    if not (sum_node and isinstance(sum_node.op, Sum)):
+        return
+
+    exp_node, axis = sum_node.inputs[0].owner, sum_node.op.axis
+    if not (
+        exp_node
+        and isinstance(exp_node.op, Elemwise)
+        and isinstance(exp_node.op.scalar_op, Exp)
     ):
-        # get parameters from unoptimized op
-        grads, sm = node.inputs[0].owner.inputs
-        ret = grads - pt_sum(grads, axis=sm.owner.op.axis, keepdims=True) * sm
-        ret.tag.values_eq_approx = values_eq_approx_remove_nan
-        copy_stack_trace(node.outputs[0], ret)
-        return [ret]
+        return
 
+    ret = logsumexp(exp_node.inputs[0], axis=axis)
 
-def softmax_simplifier(numerators, denominators):
-    for numerator in list(numerators):
-        if not numerator.type.dtype.startswith("float"):
-            continue
+    # Restore the dimshuffle op, if any.
+    if dimshuffle_op:
+        ret = dimshuffle_op(ret)
 
-        if not (numerator.owner and numerator.owner.op == exp):
-            continue
-
-        matching_denom = None
-
-        for denominator in denominators:
-            # Division with dimshuffle
-            if denominator.owner and isinstance(denominator.owner.op, DimShuffle):
-                ds_order = denominator.owner.op.new_order
-                # Check that at most only one dimension is being reintroduced by
-                # a dimshuffle. The cases where all dimensions are reintroduced
-                # after a complete sum reduction end up in the else branch
-                if ds_order.count("x") != 1:
-                    continue
-                # Check that dimshuffle does not change order of original dims
-                ds_order_without_x = tuple(dim for dim in ds_order if dim != "x")
-                if tuple(sorted(ds_order_without_x)) != ds_order_without_x:
-                    continue
-                new_dim = ds_order.index("x")
-                z = denominator.owner.inputs[0]
-                if z.owner and isinstance(z.owner.op, Sum):
-                    sum_axis = z.owner.op.axis
-                    # Check that reintroduced dim was the one reduced
-                    if (
-                        (sum_axis is not None)
-                        and (len(sum_axis) == 1)
-                        and (sum_axis[0] == new_dim)
-                    ):
-                        if z.owner.inputs[0] is numerator:
-                            (sum_axis,) = sum_axis
-                            matching_denom = denominator
-                            break
-
-            # Division without dimshuffle
-            else:
-                z = denominator
-                if z.owner and isinstance(z.owner.op, Sum):
-                    sum_axis = z.owner.op.axis
-                    # Filter out partial summations over more than one axis
-                    # The cases where all axis of summation are explicitly given
-                    # as in `sum(matrix, axis=(0, 1))` are eventually rewritten
-                    # to `sum(matrix)` and this branch is not a blocker
-                    if sum_axis is not None and len(sum_axis) != 1:
-                        continue
-                    if z.owner.inputs[0] is numerator:
-                        if sum_axis is not None:
-                            (sum_axis,) = sum_axis
-                        matching_denom = denominator
-                        break
-
-        if matching_denom:
-            softmax = Softmax(axis=sum_axis)(numerator.owner.inputs[0])
-            copy_stack_trace(numerator, softmax)
-            numerators.remove(numerator)
-            denominators.remove(matching_denom)
-            numerators.append(softmax)
-
-    return numerators, denominators
-
-
-local_mul_canonizer.add_simplifier(softmax_simplifier, "softmax_simplifier")
+    return [ret]

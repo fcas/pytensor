@@ -42,20 +42,24 @@ class SortOp(Op):
     def make_node(self, input, axis=-1):
         input = as_tensor_variable(input)
         axis = as_tensor_variable(axis, ndim=0, dtype=int)
+        if axis.type.numpy_dtype.kind != "i":
+            raise ValueError(
+                f"Sort axis must have an integer dtype, got {axis.type.dtype}"
+            )
         out_type = input.type()
         return Apply(self, [input, axis], [out_type])
 
     def perform(self, node, inputs, output_storage):
         a, axis = inputs
         z = output_storage[0]
-        z[0] = np.sort(a, int(axis), self.kind)
+        z[0] = np.sort(a, axis, self.kind)
 
-    def infer_shape(self, fgraph, node, inputs_shapes):
+    def infer_shape(self, node, inputs_shapes):
         assert node.inputs[0].ndim == node.outputs[0].ndim
         assert inputs_shapes[1] == ()
         return [inputs_shapes[0]]
 
-    def grad(self, inputs, output_grads):
+    def pullback(self, inputs, outputs, output_grads):
         a, axis = inputs
         indices = self.__get_argsort_indices(a, axis)
         inp_grad = output_grads[0][tuple(indices)]
@@ -105,14 +109,14 @@ class SortOp(Op):
         return indices
 
     """
-    def R_op(self, inputs, eval_points):
-        # R_op can receive None as eval_points.
+    def pushforward(self, inputs, outputs, eval_points):
+        # pushforward can receive DisconnectedType as eval_points.
         # That mean there is no diferientiable path through that input
         # If this imply that you cannot compute some outputs,
-        # return None for those.
-        if eval_points[0] is None:
-            return eval_points
-        return self.grad(inputs, eval_points)
+        # return disconnected_type() for those.
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return list(eval_points)
+        return self.pullback(inputs, outputs, eval_points)
     """
 
 
@@ -163,6 +167,10 @@ class ArgSortOp(Op):
     def make_node(self, input, axis=-1):
         input = as_tensor_variable(input)
         axis = as_tensor_variable(axis, ndim=0, dtype=int)
+        if axis.type.numpy_dtype.kind != "i":
+            raise ValueError(
+                f"ArgSort axis must have an integer dtype, got {axis.type.dtype}"
+            )
         return Apply(
             self,
             [input, axis],
@@ -173,16 +181,16 @@ class ArgSortOp(Op):
         a, axis = inputs
         z = output_storage[0]
         z[0] = np.asarray(
-            np.argsort(a, int(axis), self.kind),
+            np.argsort(a, axis, self.kind),
             dtype=node.outputs[0].dtype,
         )
 
-    def infer_shape(self, fgraph, node, inputs_shapes):
+    def infer_shape(self, node, inputs_shapes):
         assert node.inputs[0].ndim == node.outputs[0].ndim
         assert inputs_shapes[1] == ()
         return [inputs_shapes[0]]
 
-    def grad(self, inputs, output_grads):
+    def pullback(self, inputs, outputs, output_grads):
         # No grad defined for integers.
         inp, axis = inputs
         inp_grad = inp.zeros_like()
@@ -196,14 +204,14 @@ class ArgSortOp(Op):
         return [inp_grad, axis_grad]
 
     """
-    def R_op(self, inputs, eval_points):
-        # R_op can receive None as eval_points.
+    def pushforward(self, inputs, outputs, eval_points):
+        # pushforward can receive DisconnectedType as eval_points.
         # That mean there is no diferientiable path through that input
         # If this imply that you cannot compute some outputs,
-        # return None for those.
-        if eval_points[0] is None:
-            return eval_points
-        return self.grad(inputs, eval_points)
+        # return disconnected_type() for those.
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return list(eval_points)
+        return self.pullback(inputs, outputs, eval_points)
     """
 
 

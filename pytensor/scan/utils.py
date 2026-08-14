@@ -1,8 +1,8 @@
 """This module provides utility functions for the `Scan` `Op`."""
 
 import copy
-import dataclasses
 import logging
+import warnings
 from collections import namedtuple
 from collections.abc import Callable, Sequence
 from itertools import chain
@@ -13,13 +13,11 @@ import numpy as np
 
 from pytensor import scalar as ps
 from pytensor import tensor as pt
-from pytensor.compile.profiling import ProfileStats
-from pytensor.configdefaults import config
-from pytensor.graph.basic import Constant, Variable, equal_computations, graph_inputs
-from pytensor.graph.op import get_test_value
+from pytensor.compile.debug.profiling import ProfileStats
+from pytensor.graph.basic import Constant, Variable, equal_computations
 from pytensor.graph.replace import clone_replace
+from pytensor.graph.traversal import graph_inputs
 from pytensor.graph.type import HasDataType
-from pytensor.graph.utils import TestValueError
 from pytensor.tensor.basic import AllocEmpty, cast
 from pytensor.tensor.subtensor import set_subtensor
 from pytensor.tensor.variable import TensorConstant
@@ -72,15 +70,6 @@ def safe_new(
         else:
             nw_x = x.type()
         nw_x.name = nw_name
-        if config.compute_test_value != "off":
-            # Copy test value, cast it if necessary
-            try:
-                x_test_value = get_test_value(x)
-            except TestValueError:
-                pass
-            else:
-                # This clause is executed if no exception was raised
-                nw_x.tag.test_value = nw_x.type.filter(x_test_value)
         return nw_x
     else:
         try:
@@ -99,17 +88,8 @@ def safe_new(
 
     nw_x = x.type()
     nw_x.name = nw_name
-    # Preserve test values so that the `compute_test_value` option can be used.
-    # The test value is deep-copied to ensure there can be no interactions
-    # between test values, due to inplace operations for instance. This may
-    # not be the most efficient memory-wise, though.
-    if config.compute_test_value != "off":
-        try:
-            nw_x.tag.test_value = copy.deepcopy(get_test_value(x))
-        except TestValueError:
-            pass
 
-    return nw_x
+    return type_cast(Variable, nw_x)
 
 
 class until:
@@ -190,38 +170,6 @@ class ScanProfileStats(ProfileStats):
         print("", file=file)
 
 
-def traverse(out, x, x_copy, d, visited=None):
-    """
-    Function used by scan to parse the tree and figure out which nodes
-    it needs to replace.
-
-    There are two options :
-        1) x and x_copy or on host, then you would replace x with x_copy
-
-    """
-    # ``visited`` is a set of nodes that are already known and don't need to be
-    # checked again, speeding up the traversal of multiply-connected graphs.
-    # if a ``visited`` set is given, it will be updated in-place so the callee
-    # knows which nodes we have seen.
-    if visited is None:
-        visited = set()
-    if out in visited:
-        return d
-    visited.add(out)
-
-    if out == x:
-        # assert isinstance(x.type, GpuArrayType)
-        # d[out] = GpuFromHost(x.type.context_name)(x_copy)
-        # return d
-        raise RuntimeError("Not supported")
-    elif out.owner is None:
-        return d
-    else:
-        for inp in out.owner.inputs:
-            d = traverse(inp, x, x_copy, d, visited)
-        return d
-
-
 def expand_empty(tensor_var, size):
     """
     Transforms the shape of a tensor from (d1, d2 ... ) to ( d1+size, d2, ..)
@@ -231,8 +179,8 @@ def expand_empty(tensor_var, size):
 
     if size == 0:
         return tensor_var
-    shapes = [tensor_var.shape[x] for x in range(tensor_var.ndim)]
-    new_shape = [size + shapes[0]] + shapes[1:]
+    shapes = tuple(tensor_var.shape)
+    new_shape = (size + shapes[0], *shapes[1:])
     empty = AllocEmpty(tensor_var.dtype)(*new_shape)
 
     ret = set_subtensor(empty[: shapes[0]], tensor_var)
@@ -344,209 +292,6 @@ class Validator:
         return get_value(out)
 
 
-def scan_can_remove_outs(op, out_idxs):
-    """Look at all outputs defined by indices ``out_idxs`` and determines which can be removed.
-
-    Returns
-    -------
-    two lists, the first one with the indices of outs that can be removed, the
-    second with the outputs that can not be removed.
-
-    """
-    non_removable = [o for i, o in enumerate(op.inner_outputs) if i not in out_idxs]
-    required_inputs = list(graph_inputs(non_removable))
-
-    out_ins = []
-    offset = op.info.n_seqs
-    for idx, tap in enumerate(
-        chain(
-            op.info.mit_mot_in_slices,
-            op.info.mit_sot_in_slices,
-            op.info.sit_sot_in_slices,
-        )
-    ):
-        n_ins = len(tap)
-        out_ins += [op.inner_inputs[offset : offset + n_ins]]
-        offset += n_ins
-    out_ins += [[] for k in range(op.info.n_nit_sot)]
-    out_ins += [[op.inner_inputs[offset + k]] for k in range(op.info.n_shared_outs)]
-
-    added = True
-    out_idxs_mask = [1 for idx in out_idxs]
-    while added:
-        added = False
-        for pos, idx in enumerate(out_idxs):
-            if out_idxs_mask[pos] and any(x in required_inputs for x in out_ins[idx]):
-                # This output is required ..
-                out_idxs_mask[pos] = 0
-                required_inputs += list(graph_inputs([op.inner_outputs[idx]]))
-                added = True
-
-    required_outs = [x for i, x in enumerate(out_idxs) if out_idxs_mask[i] == 0]
-    not_required = [x for i, x in enumerate(out_idxs) if out_idxs_mask[i] == 1]
-    return (required_outs, not_required)
-
-
-def compress_outs(op, not_required, inputs):
-    """
-    Helpful function that gets a Scan op, a list of indices indicating
-    which outputs are not required anymore and should be removed, and
-    a list of inputs to the apply node corresponding to the scan op and
-    produces the list of inputs and outputs and the info dictionary where
-    the indicated outputs are eliminated. Note that eliminating an output
-    means removing its inputs from the inner function and from the
-    node inputs, and changing the dictionary.
-
-    """
-    from pytensor.scan.op import ScanInfo
-
-    op_info = op.info
-    info = ScanInfo(
-        n_seqs=op_info.n_seqs,
-        mit_mot_in_slices=(),
-        mit_mot_out_slices=(),
-        mit_sot_in_slices=(),
-        sit_sot_in_slices=(),
-        n_nit_sot=0,
-        n_shared_outs=0,
-        n_non_seqs=0,
-        as_while=op_info.as_while,
-    )
-
-    op_inputs = op.inner_inputs[: op_info.n_seqs]
-    op_outputs = []
-    node_inputs = inputs[: op_info.n_seqs + 1]
-    map_old_new = {}
-
-    offset = 0
-    ni_offset = op_info.n_seqs + 1
-    i_offset = op_info.n_seqs
-    o_offset = 0
-    curr_pos = 0
-    for idx in range(op_info.n_mit_mot):
-        if offset + idx not in not_required:
-            map_old_new[offset + idx] = curr_pos
-            curr_pos += 1
-            info = dataclasses.replace(
-                info,
-                mit_mot_in_slices=(
-                    *info.mit_mot_in_slices,
-                    op_info.mit_mot_in_slices[idx],
-                ),
-                mit_mot_out_slices=(
-                    *info.mit_mot_out_slices,
-                    op_info.mit_mot_out_slices[idx],
-                ),
-            )
-            # input taps
-            for jdx in op_info.mit_mot_in_slices[idx]:
-                op_inputs += [op.inner_inputs[i_offset]]
-                i_offset += 1
-            # output taps
-            for jdx in op_info.mit_mot_out_slices[idx]:
-                op_outputs += [op.inner_outputs[o_offset]]
-                o_offset += 1
-            # node inputs
-            node_inputs += [inputs[ni_offset + idx]]
-        else:
-            o_offset += len(op_info.mit_mot_out_slices[idx])
-            i_offset += len(op_info.mit_mot_in_slices[idx])
-
-    offset += op_info.n_mit_mot
-    ni_offset += op_info.n_mit_mot
-
-    for idx in range(op_info.n_mit_sot):
-        if offset + idx not in not_required:
-            map_old_new[offset + idx] = curr_pos
-            curr_pos += 1
-            info = dataclasses.replace(
-                info,
-                mit_sot_in_slices=(
-                    *info.mit_sot_in_slices,
-                    op_info.mit_sot_in_slices[idx],
-                ),
-            )
-            # input taps
-            for jdx in op_info.mit_sot_in_slices[idx]:
-                op_inputs += [op.inner_inputs[i_offset]]
-                i_offset += 1
-            # output taps
-            op_outputs += [op.inner_outputs[o_offset]]
-            o_offset += 1
-            # node inputs
-            node_inputs += [inputs[ni_offset + idx]]
-        else:
-            o_offset += 1
-            i_offset += len(op_info.mit_sot_in_slices[idx])
-
-    offset += op_info.n_mit_sot
-    ni_offset += op_info.n_mit_sot
-    for idx in range(op_info.n_sit_sot):
-        if offset + idx not in not_required:
-            map_old_new[offset + idx] = curr_pos
-            curr_pos += 1
-            info = dataclasses.replace(
-                info,
-                sit_sot_in_slices=(
-                    *info.sit_sot_in_slices,
-                    op_info.sit_sot_in_slices[idx],
-                ),
-            )
-            # input taps
-            op_inputs += [op.inner_inputs[i_offset]]
-            i_offset += 1
-            # output taps
-            op_outputs += [op.inner_outputs[o_offset]]
-            o_offset += 1
-            # node inputs
-            node_inputs += [inputs[ni_offset + idx]]
-        else:
-            o_offset += 1
-            i_offset += 1
-
-    offset += op_info.n_sit_sot
-    ni_offset += op_info.n_sit_sot
-    nit_sot_ins = []
-    for idx in range(op_info.n_nit_sot):
-        if offset + idx not in not_required:
-            map_old_new[offset + idx] = curr_pos
-            curr_pos += 1
-            info = dataclasses.replace(info, n_nit_sot=info.n_nit_sot + 1)
-            op_outputs += [op.inner_outputs[o_offset]]
-            o_offset += 1
-            nit_sot_ins += [inputs[ni_offset + idx + op_info.n_shared_outs]]
-        else:
-            o_offset += 1
-
-    offset += op_info.n_nit_sot
-    shared_ins = []
-    for idx in range(op_info.n_shared_outs):
-        if offset + idx not in not_required:
-            map_old_new[offset + idx] = curr_pos
-            curr_pos += 1
-            info = dataclasses.replace(info, n_shared_outs=info.n_shared_outs + 1)
-            op_outputs += [op.inner_outputs[o_offset]]
-            o_offset += 1
-            op_inputs += [op.inner_inputs[i_offset]]
-            i_offset += 1
-            shared_ins += [inputs[ni_offset + idx]]
-        else:
-            o_offset += 1
-            i_offset += 1
-    node_inputs += shared_ins
-    node_inputs += nit_sot_ins
-    # other stuff
-    op_inputs += op.inner_inputs[i_offset:]
-    info = dataclasses.replace(info, n_non_seqs=len(op.inner_inputs[i_offset:]))
-    node_inputs += inputs[ni_offset + op_info.n_shared_outs + op_info.n_nit_sot :]
-    if op_info.as_while:
-        op_outputs += [op.inner_outputs[o_offset]]
-        map_old_new[o_offset] = len(op_outputs) - 1
-        # map_old_new[len(op_outputs)-1] = o_offset
-
-    return (op_inputs, op_outputs, info, node_inputs, map_old_new)
-
-
 def reconstruct_graph(inputs, outputs, tag=None):
     """
     Different interface to clone, that allows you to pass inputs.
@@ -593,23 +338,27 @@ class ScanArgs:
         _inner_inputs: Sequence[Variable],
         _inner_outputs: Sequence[Variable],
         info: "ScanInfo",
-        clone: bool | None = True,
+        clone: bool | None = None,
     ):
+        if clone is not None:
+            warnings.warn(
+                "The `clone` argument of ScanArgs is deprecated and ignored: the "
+                "inner graph is sliced as-is. For a detached mutable copy of a "
+                "Scan's inner graph use `ScanArgs.from_node(node, clone=True)` or "
+                "thaw it with `node.op.fgraph.unfreeze()`.",
+                FutureWarning,
+            )
+
         self.n_steps = outer_inputs[0]
         self.as_while = info.as_while
 
-        if clone:
-            rval = reconstruct_graph(_inner_inputs, _inner_outputs, "")
-        else:
-            rval = (_inner_inputs, _inner_outputs)
-
         if self.as_while:
-            self.cond = [rval[1][-1]]
-            inner_outputs = rval[1][:-1]
+            self.cond = [_inner_outputs[-1]]
+            inner_outputs = _inner_outputs[:-1]
         else:
             self.cond = []
-            inner_outputs = rval[1]
-        inner_inputs = rval[0]
+            inner_outputs = _inner_outputs
+        inner_inputs = _inner_inputs
 
         p = 1
         q = 0
@@ -657,11 +406,11 @@ class ScanArgs:
         p += n_sit_sot
         q += n_sit_sot
 
-        n_shared_outs = info.n_shared_outs
-        self.outer_in_shared = list(outer_inputs[p : p + n_shared_outs])
-        self.inner_in_shared = list(inner_inputs[q : q + n_shared_outs])
-        p += n_shared_outs
-        q += n_shared_outs
+        n_untraced_sit_sot = info.n_untraced_sit_sot
+        self.outer_in_shared = list(outer_inputs[p : p + n_untraced_sit_sot])
+        self.inner_in_shared = list(inner_inputs[q : q + n_untraced_sit_sot])
+        p += n_untraced_sit_sot
+        q += n_untraced_sit_sot
 
         n_nit_sot = info.n_nit_sot
         self.outer_in_nit_sot = list(outer_inputs[p : p + n_nit_sot])
@@ -701,10 +450,10 @@ class ScanArgs:
         p += n_nit_sot
         q += n_nit_sot
 
-        self.outer_out_shared = list(outer_outputs[p : p + n_shared_outs])
-        self.inner_out_shared = list(inner_outputs[q : q + n_shared_outs])
-        p += n_shared_outs
-        q += n_shared_outs
+        self.outer_out_shared = list(outer_outputs[p : p + n_untraced_sit_sot])
+        self.inner_out_shared = list(inner_outputs[q : q + n_untraced_sit_sot])
+        p += n_untraced_sit_sot
+        q += n_untraced_sit_sot
 
         assert p == len(outer_outputs)
         assert q == len(inner_outputs)
@@ -715,13 +464,20 @@ class ScanArgs:
 
         if not isinstance(node.op, Scan):
             raise TypeError(f"{node} is not a Scan node")
+        if clone:
+            # Thaw the frozen inner graph into a fresh mutable copy.
+            unfrozen_fgraph = node.op.fgraph.unfreeze()
+            inner_inputs = list(unfrozen_fgraph.inputs)
+            inner_outputs = list(unfrozen_fgraph.outputs)
+        else:
+            inner_inputs = node.op.inner_inputs
+            inner_outputs = node.op.inner_outputs
         return ScanArgs(
             node.inputs,
             node.outputs,
-            node.op.inner_inputs,
-            node.op.inner_outputs,
+            inner_inputs,
+            inner_outputs,
             node.op.info,
-            clone=clone,
         )
 
     @property
@@ -815,7 +571,7 @@ class ScanArgs:
             mit_sot_in_slices=tuple(tuple(v) for v in self.mit_sot_in_slices),
             sit_sot_in_slices=((-1,),) * len(self.inner_in_sit_sot),
             n_nit_sot=len(self.outer_in_nit_sot),
-            n_shared_outs=len(self.outer_in_shared),
+            n_untraced_sit_sot=len(self.outer_in_shared),
             n_non_seqs=len(self.inner_in_non_seqs),
             as_while=self.as_while,
         )
@@ -1094,9 +850,22 @@ class ScanArgs:
 
 def forced_replace(out, x, y):
     """
-    Check all internal values of the graph that compute the variable ``out``
-    for occurrences of values identical with ``x``. If such occurrences are
-    encountered then they are replaced with variable ``y``.
+    Replace subexpressions in ``out`` that are structurally equal to ``x``
+    with ``y``, using ``equal_computations`` for matching.
+
+    Unlike ``graph_replace`` (which matches by variable identity),
+    this detects when a subexpression *recomputes* ``x`` without
+    being the same variable object. This is used by ``Scan.L_op``
+    to substitute inner-function outputs with placeholders wired to
+    the saved forward values, avoiding redundant recomputation in
+    the backward scan. For example, if ``exp(x).L_op`` returns
+    ``output_gradient * exp(x)`` by recreating ``exp(x)`` instead
+    of referencing the existing output variable, a plain identity
+    check would miss it, but ``equal_computations`` catches it.
+
+    This is not comprehensive: structurally different but semantically
+    equivalent expressions (e.g. ``exp(x + 0)`` vs ``exp(x)``) will
+    not match.
 
     Parameters
     ----------
@@ -1112,7 +881,7 @@ def forced_replace(out, x, y):
 
     Notes
     -----
-    When it find a match, it don't continue on the corresponding inputs.
+    When it finds a match, it does not continue into that node's inputs.
     """
     if out is None:
         return None

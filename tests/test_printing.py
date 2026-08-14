@@ -2,7 +2,10 @@
 Tests of printing functionality
 """
 
+import importlib.util
+import io
 import logging
+import re
 from io import StringIO
 from textwrap import dedent
 
@@ -11,24 +14,38 @@ import pytest
 
 import pytensor
 from pytensor import config
+from pytensor.assumptions import assume
+from pytensor.compile.builders import OpFromGraph
+from pytensor.compile.debug.profiling import ProfileStats
 from pytensor.compile.mode import get_mode
 from pytensor.compile.ops import deep_copy_op
 from pytensor.printing import (
     PatternPrinter,
     PPrinter,
     Print,
+    _try_pydot_import,
     char_from_number,
     debugprint,
     default_printer,
     get_node_by_id,
     min_informative_str,
     pp,
-    pydot_imported,
     pydotprint,
 )
+from pytensor.scalar import Composite, float64
 from pytensor.tensor import as_tensor_variable
+from pytensor.tensor.elemwise import Elemwise
+from pytensor.tensor.linalg import inv
+from pytensor.tensor.math import maximum
 from pytensor.tensor.type import dmatrix, dvector, matrix
 from tests.graph.utils import MyInnerGraphOp, MyOp, MyVariable
+
+
+try:
+    _try_pydot_import()
+    pydot_imported = True
+except Exception:
+    pydot_imported = False
 
 
 @pytest.mark.parametrize(
@@ -102,7 +119,7 @@ def test_pydotprint_long_name():
 )
 def test_pydotprint_profile():
     A = matrix()
-    prof = pytensor.compile.ProfileStats(atexit_print=False, gpu_checks=False)
+    prof = ProfileStats(atexit_print=False, gpu_checks=False)
     f = pytensor.function([A], A + 1, profile=prof)
     pydotprint(f, print_output_file=False)
     f([[1]])
@@ -131,9 +148,9 @@ def test_min_informative_str():
   D. D
   E. E"""
 
-    if mis != reference:
-        print("--" + mis + "--")
-        print("--" + reference + "--")
+    # if mis != reference:
+    #     print("--" + mis + "--")
+    #     print("--" + reference + "--")
 
     assert mis == reference
 
@@ -151,8 +168,7 @@ def test_debugprint():
 
     F = D + E
     G = C + F
-    mode = pytensor.compile.get_default_mode().including("fusion")
-    g = pytensor.function([A, B, D, E], G, mode=mode)
+    g = pytensor.function([A, B, D, E], G)
 
     # just test that it work
     s = StringIO()
@@ -243,7 +259,7 @@ def test_debugprint():
     assert s == reference
 
     # Test the `profile` handling when profile data is missing
-    g = pytensor.function([A, B, D, E], G, mode=mode, profile=True)
+    g = pytensor.function([A, B, D, E], G, profile=True)
 
     s = StringIO()
     debugprint(g, file=s, id_type="", print_storage=True)
@@ -284,7 +300,7 @@ def test_debugprint():
     J = dvector()
     s = StringIO()
     debugprint(
-        pytensor.function([A, B, D, J], A + (B.dot(J) - D), mode="FAST_RUN"),
+        pytensor.function([A, B, D, J], A + (B.dot(J) - D), mode="CVM"),
         file=s,
         id_type="",
         print_destroy_map=True,
@@ -294,7 +310,8 @@ def test_debugprint():
     Gemv_op_name = "CGemv" if pytensor.config.blas__ldflags else "Gemv"
     exp_res = dedent(
         r"""
-        Composite{(i2 + (i0 - i1))} 4
+        Composite{(i0 + (i1 - i2))} 4
+        ├─ A
         ├─ ExpandDims{axis=0} v={0: [0]} 3
         """
         f"        │  └─ {Gemv_op_name}{{inplace}} d={{0: [0]}} 2"
@@ -306,17 +323,16 @@ def test_debugprint():
         │     ├─ B
         │     ├─ <Vector(float64, shape=(?,))>
         │     └─ 0.0
-        ├─ D
-        └─ A
+        └─ D
 
         Inner graphs:
 
-        Composite{(i2 + (i0 - i1))}
-        ← add 'o0'
-            ├─ i2
-            └─ sub
+        Composite{(i0 + (i1 - i2))}
+        ← add
             ├─ i0
-            └─ i1
+            └─ sub
+            ├─ i1
+            └─ i2
         """
     ).lstrip()
 
@@ -325,8 +341,77 @@ def test_debugprint():
     ]
 
 
+def test_debugprint_assumptions():
+    x = matrix("x")
+    out = inv(assume(x, diagonal=True))
+
+    s = StringIO()
+    debugprint(out, file=s, print_assumptions=True)
+    reference = dedent(
+        r"""
+        Blockwise{MatrixInverse, (m,m)->(m,m)} [id A] a={diag}
+         └─ SpecifyAssumptions{diagonal} [id B] a={diag}
+            └─ x [id C]
+        """
+    ).lstrip()
+    assert s.getvalue() == reference
+
+    # The flag is off by default, so no a={...} tag is printed.
+    s = StringIO()
+    debugprint(out, file=s)
+    assert "a={" not in s.getvalue()
+
+
+def test_debugprint_assumptions_prunes_implied_facts():
+    # positive_definite implies symmetric; only the strongest fact is shown.
+    x = matrix("x")
+    s = StringIO()
+    debugprint(assume(x, positive_definite=True), file=s, print_assumptions=True)
+    reference = dedent(
+        r"""
+        SpecifyAssumptions{positive_definite} [id A] a={pd}
+         └─ x [id B]
+        """
+    ).lstrip()
+    assert s.getvalue() == reference
+
+
+def test_debugprint_assumptions_negation_and_multiple():
+    x = matrix("x")
+
+    s = StringIO()
+    debugprint(assume(x, symmetric=False), file=s, print_assumptions=True)
+    assert (
+        s.getvalue()
+        == dedent(
+            r"""
+        SpecifyAssumptions{!symmetric} [id A] a={!sym}
+         └─ x [id B]
+        """
+        ).lstrip()
+    )
+
+    # Two independent facts survive propagation through ``inv``.
+    s = StringIO()
+    debugprint(
+        inv(assume(x, diagonal=True, orthogonal=True)),
+        file=s,
+        print_assumptions=True,
+    )
+    assert (
+        s.getvalue()
+        == dedent(
+            r"""
+        Blockwise{MatrixInverse, (m,m)->(m,m)} [id A] a={diag, orth}
+         └─ SpecifyAssumptions{diagonal, orthogonal} [id B] a={diag, orth}
+            └─ x [id C]
+        """
+        ).lstrip()
+    )
+
+
 def test_debugprint_id_type():
-    a_at = dvector()
+    a_at = dmatrix()
     b_at = dmatrix()
 
     d_at = b_at.dot(a_at)
@@ -337,10 +422,10 @@ def test_debugprint_id_type():
     s = s.getvalue()
 
     exp_res = f"""Add [id {e_at.auto_name}]
- ├─ dot [id {d_at.auto_name}]
+ ├─ Dot [id {d_at.auto_name}]
  │  ├─ <Matrix(float64, shape=(?, ?))> [id {b_at.auto_name}]
- │  └─ <Vector(float64, shape=(?,))> [id {a_at.auto_name}]
- └─ <Vector(float64, shape=(?,))> [id {a_at.auto_name}]
+ │  └─ <Matrix(float64, shape=(?, ?))> [id {a_at.auto_name}]
+ └─ <Matrix(float64, shape=(?, ?))> [id {a_at.auto_name}]
     """
 
     assert [l.strip() for l in s.split("\n")] == [
@@ -381,8 +466,8 @@ Inner graphs:
 
 MyInnerGraphOp [id A]
  ← op2 [id D] 'igo1'
-    ├─ *0-<MyType()> [id E]
-    └─ *1-<MyType()> [id F]
+    ├─ i0 [id E]
+    └─ i1 [id F]
     """
 
     for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
@@ -404,13 +489,122 @@ Inner graphs:
 
 MyInnerGraphOp [id A]
  ← MyInnerGraphOp [id C]
-    ├─ *0-<MyType()> [id D]
-    └─ *1-<MyType()> [id E]
+    ├─ i0 [id D]
+    └─ i1 [id E]
 
 MyInnerGraphOp [id C]
  ← op2 [id F] 'igo1'
-    ├─ *0-<MyType()> [id D]
-    └─ *1-<MyType()> [id E]
+    ├─ i0 [id D]
+    └─ i1 [id E]
+    """
+
+    for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
+        assert exp_line.strip() == res_line.strip()
+
+
+def test_debugprint_inner_graph_shared():
+    """Inner-graph `Op`s that compare equal share a single printed body, whose
+    header lists every node id it applies to (deduped, instead of one body per
+    occurrence)."""
+    x = dvector("x")
+
+    def relu_ofg():
+        i = dvector("i")
+        return OpFromGraph([i], [maximum(i, 0)], inline=False, name="Relu")
+
+    # `a` and `b` use distinct-but-equal OFG instances (identical inner graph);
+    # `c` uses a structurally different OFG.
+    a = relu_ofg()(x)
+    b = relu_ofg()(a)
+    out = OpFromGraph([x], [x + 1], inline=False, name="AddOne")(b)
+
+    lines = debugprint(out, file="str").split("\n")
+
+    exp_res = """AddOne{inline=False} [id A]
+ └─ Relu{inline=False} [id B]
+    └─ Relu{inline=False} [id C]
+       └─ x [id D]
+
+Inner graphs:
+
+AddOne{inline=False} [id A]
+ ← Add [id E]
+    ├─ i0 [id F]
+    └─ ExpandDims{axis=0} [id G]
+       └─ 1 [id H]
+
+Relu{inline=False} [id B, C]
+ ← Maximum [id I]
+    ├─ i0 [id F]
+    └─ ExpandDims{axis=0} [id J]
+       └─ 0 [id K]
+    """
+
+    for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
+        assert exp_line.strip() == res_line.strip()
+
+    def add_one_composite():
+        xs = float64("xs")
+        return Composite([xs], [xs + 1.0])
+
+    d = Elemwise(add_one_composite())(x)
+    e = Elemwise(add_one_composite())(d)
+
+    lines = debugprint(e, file="str").split("\n")
+
+    exp_res = """Composite{(i0 + 1.0)} [id A]
+ └─ Composite{(i0 + 1.0)} [id B]
+    └─ x [id C]
+
+Inner graphs:
+
+Composite{(i0 + 1.0)} [id A, B]
+ ← add [id D]
+    ├─ i0 [id E]
+    └─ 1.0 [id F]
+    """
+
+    for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
+        assert exp_line.strip() == res_line.strip()
+
+    # An Op that only appears nested inside other inner graphs is still
+    # discovered and printed in the "Inner graphs" section. Here both A and B
+    # apply the same Relu to their (nominal) input, so global FrozenApply
+    # interning collapses it to a single shared node, printed once.
+    i1 = dvector("i")
+    a_op = OpFromGraph([i1], [relu_ofg()(i1) + 1], inline=False, name="A")
+    i2 = dvector("i")
+    b_op = OpFromGraph([i2], [relu_ofg()(i2) * 2], inline=False, name="B")
+
+    lines = debugprint(a_op(x) + b_op(x), file="str").split("\n")
+
+    exp_res = """Add [id A]
+ ├─ A{inline=False} [id B]
+ │  └─ x [id C]
+ └─ B{inline=False} [id D]
+    └─ x [id C]
+
+Inner graphs:
+
+A{inline=False} [id B]
+ ← Add [id E]
+    ├─ Relu{inline=False} [id F]
+    │  └─ i0 [id G]
+    └─ ExpandDims{axis=0} [id H]
+       └─ 1 [id I]
+
+B{inline=False} [id D]
+ ← Mul [id J]
+    ├─ Relu{inline=False} [id F]
+    │  └─ ···
+    └─ ExpandDims{axis=0} [id K]
+       └─ 2 [id L]
+
+Relu{inline=False} [id F]
+ ← Maximum [id M]
+    ├─ i0 [id G]
+    └─ ExpandDims{axis=0} [id N]
+       └─ 0 [id O]
     """
 
     for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
@@ -479,7 +673,7 @@ def test_Print(capsys):
 
     fn()
 
-    stdout, stderr = capsys.readouterr()
+    stdout, _stderr = capsys.readouterr()
     assert "hello" in stdout
 
 
@@ -490,3 +684,279 @@ def test_summary_with_profile_optimizer():
     s = StringIO()
     f.profile.summary(file=s)
     assert "Rewriter Profile" in s.getvalue()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("rich") is None, reason="rich is not installed"
+)
+class TestDebugprintRich:
+    """Tests for debugprint(..., file="rich").
+
+    We test PyTensor's tree-building contract only — not Rich's rendering.
+    Rich's own test suite covers rendering; our job is to verify that we
+    construct the right tree structure and don't crash on various graph shapes.
+    """
+
+    def test_return_type(self):
+        from rich.tree import Tree
+
+        x = dvector("x")
+        tree = debugprint(x.sum(), file="rich")
+        assert isinstance(tree, Tree)
+
+    def test_single_output_has_one_child(self):
+        # One output variable → the hidden root should have exactly one child.
+        x = dvector("x")
+        tree = debugprint(x.sum(), file="rich")
+        assert len(tree.children) == 1
+
+    def test_multiple_outputs_have_multiple_children(self):
+        # Two output variables → the hidden root has two children.
+        x = dvector("x")
+        mean = x.mean()
+        std = x.std()
+        tree = debugprint([mean, std], file="rich")
+        assert len(tree.children) == 2
+
+    def test_linear_graph(self):
+        # sum(x * 2): root → sum_node → mul_node → [x_leaf, 2_leaf]
+        x = dvector("x")
+        y = (x * 2).sum()
+        tree = debugprint(y, file="rich")
+        sum_node = tree.children[0]
+        mul_node = sum_node.children[0]
+        assert len(mul_node.children) == 2
+
+    def test_named_var(self):
+        # Named intermediate: the label of the mul node contains its name.
+        x = dvector("x")
+        y = x * 2
+        y.name = "doubled"
+        tree = debugprint(y.sum(), file="rich")
+        mul_node = tree.children[0].children[0]
+        assert "doubled" in str(mul_node.label)
+
+    def test_dag_shared_leaf(self):
+        # x + x: the add node has two children, both representing x.
+        x = dvector("x")
+        tree = debugprint(x + x, file="rich")
+        add_node = tree.children[0]
+        assert len(add_node.children) == 2
+
+    def test_diamond_dag(self):
+        # (x*2) + (x+1): add has two children; each has x as a child,
+        # but the second occurrence of x is a repeat (still a child node).
+        x = dvector("x")
+        a = x * 2
+        b = x + 1
+        tree = debugprint(a + b, file="rich")
+        add_node = tree.children[0]
+        assert len(add_node.children) == 2
+        # Each branch (mul, add) has x as a child.
+        assert len(add_node.children[0].children) >= 1
+        assert len(add_node.children[1].children) >= 1
+
+    def test_depth_limit(self):
+        # depth=1: the root op node is present but its inputs are not expanded.
+        x = dvector("x")
+        y = (x * 2).sum()
+        tree = debugprint(y, depth=1, file="rich")
+        sum_node = tree.children[0]
+        assert len(sum_node.children) == 0
+
+    def test_stop_on_name(self):
+        # stop_on_name=True: traversal stops when it hits the named leaf x,
+        # so the mul node's child (x) has no further children.
+        x = dvector("x")
+        x.name = "x"
+        tree = debugprint((x * 2).sum(), stop_on_name=True, file="rich")
+        sum_node = tree.children[0]
+        mul_node = sum_node.children[0]
+        x_node = mul_node.children[0]
+        assert len(x_node.children) == 0
+
+    def test_print_type(self):
+        # print_type=True: the type annotation appears in the root op's label.
+        x = dvector("x")
+        tree = debugprint(x.sum(), print_type=True, file="rich")
+        sum_node = tree.children[0]
+        assert "<" in str(sum_node.label)
+
+    def test_function_graph(self):
+        # FunctionGraph: one output → one child under the hidden root.
+        from pytensor.graph.fg import FunctionGraph
+
+        x = dvector("x")
+        y = x.sum()
+        fg = FunctionGraph([x], [y])
+        tree = debugprint(fg, file="rich")
+        assert len(tree.children) == 1
+
+    def test_inner_graph_op(self):
+        # HasInnerGraph op: root has two children — the op node and the
+        # "Inner graphs:" section. The op node has the two outer inputs as children.
+        igo_in_1, igo_in_2 = MyVariable("x"), MyVariable("y")
+        igo_out = MyOp("op")(igo_in_1, igo_in_2)
+        op = MyInnerGraphOp([igo_in_1, igo_in_2], [igo_out])
+        a, b = MyVariable("a"), MyVariable("b")
+        out = op(a, b)
+        tree = debugprint(out, file="rich")
+        assert len(tree.children) == 2  # op node + "Inner graphs:" section
+        op_node = tree.children[0]
+        assert len(op_node.children) == 2
+
+    def test_opfromgraph_expands_inner_graph(self):
+        # OpFromGraph should produce an "Inner graphs:" section as a second
+        # top-level child of the hidden root, matching the text renderer.
+        x = dvector("x")
+        out = OpFromGraph([x], [x.std()])(x)
+        tree = debugprint(out, file="rich")
+        # root child 0: the op node; root child 1: "Inner graphs:" section
+        assert len(tree.children) == 2
+        inner_section = tree.children[1]
+        assert len(inner_section.children) >= 1
+
+    def test_inner_graph_header_is_bold(self):
+        # The "Inner graphs:" header should be bold.
+        x = dvector("x")
+        out = OpFromGraph([x], [x.std()])(x)
+        tree = debugprint(out, file="rich")
+        inner_section = tree.children[1]
+        assert "bold" in str(inner_section.label), (
+            f"'Inner graphs:' header should have bold markup, got: {inner_section.label!r}"
+        )
+
+    def test_repeated_node_no_duplication(self):
+        # The second occurrence of a shared node shows its colored label with
+        # ··· as a child — no full subtree expansion.
+        x = dvector("x")
+        shared = x * 2
+        tree = debugprint(shared + shared, file="rich")
+        add_node = tree.children[0]
+        # The add has two children: canonical Mul (full subtree) and repeat Mul (··· child)
+        assert len(add_node.children) == 2
+        repeat_entry = add_node.children[1]
+        assert "···" not in str(repeat_entry.label), (
+            f"Repeat entry label should be the node label, not ···: {repeat_entry.label!r}"
+        )
+        assert len(repeat_entry.children) == 1, (
+            f"Repeat entry should have exactly one child (···), got: {repeat_entry.children}"
+        )
+        sentinel = repeat_entry.children[0]
+        assert "···" in str(sentinel.label), (
+            f"Expected '···' as child of repeat entry, got: {sentinel.label!r}"
+        )
+        assert len(sentinel.children) == 0, "··· should be a leaf"
+
+    def test_repeated_nodes_same_color(self):
+        # The canonical label, the repeat entry label, and the ··· sentinel
+        # should all share the same color.
+        x = dvector("x")
+        shared = x * 2
+        tree = debugprint(shared + shared, file="rich")
+        add_node = tree.children[0]
+        canonical_mul = add_node.children[0]
+        repeat_entry = add_node.children[1]
+        sentinel = repeat_entry.children[0]
+        color_re = re.compile(r"\[(\w+)\]")
+        canonical_colors = color_re.findall(str(canonical_mul.label))
+        repeat_colors = color_re.findall(str(repeat_entry.label))
+        sentinel_colors = color_re.findall(str(sentinel.label))
+        assert canonical_colors, "canonical shared node should have a color tag"
+        assert repeat_colors, (
+            f"repeat entry should have a color tag, got: {repeat_entry.label!r}"
+        )
+        assert sentinel_colors, (
+            f"sentinel should have a color tag, got: {sentinel.label!r}"
+        )
+        assert canonical_colors[0] == repeat_colors[0] == sentinel_colors[0], (
+            f"canonical, repeat entry, and sentinel should share the same color: "
+            f"{canonical_colors[0]!r}, {repeat_colors[0]!r}, {sentinel_colors[0]!r}"
+        )
+
+    def test_two_distinct_shared_nodes_get_different_colors(self):
+        # Two independently shared nodes should each get a distinct color so
+        # they can be visually distinguished from one another.
+        x = dvector("x")
+        a = x * 2
+        b = x + 1
+        tree = debugprint((a + b) + (a - b), file="rich")
+        # Walk the tree and collect all color tags used on colored nodes.
+        color_re = re.compile(r"\[(\w+)\]")
+
+        def collect_colors(node):
+            colors = set()
+            m = color_re.findall(str(node.label))
+            if m:
+                colors.add(m[0])
+            for child in node.children:
+                colors |= collect_colors(child)
+            return colors
+
+        colors = collect_colors(tree)
+        # Both shared nodes must have been assigned a color, and they must differ.
+        assert len(colors) >= 2, (
+            f"Expected at least 2 distinct colors for 2 shared nodes, got: {colors}"
+        )
+
+    def test_markup_escaping(self):
+        # If a variable name or op contains Rich markup delimiters like [ or ],
+        # the label must be escaped so rendering does not raise.
+        x = dvector("x")
+        y = x * 2
+        y.name = "result[0]"  # square brackets would break Rich markup if unescaped
+        tree = debugprint(y.sum(), file="rich")
+        # Verify the name is present in the label (escaped form is still readable).
+        mul_node = tree.children[0].children[0]
+        assert "result" in str(mul_node.label)
+        # Verify Rich can render the tree without raising a markup error.
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, highlight=False)
+        console.print(tree)  # raises MarkupError if escaping is broken
+
+    def test_deep_shared_node_sentinel_depth(self):
+        # A shared node at depth > 1 should show its colored label with ···
+        # as a child at the correct depth in the tree.
+        x = dvector("x")
+        shared = x * 2  # will appear at depth 2 (grandchild of add)
+        out = shared.sum() + shared.mean()
+        tree = debugprint(out, file="rich")
+        add_node = tree.children[0]
+        # Second branch is mean (True_div); its Sum child has the repeat entry.
+        mean_node = add_node.children[1]  # True_div 'mean'
+        sum_under_mean = mean_node.children[0]  # Sum
+        repeat_entry = sum_under_mean.children[0]  # colored repeat entry
+        assert len(repeat_entry.children) == 1, (
+            f"Repeat entry should have exactly one child (···), got: {repeat_entry.children}"
+        )
+        sentinel = repeat_entry.children[0]
+        assert "···" in str(sentinel.label), (
+            f"Expected ··· as child of repeat entry, got: {sentinel.label!r}"
+        )
+        assert len(sentinel.children) == 0, "··· should be a leaf"
+
+    def test_shared_node_colored_across_outputs(self):
+        # A node shared between two separate outputs should produce a colored
+        # canonical label in the first subtree and a colored ··· sentinel in the
+        # second, since node_colors spans all outputs.
+        x = dvector("x")
+        shared = x * 2
+        tree = debugprint([shared.sum(), shared.mean()], file="rich")
+
+        def find_sentinel_and_colored(node):
+            results = []
+            label = str(node.label)
+            if re.search(r"\[(\w+)\]", label) or "···" in label:
+                results.append(label)
+            for child in node.children:
+                results.extend(find_sentinel_and_colored(child))
+            return results
+
+        found = find_sentinel_and_colored(tree)
+        # At minimum: one colored canonical Mul and one ··· sentinel
+        colored = [l for l in found if re.search(r"\[(\w+)\]", l) and "···" not in l]
+        sentinels = [l for l in found if "···" in l]
+        assert colored, "canonical shared node should be colored"
+        assert sentinels, "second occurrence should produce a ··· sentinel"

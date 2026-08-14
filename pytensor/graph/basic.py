@@ -2,15 +2,10 @@
 
 import abc
 import warnings
-from collections import deque
+import weakref
 from collections.abc import (
-    Callable,
-    Collection,
-    Generator,
     Hashable,
     Iterable,
-    Iterator,
-    Reversible,
     Sequence,
 )
 from copy import copy
@@ -23,21 +18,15 @@ from typing import (
     TypeVar,
     Union,
     cast,
-    overload,
 )
 
 import numpy as np
 
-from pytensor.configdefaults import config
 from pytensor.graph.utils import (
     MetaObject,
     Scratchpad,
-    TestValueError,
-    ValidatingScratchpad,
     add_tag_trace,
-    get_variable_trace_string,
 )
-from pytensor.misc.ordered_set import OrderedSet
 
 
 if TYPE_CHECKING:
@@ -50,9 +39,39 @@ OptionalApplyType = TypeVar("OptionalApplyType", None, "Apply", covariant=True)
 _TypeType = TypeVar("_TypeType", bound="Type")
 _IdType = TypeVar("_IdType", bound=Hashable)
 
-T = TypeVar("T", bound="Node")
-NoParams = object()
-NodeAndChildren = tuple[T, Iterable[T] | None]
+_MOVED_FUNCTIONS = {
+    "walk",
+    "ancestors",
+    "graph_inputs",
+    "explicit_graph_inputs",
+    "vars_between",
+    "orhpans_between",
+    "applys_between",
+    "apply_depends_on",
+    "truncated_graph_inputs",
+    "general_toposort",
+    "io_toposort",
+    "list_of_nodes",
+    "get_var_by_name",
+}
+
+
+def __getattr__(name):
+    """Provide backwards-compatibility for functions moved to graph/traversal.py."""
+    if name in _MOVED_FUNCTIONS:
+        warnings.warn(
+            (
+                f"`pytensor.graph.basic.{name}` was moved to `pytensor.graph.traversal.{name}`. "
+                "Calling it from the old location will fail in a future release."
+            ),
+            FutureWarning,
+            stacklevel=2,
+        )
+        from pytensor.graph import traversal
+
+        return getattr(traversal, name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class Node(MetaObject):
@@ -88,7 +107,89 @@ class Node(MetaObject):
         return debugprint(self, **kwargs)
 
 
-class Apply(Node, Generic[OpType]):
+def _warn_deprecated_clone_inner_graph(value, name="clone_inner_graph"):
+    """Warn if a caller still passes the removed ``clone_inner_graph(s)`` kwarg."""
+    if value is not None:
+        warnings.warn(
+            f"`{name}` is deprecated and ignored: inner-graph `Op`s are immutable, "
+            "so cloning always shares them.",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+
+class AbstractApply(Node):
+    r"""Common, immutability-agnostic base for `Apply` and `FrozenApply`.
+
+    Never instantiated directly. It holds the read-only structural API shared by
+    the mutable `Apply` and the immutable, interned `FrozenApply`: the `op`, the
+    `inputs`/`outputs` sequences, and the queries derived from them. Mutation
+    and cloning live on `Apply` alone, so code that must reject frozen nodes can
+    test ``isinstance(x, Apply)`` while code that only reads structure can
+    accept `AbstractApply`.
+    """
+
+    op: "Op"
+    inputs: Sequence["Variable"]
+    outputs: Sequence["Variable"]
+    tag: Scratchpad
+
+    def default_output(self):
+        """
+        Returns the default output for this node.
+
+        Returns
+        -------
+        Variable instance
+            An element of self.outputs, typically self.outputs[0].
+
+        Notes
+        -----
+        May raise AttributeError self.op.default_output is out of range, or if
+        there are multiple outputs and self.op.default_output does not exist.
+
+        """
+        do = getattr(self.op, "default_output", None)
+        if do is None:
+            if len(self.outputs) == 1:
+                return self.outputs[0]
+            else:
+                raise ValueError(
+                    f"Multi-output Op {self.op} default_output not specified"
+                )
+        return self.outputs[do]
+
+    def __str__(self):
+        # FIXME: The called function is too complicated for this simple use case.
+        return op_as_string(self.inputs, self)
+
+    def __repr__(self):
+        return str(self)
+
+    def get_parents(self):
+        return list(self.inputs)
+
+    @property
+    def out(self):
+        """An alias for `self.default_output`"""
+        return self.default_output()
+
+    @property
+    def nin(self):
+        """The number of inputs."""
+        return len(self.inputs)
+
+    @property
+    def nout(self):
+        """The number of outputs."""
+        return len(self.outputs)
+
+    @property
+    def params_type(self):
+        return self.op.params_type
+
+
+class Apply(AbstractApply, Generic[OpType]):  # noqa: UP046
     """A `Node` representing the application of an operation to inputs.
 
     Basically, an `Apply` instance is an object that represents the
@@ -97,7 +198,7 @@ class Apply(Node, Generic[OpType]):
     This class is typically instantiated by a `Op.make_node` method, which
     is called by `Op.__call__`.
 
-    The function `pytensor.compile.function.function` uses `Apply.inputs`
+    The function `pytensor.compile.maker.function` uses `Apply.inputs`
     together with `Variable.owner` to search the expression graph and determine
     which inputs are necessary to compute the function's outputs.
 
@@ -122,6 +223,8 @@ class Apply(Node, Generic[OpType]):
         The outputs of the expression modeled by the `Apply` node.
 
     """
+
+    op: OpType
 
     def __init__(
         self,
@@ -174,44 +277,8 @@ class Apply(Node, Generic[OpType]):
             d["tag"] = t
         return d
 
-    def default_output(self):
-        """
-        Returns the default output for this node.
-
-        Returns
-        -------
-        Variable instance
-            An element of self.outputs, typically self.outputs[0].
-
-        Notes
-        -----
-        May raise AttributeError self.op.default_output is out of range, or if
-        there are multiple outputs and self.op.default_output does not exist.
-
-        """
-        do = getattr(self.op, "default_output", None)
-        if do is None:
-            if len(self.outputs) == 1:
-                return self.outputs[0]
-            else:
-                raise ValueError(
-                    f"Multi-output Op {self.op} default_output not specified"
-                )
-        return self.outputs[do]
-
-    def __str__(self):
-        return op_as_string(self.inputs, self)
-
-    def __repr__(self):
-        return str(self)
-
-    def clone(self, clone_inner_graph: bool = False) -> "Apply[OpType]":
+    def clone(self, clone_inner_graph=None) -> "Apply[OpType]":
         r"""Clone this `Apply` instance.
-
-        Parameters
-        ----------
-        clone_inner_graph
-            If ``True``, clone `HasInnerGraph` `Op`\s and their inner-graphs.
 
         Returns
         -------
@@ -219,24 +286,19 @@ class Apply(Node, Generic[OpType]):
 
         Notes
         -----
-        Tags are copied from `self` to the returned instance.
+        Tags are copied from `self` to the returned instance. Inner-graph `Op`\s
+        are immutable, so the `Op` is shared rather than deep-cloned.
 
         """
-        from pytensor.graph.op import HasInnerGraph
-
-        new_op = self.op
-
-        if isinstance(new_op, HasInnerGraph) and clone_inner_graph:  # type: ignore
-            new_op = new_op.clone()  # type: ignore
-
+        _warn_deprecated_clone_inner_graph(clone_inner_graph)
         cp = self.__class__(
-            new_op, self.inputs, [output.clone() for output in self.outputs]
+            self.op, self.inputs, [output.clone() for output in self.outputs]
         )
         cp.tag = copy(self.tag)
         return cp
 
     def clone_with_new_inputs(
-        self, inputs: Sequence["Variable"], strict=True, clone_inner_graph=False
+        self, inputs: Sequence["Variable"], strict=True, clone_inner_graph=None
     ) -> "Apply[OpType]":
         r"""Duplicate this `Apply` instance in a new graph.
 
@@ -253,8 +315,6 @@ class Apply(Node, Generic[OpType]):
             ``self.outputs``.  If ``False``, then there's no guarantee that the
             clone's outputs will have the same types as ``self.outputs``,
             and cloning may not even be possible (it depends on the `Op`).
-        clone_inner_graph : bool
-            If ``True``, clone `HasInnerGraph` `Op`\s and their inner-graphs.
 
         Returns
         -------
@@ -262,8 +322,7 @@ class Apply(Node, Generic[OpType]):
             An `Apply` instance with the same `Op` but different outputs.
 
         """
-        from pytensor.graph.op import HasInnerGraph
-
+        _warn_deprecated_clone_inner_graph(clone_inner_graph)
         assert isinstance(inputs, list | tuple)
         remake_node = False
         new_inputs: list[Variable] = list(inputs)
@@ -289,42 +348,15 @@ class Apply(Node, Generic[OpType]):
                     remake_node = True
 
         if remake_node:
-            new_op = self.op
-
-            if isinstance(new_op, HasInnerGraph) and clone_inner_graph:  # type: ignore
-                new_op = new_op.clone()  # type: ignore
-
-            new_node = new_op.make_node(*new_inputs)
+            new_node = self.op.make_node(*new_inputs)
             new_node.tag = copy(self.tag).__update__(new_node.tag)
         else:
-            new_node = self.clone(clone_inner_graph=clone_inner_graph)
+            new_node = self.clone()
             new_node.inputs = new_inputs
         return new_node
 
-    def get_parents(self):
-        return list(self.inputs)
 
-    @property
-    def out(self):
-        """An alias for `self.default_output`"""
-        return self.default_output()
-
-    @property
-    def nin(self):
-        """The number of inputs."""
-        return len(self.inputs)
-
-    @property
-    def nout(self):
-        """The number of outputs."""
-        return len(self.outputs)
-
-    @property
-    def params_type(self):
-        return self.op.params_type
-
-
-class Variable(Node, Generic[_TypeType, OptionalApplyType]):
+class Variable(Node, Generic[_TypeType, OptionalApplyType]):  # noqa: UP046
     r"""
     A :term:`Variable` is a node in an expression graph that represents a
     variable.
@@ -404,19 +436,17 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
 
         c = a + b  # create a simple expression
 
-        f = pytensor.function(
-            [b], [c]
-        )  # this works because a has a value associated with it already
+        # this works because a has a value associated with it already
+        f = pytensor.function([b], [c])
 
-        assert 4.0 == f(2.5)  # bind 2.5 to an internal copy of b and evaluate an internal c
+        # bind 2.5 to an internal copy of b and evaluate an internal c
+        assert 4.0 == f(2.5)
 
-        pytensor.function(
-            [a], [c]
-        )  # compilation error because b (required by c) is undefined
+        # compilation error because b (required by c) is undefined
+        pytensor.function([a], [c])
 
-        pytensor.function(
-            [a, b], [c]
-        )  # compilation error because a is constant, it can't be an input
+        # compilation error because a is constant, it can't be an input
+        pytensor.function([a, b], [c])
 
 
     The python variables ``a, b, c`` all refer to instances of type
@@ -428,23 +458,7 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
     # __slots__ = ['type', 'owner', 'index', 'name']
     __count__ = count(0)
 
-    _owner: OptionalApplyType
-
-    @property
-    def owner(self) -> OptionalApplyType:
-        return self._owner
-
-    @owner.setter
-    def owner(self, value) -> None:
-        self._owner = value
-
-    @property
-    def index(self):
-        return self._index
-
-    @index.setter
-    def index(self, value):
-        self._index = value
+    owner: OptionalApplyType
 
     def __init__(
         self,
@@ -455,13 +469,13 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
     ) -> None:
         super().__init__()
 
-        self.tag = ValidatingScratchpad("test_value", type.filter)
+        self.tag = Scratchpad()
 
         self.type = type
 
-        self._owner = owner
+        self.owner = owner
 
-        if owner is not None and not isinstance(owner, Apply):
+        if owner is not None and not isinstance(owner, AbstractApply):
             raise TypeError("owner must be an Apply instance")
 
         if index is not None and not isinstance(index, int):
@@ -473,20 +487,6 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         self.name = name
 
         self.auto_name = f"auto_{next(self.__count__)}"
-
-    def get_test_value(self):
-        """Get the test value.
-
-        Raises
-        ------
-        TestValueError
-
-        """
-        if not hasattr(self.tag, "test_value"):
-            detailed_err_msg = get_variable_trace_string(self)
-            raise TestValueError(f"{self} has no test value {detailed_err_msg}")
-
-        return self.tag.test_value
 
     def __str__(self):
         """Return a ``str`` representation of the `Variable`."""
@@ -501,29 +501,9 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         else:
             return f"<{self.type}>"
 
-    def __repr_test_value__(self):
-        """Return a ``repr`` of the test value.
-
-        Return a printable representation of the test value. It can be
-        overridden by classes with non printable test_value to provide a
-        suitable representation of the test_value.
-        """
-        return repr(self.get_test_value())
-
     def __repr__(self, firstPass=True):
-        """Return a ``repr`` of the `Variable`.
-
-        Return a printable name or description of the Variable. If
-        ``config.print_test_value`` is ``True`` it will also print the test
-        value, if any.
-        """
-        to_print = [str(self)]
-        if config.print_test_value and firstPass:
-            try:
-                to_print.append(self.__repr_test_value__())
-            except TestValueError:
-                pass
-        return "\n".join(to_print)
+        """Return a ``repr`` of the `Variable`."""
+        return str(self)
 
     def clone(self, **kwargs):
         """Return a new, un-owned `Variable` like `self`.
@@ -548,30 +528,26 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         cp.tag = copy(self.tag)
         return cp
 
-    def __lt__(self, other):
-        raise NotImplementedError(
-            "Subclasses of Variable must provide __lt__", self.__class__.__name__
-        )
-
-    def __le__(self, other):
-        raise NotImplementedError(
-            "Subclasses of Variable must provide __le__", self.__class__.__name__
-        )
-
-    def __gt__(self, other):
-        raise NotImplementedError(
-            "Subclasses of Variable must provide __gt__", self.__class__.__name__
-        )
-
-    def __ge__(self, other):
-        raise NotImplementedError(
-            "Subclasses of Variable must provide __ge__", self.__class__.__name__
-        )
-
     def get_parents(self):
         if self.owner is not None:
             return [self.owner]
         return []
+
+    @property
+    def owner_op(self) -> Optional["Op"]:
+        if (apply := self.owner) is not None:
+            return apply.op  # type: ignore[no-any-return]
+        else:
+            return None
+
+    @property
+    def owner_op_and_inputs(
+        self,
+    ) -> tuple[Optional["Op"], *tuple["Variable", ...]]:
+        if (apply := self.owner) is not None:
+            return apply.op, *apply.inputs  # type: ignore[has-type]
+        else:
+            return (None,)
 
     def eval(
         self,
@@ -614,7 +590,8 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         This way of computing has more overhead than a normal PyTensor
         function, so don't use it too much in real scripts.
         """
-        from pytensor.compile.function import function
+        from pytensor.compile.maker import function
+        from pytensor.graph.traversal import get_var_by_name
 
         ignore_unused_input = kwargs.get("on_unused_input", None) in ("ignore", "warn")
 
@@ -664,15 +641,6 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
     def __getstate__(self):
         d = self.__dict__.copy()
         d.pop("_fn_cache", None)
-        if (not config.pickle_test_value) and (hasattr(self.tag, "test_value")):
-            if not type(config).pickle_test_value.is_default:
-                warnings.warn(
-                    "pickle_test_value is not default value (True).\n"
-                    f"Test value of variable {d['auto_name']}({d['name']}) will not be dumped."
-                )
-            t = copy(d["tag"])
-            del t.test_value
-            d["tag"] = t
         return d
 
 
@@ -720,7 +688,7 @@ class AtomicVariable(Variable[_TypeType, None]):
         return cp
 
 
-class NominalVariable(Generic[_TypeType, _IdType], AtomicVariable[_TypeType]):
+class NominalVariable(Generic[_TypeType, _IdType], AtomicVariable[_TypeType]):  # noqa: UP046
     """A variable that enables alpha-equivalent comparisons."""
 
     __instances__: dict[tuple["Type", Hashable], "NominalVariable"] = {}
@@ -734,7 +702,7 @@ class NominalVariable(Generic[_TypeType, _IdType], AtomicVariable[_TypeType]):
                 return cls, (self.id, self.type)
 
             def _str(self):
-                return f"*{self.id}-{var_type.__str__(self)}"
+                return f"i{self.id}"
 
             new_type = type(
                 type_name, (cls, var_type), {"__reduce__": _reduce, "__str__": _str}
@@ -787,16 +755,28 @@ class Constant(AtomicVariable[_TypeType]):
     """
 
     # __slots__ = ['data']
+    # Allow pattern matching on data field positionally
+    __match_args__ = ("data",)
 
     def __init__(self, type: _TypeType, data: Any, name: str | None = None):
         super().__init__(type, name=name)
         self.data = type.filter(data)
         add_tag_trace(self)
 
-    def get_test_value(self):
-        return self.data
-
     def signature(self):
+        """Return a hashable object identifying this Constant by value.
+
+        The returned object must satisfy:
+        1. Hashable: ``hash(sig)`` must not raise.
+        2. Self-equality: ``sig == sig`` must be ``True`` (not an array).
+        3. Pickle-stable: ``pickle.loads(pickle.dumps(sig)) == sig``
+           and same ``hash``. This is required for C module cache keys.
+
+        The default ``(type, data)`` is sufficient for simple Python
+        objects (None, slices, etc.) but breaks for numpy data (NaN,
+        arrays). Subclasses with numeric data must override this.
+        See ``TensorConstantSignature``, ``ScalarConstantSignature``.
+        """
         return (self.type, self.data)
 
     def __str__(self):
@@ -832,388 +812,102 @@ class Constant(AtomicVariable[_TypeType]):
         return self.data
 
 
-def walk(
-    nodes: Iterable[T],
-    expand: Callable[[T], Iterable[T] | None],
-    bfs: bool = True,
-    return_children: bool = False,
-    hash_fn: Callable[[T], int] = id,
-) -> Generator[T | NodeAndChildren, None, None]:
-    r"""Walk through a graph, either breadth- or depth-first.
+def _get_frozen_output(apply_node: "FrozenApply", index: int) -> Variable:
+    """Resolve a FrozenApply output by index. Used by pickle."""
+    return apply_node.outputs[index]
 
-    Parameters
-    ----------
-    nodes
-        The nodes from which to start walking.
-    expand
-        A callable that is applied to each node in `nodes`, the results of
-        which are either new nodes to visit or ``None``.
-    bfs
-        If ``True``, breath first search is used; otherwise, depth first
-        search.
-    return_children
-        If ``True``, each output node will be accompanied by the output of
-        `expand` (i.e. the corresponding child nodes).
-    hash_fn
-        The function used to produce hashes of the elements in `nodes`.
-        The default is ``id``.
 
-    Notes
-    -----
-    A node will appear at most once in the return value, even if it
-    appears multiple times in the `nodes` parameter.
+def _make_frozen_output_reduce(out: Variable):
+    """Create a __reduce_ex__ override for a FrozenApply output Variable."""
+    owner = out.owner
+    index = out.index
 
+    def __reduce_ex__(protocol):
+        return (_get_frozen_output, (owner, index))
+
+    return __reduce_ex__
+
+
+class FrozenApply(AbstractApply):
+    """An immutable, globally-interned application node for frozen graphs.
+
+    It deliberately does *not* subclass `Apply`: its `inputs` / `outputs` are
+    tuples and it has no `clone` / `clone_with_new_inputs`, so it cannot be
+    mutated, rebuilt, or walked by the generic clone machinery -- a frozen node
+    leaking into such a path fails loudly. Code that manipulates a frozen graph
+    must thaw it explicitly first (``FrozenFunctionGraph.unfreeze`` / ``bind``).
+
+    Instances are interned on ``(op, inputs, output_types, topo_idx)``:
+    constructing one with a matching key returns the cached instance.  Constant
+    inputs are keyed by ``signature()`` (so equal-valued Constants share a node).
+    Other inputs are already globally interned, so identity is enough; the key
+    stores their ``id()`` rather than the variables themselves, keeping strong
+    references out of the cache so chains of ``FrozenApply`` nodes collect in a
+    single GC pass.
+
+    ``topo_idx`` is the node's position in a baked custom toposort, or ``-1``
+    when no specific order is imposed (deduplicated graphs).  Keying on it keeps
+    two structurally equal computations at different toposort positions as
+    distinct interned nodes, which is how a `FrozenFunctionGraph` pins a
+    destroy-aware order.
+
+    ``output_types`` is in the key because frozen graphs root on
+    ``NominalVariable`` inputs (index and type only).  Nominalizing truncates the
+    root inputs, discarding the values and subgraphs an Op may have read to
+    derive its output type (e.g. via ``infer_shape``), so ``(op, inputs)`` alone
+    no longer pins it down.
     """
 
-    nodes = deque(nodes)
-
-    rval_set: set[int] = set()
-
-    nodes_pop: Callable[[], T]
-    if bfs:
-        nodes_pop = nodes.popleft
-    else:
-        nodes_pop = nodes.pop
-
-    while nodes:
-        node: T = nodes_pop()
-
-        node_hash: int = hash_fn(node)
-
-        if node_hash not in rval_set:
-            rval_set.add(node_hash)
-
-            new_nodes: Iterable[T] | None = expand(node)
-
-            if return_children:
-                yield node, new_nodes
-            else:
-                yield node
-
-            if new_nodes:
-                nodes.extend(new_nodes)
-
-
-def ancestors(
-    graphs: Iterable[Variable], blockers: Collection[Variable] | None = None
-) -> Generator[Variable, None, None]:
-    r"""Return the variables that contribute to those in given graphs (inclusive).
-
-    Parameters
-    ----------
-    graphs : list of `Variable` instances
-        Output `Variable` instances from which to search backward through
-        owners.
-    blockers : list of `Variable` instances
-        A collection of `Variable`\s that, when found, prevent the graph search
-        from preceding from that point.
-
-    Yields
-    ------
-    `Variable`\s
-        All input nodes, in the order found by a left-recursive depth-first
-        search started at the nodes in `graphs`.
-
-    """
-
-    def expand(r: Variable) -> Iterator[Variable] | None:
-        if r.owner and (not blockers or r not in blockers):
-            return reversed(r.owner.inputs)
-        return None
-
-    yield from cast(Generator[Variable, None, None], walk(graphs, expand, False))
-
-
-def graph_inputs(
-    graphs: Iterable[Variable], blockers: Collection[Variable] | None = None
-) -> Generator[Variable, None, None]:
-    r"""Return the inputs required to compute the given Variables.
-
-    Parameters
-    ----------
-    graphs : list of `Variable` instances
-        Output `Variable` instances from which to search backward through
-        owners.
-    blockers : list of `Variable` instances
-        A collection of `Variable`\s that, when found, prevent the graph search
-        from preceding from that point.
-
-    Yields
-    ------
-        Input nodes with no owner, in the order found by a left-recursive
-        depth-first search started at the nodes in `graphs`.
-
-    """
-    yield from (r for r in ancestors(graphs, blockers) if r.owner is None)
-
-
-def explicit_graph_inputs(
-    graph: Variable | Iterable[Variable],
-) -> Generator[Variable, None, None]:
-    """
-    Get the root variables needed as inputs to a function that computes `graph`
-
-    Parameters
-    ----------
-    graph : TensorVariable
-        Output `Variable` instances for which to search backward through
-        owners.
-
-    Returns
-    -------
-    iterable
-        Generator of root Variables (without owner) needed to compile a function that evaluates `graphs`.
-
-    Examples
-    --------
-
-    .. code-block:: python
-
-        import pytensor
-        import pytensor.tensor as pt
-        from pytensor.graph.basic import explicit_graph_inputs
-
-        x = pt.vector("x")
-        y = pt.constant(2)
-        z = pt.mul(x * y)
-
-        inputs = list(explicit_graph_inputs(z))
-        f = pytensor.function(inputs, z)
-        eval = f([1, 2, 3])
-
-        print(eval)
-        # [2. 4. 6.]
-    """
-    from pytensor.compile.sharedvalue import SharedVariable
-
-    if isinstance(graph, Variable):
-        graph = [graph]
-
-    return (
-        v
-        for v in graph_inputs(graph)
-        if isinstance(v, Variable) and not isinstance(v, Constant | SharedVariable)
-    )
-
-
-def vars_between(
-    ins: Iterable[Variable], outs: Iterable[Variable]
-) -> Generator[Variable, None, None]:
-    r"""Extract the `Variable`\s within the sub-graph between input and output nodes.
-
-    Parameters
-    ----------
-    ins
-        Input `Variable`\s.
-    outs
-        Output `Variable`\s.
-
-    Yields
-    ------
-    The `Variable`\s that are involved in the subgraph that lies
-    between `ins` and `outs`. This includes `ins`, `outs`,
-    ``orphans_between(ins, outs)`` and all values of all intermediary steps from
-    `ins` to `outs`.
-
-    """
-
-    ins = set(ins)
-
-    def expand(r: Variable) -> Iterable[Variable] | None:
-        if r.owner and r not in ins:
-            return reversed(r.owner.inputs + r.owner.outputs)
-        return None
-
-    yield from cast(Generator[Variable, None, None], walk(outs, expand))
-
-
-def orphans_between(
-    ins: Collection[Variable], outs: Iterable[Variable]
-) -> Generator[Variable, None, None]:
-    r"""Extract the `Variable`\s not within the sub-graph between input and output nodes.
-
-    Parameters
-    ----------
-    ins : list
-        Input `Variable`\s.
-    outs : list
-        Output `Variable`\s.
-
-    Yields
-    -------
-    Variable
-        The `Variable`\s upon which one or more `Variable`\s in `outs`
-        depend, but are neither in `ins` nor in the sub-graph that lies between
-        them.
-
-    Examples
-    --------
-    >>> from pytensor.graph.basic import orphans_between
-    >>> from pytensor.tensor import scalars
-    >>> x, y = scalars("xy")
-    >>> list(orphans_between([x], [(x + y)]))
-    [y]
-
-    """
-    yield from (r for r in vars_between(ins, outs) if r.owner is None and r not in ins)
-
-
-def applys_between(
-    ins: Collection[Variable], outs: Iterable[Variable]
-) -> Generator[Apply, None, None]:
-    r"""Extract the `Apply`\s contained within the sub-graph between given input and output variables.
-
-    Parameters
-    ----------
-    ins : list
-        Input `Variable`\s.
-    outs : list
-        Output `Variable`\s.
-
-    Yields
-    ------
-    The `Apply`\s that are contained within the sub-graph that lies
-    between `ins` and `outs`, including the owners of the `Variable`\s in
-    `outs` and intermediary `Apply`\s between `ins` and `outs`, but not the
-    owners of the `Variable`\s in `ins`.
-
-    """
-    yield from (
-        r.owner for r in vars_between(ins, outs) if r not in ins and r.owner is not None
-    )
-
-
-def truncated_graph_inputs(
-    outputs: Sequence[Variable],
-    ancestors_to_include: Collection[Variable] | None = None,
-) -> list[Variable]:
-    """Get the truncate graph inputs.
-
-    Unlike :func:`graph_inputs` this function will return
-    the closest variables to outputs that do not depend on
-    ``ancestors_to_include``. So given all the returned
-    variables provided there is no missing variable to
-    compute the output and all variables are independent
-    from each other.
-
-    Parameters
-    ----------
-    outputs : Collection[Variable]
-        Variable to get conditions for
-    ancestors_to_include : Optional[Collection[Variable]]
-        Additional ancestors to assume, by default None
-
-    Returns
-    -------
-    List[Variable]
-        Variables required to compute ``outputs``
-
-    Examples
-    --------
-    The returned variables marked in (parenthesis), ancestors variables are ``c``, output variables are ``o``
-
-    * No ancestors to include
-
-    .. code-block::
-
-        n - n - (o)
-
-    * One ancestors to include
-
-    .. code-block::
-
-        n - (c) - o
-
-    * Two ancestors to include where on depends on another, both returned
-
-    .. code-block::
-
-        (c) - (c) - o
-
-    * Additional variables are present
-
-    .. code-block::
-
-           (c) - n - o
-        n - (n) -'
-
-    * Disconnected ancestors to include not returned
-
-    .. code-block::
-
-        (c) - n - o
-         c
-
-    * Disconnected output is present and returned
-
-    .. code-block::
-
-        (c) - (c) - o
-        (o)
-
-    * ancestors to include that include itself adds itself
-
-    .. code-block::
-
-        n - (c) - (o/c)
-
-    """
-    # simple case, no additional ancestors to include
-    truncated_inputs: list[Variable] = list()
-    # blockers have known independent variables and ancestors to include
-    candidates = list(outputs)
-    if not ancestors_to_include:  # None or empty
-        # just filter out unique variables
-        for variable in candidates:
-            if variable not in truncated_inputs:
-                truncated_inputs.append(variable)
-        # no more actions are needed
-        return truncated_inputs
-
-    blockers: set[Variable] = set(ancestors_to_include)
-    # variables that go here are under check already, do not repeat the loop for them
-    seen: set[Variable] = set()
-    # enforce O(1) check for variable in ancestors to include
-    ancestors_to_include = blockers.copy()
-
-    while candidates:
-        # on any new candidate
-        variable = candidates.pop()
-        # we've looked into this variable already
-        if variable in seen:
-            continue
-        # check if the variable is independent, never go above blockers;
-        # blockers are independent variables and ancestors to include
-        elif variable in ancestors_to_include:
-            # The case where variable is in ancestors to include so we check if it depends on others
-            # it should be removed from the blockers to check against the rest
-            dependent = variable_depends_on(variable, ancestors_to_include - {variable})
-            # ancestors to include that are present in the graph (not disconnected)
-            # should be added to truncated_inputs
-            truncated_inputs.append(variable)
-            if dependent:
-                # if the ancestors to include is still dependent we need to go above, the search is not yet finished
-                # owner can never be None for a dependent variable
-                candidates.extend(n for n in variable.owner.inputs if n not in seen)
-        else:
-            # A regular variable to check
-            dependent = variable_depends_on(variable, blockers)
-            # all regular variables fall to blockers
-            # 1. it is dependent - further search irrelevant
-            # 2. it is independent - the search variable is inside the closure
-            blockers.add(variable)
-            # if we've found an independent variable and it is not in blockers so far
-            # it is a new independent variable not present in ancestors to include
-            if dependent:
-                # populate search if it's not an independent variable
-                # owner can never be None for a dependent variable
-                candidates.extend(n for n in variable.owner.inputs if n not in seen)
-            else:
-                # otherwise, do not search beyond
-                truncated_inputs.append(variable)
-        # add variable to seen, no point in checking it once more
-        seen.add(variable)
-    return truncated_inputs
+    _cache: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+    topo_idx: int
+
+    def __new__(
+        cls,
+        op: "Op",
+        inputs: tuple[Variable, ...],
+        output_types: tuple["Type", ...],
+        topo_idx: int = -1,
+    ):
+        cache_key = (
+            op,
+            tuple(i.signature() if isinstance(i, Constant) else id(i) for i in inputs),
+            output_types,
+            topo_idx,
+        )
+        cached = cls._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        instance = object.__new__(cls)
+        instance.op = op
+        instance.topo_idx = topo_idx
+        instance.inputs = inputs
+        instance.outputs = tuple(
+            t.variable_type(type=t, owner=instance, index=i)
+            for i, t in enumerate(output_types)
+        )
+        # Give each output Variable a __reduce__ that resolves to the
+        # canonical output on unpickle, avoiding fresh Variable objects.
+        for out in instance.outputs:
+            out.__reduce_ex__ = _make_frozen_output_reduce(out)  # type: ignore[method-assign]
+        instance.tag = Scratchpad()
+        cls._cache[cache_key] = instance
+        return instance
+
+    def __init__(self, op, inputs, output_types, topo_idx=-1):
+        # All initialization is done in __new__
+        pass
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (
+                self.op,
+                self.inputs,
+                tuple(o.type for o in self.outputs),
+                self.topo_idx,
+            ),
+        )
 
 
 def clone(
@@ -1221,7 +915,7 @@ def clone(
     outputs: Sequence[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool | None = None,
-    clone_inner_graphs: bool = False,
+    clone_inner_graphs=None,
 ) -> tuple[list[Variable], list[Variable]]:
     r"""Copies the sub-graph contained between inputs and outputs.
 
@@ -1237,9 +931,6 @@ def clone(
         When ``None``, use the `copy_inputs` value.
         When ``True``, new orphans nodes are created.
         When ``False``, original orphans nodes are reused in the new graph.
-    clone_inner_graphs : bool
-        If ``True``, clone `HasInnerGraph` `Op`\s and their inner-graphs.
-
     Returns
     -------
     The inputs and outputs of that copy.
@@ -1252,6 +943,7 @@ def clone(
     conditional on the `copy_orphans` parameter.
 
     """
+    _warn_deprecated_clone_inner_graph(clone_inner_graphs, "clone_inner_graphs")
     if copy_orphans is None:
         copy_orphans = copy_inputs
     equiv = clone_get_equiv(
@@ -1259,7 +951,6 @@ def clone(
         outputs,
         copy_inputs=copy_inputs,
         copy_orphans=copy_orphans,
-        clone_inner_graphs=clone_inner_graphs,
     )
     return [cast(Variable, equiv[input]) for input in inputs], [
         cast(Variable, equiv[output]) for output in outputs
@@ -1269,13 +960,9 @@ def clone(
 def clone_node_and_cache(
     node: Apply,
     clone_d: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
-    clone_inner_graphs=False,
     **kwargs,
 ) -> Apply | None:
     """Clone an `Apply` node and cache the results in `clone_d`.
-
-    This function handles `Op` clones that are generated by inner-graph
-    cloning.
 
     Returns
     -------
@@ -1288,29 +975,11 @@ def clone_node_and_cache(
         # `clone_d`, then there's likely no need to clone it
         return None
 
-    # Use a cached `Op` clone when available
-    new_op: Op | None = cast(Optional["Op"], clone_d.get(node.op))
-
     cloned_inputs: list[Variable] = [cast(Variable, clone_d[i]) for i in node.inputs]
 
-    new_node = node.clone_with_new_inputs(
-        cloned_inputs,
-        # Only clone inner-graph `Op`s when there isn't a cached clone (and
-        # when `clone_inner_graphs` is enabled)
-        clone_inner_graph=clone_inner_graphs if new_op is None else False,
-        **kwargs,
-    )
-
-    if new_op:
-        # If we didn't clone the inner-graph `Op` above, because
-        # there was a cached version, set the cloned `Apply` to use
-        # the cached clone `Op`
-        new_node.op = new_op
+    new_node = node.clone_with_new_inputs(cloned_inputs, **kwargs)
 
     clone_d[node] = new_node
-
-    if new_node.op is not node.op:
-        clone_d.setdefault(node.op, new_node.op)
 
     for old_o, new_o in zip(node.outputs, new_node.outputs, strict=True):
         clone_d.setdefault(old_o, new_o)
@@ -1320,13 +989,12 @@ def clone_node_and_cache(
 
 def clone_get_equiv(
     inputs: Iterable[Variable],
-    outputs: Reversible[Variable],
+    outputs: Iterable[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool = True,
-    memo: (
-        dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]] | None
-    ) = None,
-    clone_inner_graphs: bool = False,
+    memo: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]
+    | None = None,
+    clone_inner_graphs=None,
     **kwargs,
 ) -> dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]:
     r"""Clone the graph between `inputs` and `outputs` and return a map of the cloned objects.
@@ -1356,12 +1024,13 @@ def clone_get_equiv(
         Optionally start with a partly-filled dictionary for the return value.
         If a dictionary is passed, this function will work in-place on that
         dictionary and return it.
-    clone_inner_graphs
-        If ``True``, clone `HasInnerGraph` `Op`\s and their inner-graphs.
     kwargs
         Keywords passed to `Apply.clone_with_new_inputs`.
 
     """
+    from pytensor.graph.traversal import toposort
+
+    _warn_deprecated_clone_inner_graph(clone_inner_graphs, "clone_inner_graphs")
     if memo is None:
         memo = {}
 
@@ -1376,7 +1045,7 @@ def clone_get_equiv(
             memo.setdefault(input, input)
 
     # go through the inputs -> outputs graph cloning as we go
-    for apply in io_toposort(inputs, outputs):
+    for apply in toposort(outputs, blockers=inputs):
         for input in apply.inputs:
             if input not in memo:
                 if not isinstance(input, Constant) and copy_orphans:
@@ -1385,9 +1054,7 @@ def clone_get_equiv(
                 else:
                     memo[input] = input
 
-        clone_node_and_cache(
-            apply, memo, clone_inner_graphs=clone_inner_graphs, **kwargs
-        )
+        clone_node_and_cache(apply, memo, **kwargs)
 
     # finish up by cloning any remaining outputs (it can happen)
     for output in outputs:
@@ -1397,310 +1064,11 @@ def clone_get_equiv(
     return memo
 
 
-@overload
-def general_toposort(
-    outputs: Iterable[T],
-    deps: None,
-    compute_deps_cache: Callable[[T], OrderedSet | list[T] | None],
-    deps_cache: dict[T, list[T]] | None,
-    clients: dict[T, list[T]] | None,
-) -> list[T]: ...
-
-
-@overload
-def general_toposort(
-    outputs: Iterable[T],
-    deps: Callable[[T], OrderedSet | list[T]],
-    compute_deps_cache: None,
-    deps_cache: None,
-    clients: dict[T, list[T]] | None,
-) -> list[T]: ...
-
-
-def general_toposort(
-    outputs: Iterable[T],
-    deps: Callable[[T], OrderedSet | list[T]] | None,
-    compute_deps_cache: Callable[[T], OrderedSet | list[T] | None] | None = None,
-    deps_cache: dict[T, list[T]] | None = None,
-    clients: dict[T, list[T]] | None = None,
-) -> list[T]:
-    """Perform a topological sort of all nodes starting from a given node.
-
-    Parameters
-    ----------
-    deps : callable
-        A Python function that takes a node as input and returns its dependence.
-    compute_deps_cache : optional
-        If provided, `deps_cache` should also be provided. This is a function like
-        `deps`, but that also caches its results in a ``dict`` passed as `deps_cache`.
-    deps_cache : dict
-        A ``dict`` mapping nodes to their children.  This is populated by
-        `compute_deps_cache`.
-    clients : dict
-        If a ``dict`` is passed, it will be filled with a mapping of
-        nodes-to-clients for each node in the subgraph.
-
-    Notes
-    -----
-
-    ``deps(i)`` should behave like a pure function (no funny business with
-    internal state).
-
-    ``deps(i)`` will be cached by this function (to be fast).
-
-    The order of the return value list is determined by the order of nodes
-    returned by the `deps` function.
-
-    The second option removes a Python function call, and allows for more
-    specialized code, so it can be faster.
-
-    """
-    if compute_deps_cache is None:
-        if deps_cache is None:
-            deps_cache = {}
-
-        def _compute_deps_cache_(io):
-            if io not in deps_cache:
-                d = deps(io)
-
-                if d:
-                    if not isinstance(d, list | OrderedSet):
-                        raise TypeError(
-                            "Non-deterministic collections found; make"
-                            " toposort non-deterministic."
-                        )
-                    deps_cache[io] = list(d)
-                else:
-                    deps_cache[io] = None
-
-                return d
-            else:
-                return deps_cache[io]
-
-        _compute_deps_cache = _compute_deps_cache_
-
-    else:
-        _compute_deps_cache = compute_deps_cache
-
-    if deps_cache is None:
-        raise ValueError("deps_cache cannot be None")
-
-    search_res: list[NodeAndChildren] = cast(
-        list[NodeAndChildren],
-        list(walk(outputs, _compute_deps_cache, bfs=False, return_children=True)),
-    )
-
-    _clients: dict[T, list[T]] = {}
-    sources: deque[T] = deque()
-    search_res_len = len(search_res)
-    for snode, children in search_res:
-        if children:
-            for child in children:
-                _clients.setdefault(child, []).append(snode)
-        if not deps_cache.get(snode):
-            sources.append(snode)
-
-    if clients is not None:
-        clients.update(_clients)
-
-    rset: set[T] = set()
-    rlist: list[T] = []
-    while sources:
-        node: T = sources.popleft()
-        if node not in rset:
-            rlist.append(node)
-            rset.add(node)
-            for client in _clients.get(node, []):
-                d = [a for a in deps_cache[client] if a is not node]
-                deps_cache[client] = d
-                if not d:
-                    sources.append(client)
-
-    if len(rlist) != search_res_len:
-        raise ValueError("graph contains cycles")
-
-    return rlist
-
-
-def io_toposort(
-    inputs: Iterable[Variable],
-    outputs: Reversible[Variable],
-    orderings: dict[Apply, list[Apply]] | None = None,
-    clients: dict[Variable, list[Variable]] | None = None,
-) -> list[Apply]:
-    """Perform topological sort from input and output nodes.
-
-    Parameters
-    ----------
-    inputs : list or tuple of Variable instances
-        Graph inputs.
-    outputs : list or tuple of Apply instances
-        Graph outputs.
-    orderings : dict
-        Keys are `Apply` instances, values are lists of `Apply` instances.
-    clients : dict
-        If provided, it will be filled with mappings of nodes-to-clients for
-        each node in the subgraph that is sorted.
-
-    """
-    if not orderings and clients is None:  # ordering can be None or empty dict
-        # Specialized function that is faster when more then ~10 nodes
-        # when no ordering.
-
-        # Do a new stack implementation with the vm algo.
-        # This will change the order returned.
-        computed = set(inputs)
-        todo = [o.owner for o in reversed(outputs) if o.owner]
-        order = []
-        while todo:
-            cur = todo.pop()
-            if all(out in computed for out in cur.outputs):
-                continue
-            if all(i in computed or i.owner is None for i in cur.inputs):
-                computed.update(cur.outputs)
-                order.append(cur)
-            else:
-                todo.append(cur)
-                todo.extend(
-                    i.owner for i in cur.inputs if (i.owner and i not in computed)
-                )
-        return order
-
-    iset = set(inputs)
-
-    if not orderings:  # ordering can be None or empty dict
-        # Specialized function that is faster when no ordering.
-        # Also include the cache in the function itself for speed up.
-
-        deps_cache: dict = {}
-
-        def compute_deps_cache(obj):
-            if obj in deps_cache:
-                return deps_cache[obj]
-            rval = []
-            if obj not in iset:
-                if isinstance(obj, Variable):
-                    if obj.owner:
-                        rval = [obj.owner]
-                elif isinstance(obj, Apply):
-                    rval = list(obj.inputs)
-                if rval:
-                    deps_cache[obj] = list(rval)
-                else:
-                    deps_cache[obj] = rval
-            else:
-                deps_cache[obj] = rval
-            return rval
-
-        topo = general_toposort(
-            outputs,
-            deps=None,
-            compute_deps_cache=compute_deps_cache,
-            deps_cache=deps_cache,
-            clients=clients,
-        )
-
-    else:
-        # the inputs are used only here in the function that decides what
-        # 'predecessors' to explore
-        def compute_deps(obj):
-            rval = []
-            if obj not in iset:
-                if isinstance(obj, Variable):
-                    if obj.owner:
-                        rval = [obj.owner]
-                elif isinstance(obj, Apply):
-                    rval = list(obj.inputs)
-                rval.extend(orderings.get(obj, []))
-            else:
-                assert not orderings.get(obj, None)
-            return rval
-
-        topo = general_toposort(
-            outputs,
-            deps=compute_deps,
-            compute_deps_cache=None,
-            deps_cache=None,
-            clients=clients,
-        )
-    return [o for o in topo if isinstance(o, Apply)]
-
-
-default_leaf_formatter = str
-
-
 def default_node_formatter(op, argstrings):
     return f"{op.op}({', '.join(argstrings)})"
 
 
-def io_connection_pattern(inputs, outputs):
-    """Return the connection pattern of a subgraph defined by given inputs and outputs."""
-    inner_nodes = io_toposort(inputs, outputs)
-
-    # Initialize 'connect_pattern_by_var' by establishing each input as
-    # connected only to itself
-    connect_pattern_by_var = {}
-    nb_inputs = len(inputs)
-
-    for i in range(nb_inputs):
-        input = inputs[i]
-        inp_connection_pattern = [i == j for j in range(nb_inputs)]
-        connect_pattern_by_var[input] = inp_connection_pattern
-
-    # Iterate through the nodes used to produce the outputs from the
-    # inputs and, for every node, infer their connection pattern to
-    # every input from the connection patterns of their parents.
-    for n in inner_nodes:
-        # Get the connection pattern of the inner node's op. If the op
-        # does not define a connection_pattern method, assume that
-        # every node output is connected to every node input
-        try:
-            op_connection_pattern = n.op.connection_pattern(n)
-        except AttributeError:
-            op_connection_pattern = [[True] * len(n.outputs)] * len(n.inputs)
-
-        # For every output of the inner node, figure out which inputs it
-        # is connected to by combining the connection pattern of the inner
-        # node and the connection patterns of the inner node's inputs.
-        for out_idx in range(len(n.outputs)):
-            out = n.outputs[out_idx]
-            out_connection_pattern = [False] * nb_inputs
-
-            for inp_idx in range(len(n.inputs)):
-                inp = n.inputs[inp_idx]
-
-                if inp in connect_pattern_by_var:
-                    inp_connection_pattern = connect_pattern_by_var[inp]
-
-                    # If the node output is connected to the node input, it
-                    # means it is connected to every inner input that the
-                    # node inputs is connected to
-                    if op_connection_pattern[inp_idx][out_idx]:
-                        out_connection_pattern = [
-                            out_connection_pattern[i] or inp_connection_pattern[i]
-                            for i in range(nb_inputs)
-                        ]
-
-            # Store the connection pattern of the node output
-            connect_pattern_by_var[out] = out_connection_pattern
-
-    # Obtain the global connection pattern by combining the
-    # connection patterns of the individual outputs
-    global_connection_pattern = [[] for o in range(len(inputs))]
-    for out in outputs:
-        out_connection_pattern = connect_pattern_by_var.get(out)
-        if out_connection_pattern is None:
-            # the output is completely isolated from inputs
-            out_connection_pattern = [False] * len(inputs)
-        for i in range(len(inputs)):
-            global_connection_pattern[i].append(out_connection_pattern[i])
-
-    return global_connection_pattern
-
-
-def op_as_string(
-    i, op, leaf_formatter=default_leaf_formatter, node_formatter=default_node_formatter
-):
+def op_as_string(i, op, leaf_formatter=str, node_formatter=default_node_formatter):
     """Return a function that returns a string representation of the subgraph between `i` and :attr:`op.inputs`"""
     strs = as_string(i, op.inputs, leaf_formatter, node_formatter)
     return node_formatter(op, strs)
@@ -1709,7 +1077,7 @@ def op_as_string(
 def as_string(
     inputs: list[Variable],
     outputs: list[Variable],
-    leaf_formatter=default_leaf_formatter,
+    leaf_formatter=str,
     node_formatter=default_node_formatter,
 ) -> list[str]:
     r"""Returns a string representation of the subgraph between `inputs` and `outputs`.
@@ -1737,6 +1105,8 @@ def as_string(
         viewing convenience).
 
     """
+    from pytensor.graph.traversal import applys_between, orphans_between
+
     i = set(inputs)
 
     orph = list(orphans_between(i, outputs))
@@ -1787,82 +1157,6 @@ def as_string(
     return [describe(output) for output in outputs]
 
 
-def view_roots(node: Variable) -> list[Variable]:
-    """Return the leaves from a search through consecutive view-maps."""
-    owner = node.owner
-    if owner is not None:
-        try:
-            vars_to_views = {owner.outputs[o]: i for o, i in owner.op.view_map.items()}
-        except AttributeError:
-            return [node]
-        if node in vars_to_views:
-            answer = []
-            for i in vars_to_views[node]:
-                answer += view_roots(owner.inputs[i])
-            return answer
-        else:
-            return [node]
-    else:
-        return [node]
-
-
-def apply_depends_on(apply: Apply, depends_on: Apply | Collection[Apply]) -> bool:
-    """Determine if any `depends_on` is in the graph given by ``apply``.
-
-    Parameters
-    ----------
-    apply : Apply
-        The Apply node to check.
-    depends_on : Union[Apply, Collection[Apply]]
-        Apply nodes to check dependency on
-
-    Returns
-    -------
-    bool
-
-    """
-    computed = set()
-    todo = [apply]
-    if not isinstance(depends_on, Collection):
-        depends_on = {depends_on}
-    else:
-        depends_on = set(depends_on)
-    while todo:
-        cur = todo.pop()
-        if cur.outputs[0] in computed:
-            continue
-        if all(i in computed or i.owner is None for i in cur.inputs):
-            computed.update(cur.outputs)
-            if cur in depends_on:
-                return True
-        else:
-            todo.append(cur)
-            todo.extend(i.owner for i in cur.inputs if i.owner)
-    return False
-
-
-def variable_depends_on(
-    variable: Variable, depends_on: Variable | Collection[Variable]
-) -> bool:
-    """Determine if any `depends_on` is in the graph given by ``variable``.
-    Parameters
-    ----------
-    variable: Variable
-        Node to check
-    depends_on: Collection[Variable]
-        Nodes to check dependency on
-
-    Returns
-    -------
-    bool
-    """
-    if not isinstance(depends_on, Collection):
-        depends_on = {depends_on}
-    else:
-        depends_on = set(depends_on)
-    return any(interim in depends_on for interim in ancestors([variable]))
-
-
 def equal_computations(
     xs: list[np.ndarray | Variable],
     ys: list[np.ndarray | Variable],
@@ -1904,14 +1198,14 @@ def equal_computations(
 
     for x, y in zip(xs, ys, strict=True):
         if not isinstance(x, Variable) and not isinstance(y, Variable):
-            return np.array_equal(x, y)
+            return np.array_equal(x, y, equal_nan=True)
         if not isinstance(x, Variable):
             if isinstance(y, Constant):
-                return np.array_equal(y.data, x)
+                return np.array_equal(y.data, x, equal_nan=True)
             return False
         if not isinstance(y, Variable):
             if isinstance(x, Constant):
-                return np.array_equal(x.data, y)
+                return np.array_equal(x.data, y, equal_nan=True)
             return False
         x_is_owned, y_is_owned = (x.owner is not None, y.owner is not None)
         if x_is_owned != y_is_owned:
@@ -2029,78 +1323,3 @@ def equal_computations(
                 return False
 
     return True
-
-
-def get_var_by_name(
-    graphs: Iterable[Variable], target_var_id: str, ids: str = "CHAR"
-) -> tuple[Variable, ...]:
-    r"""Get variables in a graph using their names.
-
-    Parameters
-    ----------
-    graphs:
-        The graph, or graphs, to search.
-    target_var_id:
-        The name to match against either ``Variable.name`` or
-        ``Variable.auto_name``.
-
-    Returns
-    -------
-    A ``tuple`` containing all the `Variable`\s that match `target_var_id`.
-
-    """
-    from pytensor.graph.op import HasInnerGraph
-
-    def expand(r) -> list[Variable] | None:
-        if not r.owner:
-            return None
-
-        res = list(r.owner.inputs)
-
-        if isinstance(r.owner.op, HasInnerGraph):
-            res.extend(r.owner.op.inner_outputs)
-
-        return res
-
-    results: tuple[Variable, ...] = ()
-    for var in walk(graphs, expand, False):
-        var = cast(Variable, var)
-        if target_var_id == var.name or target_var_id == var.auto_name:
-            results += (var,)
-
-    return results
-
-
-def replace_nominals_with_dummies(inputs, outputs):
-    """Replace nominal inputs with dummy variables.
-
-    When constructing a new graph with nominal inputs from an existing graph,
-    pre-existing nominal inputs need to be replaced with dummy variables
-    beforehand; otherwise, sequential ID ordering (i.e. when nominals are IDed
-    based on the ordered inputs to which they correspond) of the nominals could
-    be broken, and/or circular replacements could manifest.
-
-    FYI: This function assumes that all the nominal variables in the subgraphs
-    between `inputs` and `outputs` are present in `inputs`.
-
-    """
-    existing_nominal_replacements = {
-        i: i.type() for i in inputs if isinstance(i, NominalVariable)
-    }
-
-    if existing_nominal_replacements:
-        # Replace existing nominal variables, because we need to produce an
-        # inner-graph for which the nominal variable IDs correspond exactly
-        # to their input order
-        _ = clone_get_equiv(
-            inputs,
-            outputs,
-            copy_inputs=False,
-            copy_orphans=False,
-            memo=existing_nominal_replacements,
-        )
-
-        outputs = [existing_nominal_replacements[o] for o in outputs]
-        inputs = [existing_nominal_replacements[i] for i in inputs]
-
-    return inputs, outputs

@@ -1,6 +1,6 @@
 from collections.abc import Callable
-from copy import copy
 from functools import singledispatch
+from hashlib import sha256
 from textwrap import dedent
 
 import numba
@@ -13,8 +13,18 @@ import pytensor.tensor.random.basic as ptr
 from pytensor.graph import Apply
 from pytensor.graph.op import Op
 from pytensor.link.numba.dispatch import basic as numba_basic
-from pytensor.link.numba.dispatch.basic import direct_cast, numba_funcify
+from pytensor.link.numba.dispatch.basic import (
+    direct_cast,
+    generate_fallback_impl,
+    numba_funcify,
+    register_funcify_and_cache_key,
+)
+from pytensor.link.numba.dispatch.compile_ops import numba_deepcopy
 from pytensor.link.numba.dispatch.vectorize_codegen import (
+    NO_INDEXED_INPUTS,
+    NO_INDEXED_OUTPUTS,
+    NO_REDUCE_OUTPUTS,
+    NO_SIZE,
     _jit_options,
     _vectorized,
     encode_literals,
@@ -25,24 +35,27 @@ from pytensor.link.utils import (
 )
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.random.op import RandomVariable, RandomVariableWithCoreShape
+from pytensor.tensor.random.utils import custom_rng_deepcopy
 from pytensor.tensor.type_other import NoneTypeT
 from pytensor.tensor.utils import _parse_gufunc_signature
 
 
-@overload(copy)
-def copy_NumPyRandomGenerator(rng):
-    def impl(rng):
-        # TODO: Open issue on Numba?
-        with numba.objmode(new_rng=types.npy_rng):
-            new_rng = copy(rng)
+@numba.extending.overload(numba_deepcopy)
+def numba_deepcopy_random_generator(x):
+    if isinstance(x, numba.types.NumPyRandomGeneratorType):
 
-        return new_rng
+        def random_generator_deepcopy(x):
+            with numba.objmode(new_rng=types.npy_rng):
+                new_rng = custom_rng_deepcopy(x)
+            return new_rng
 
-    return impl
+        return random_generator_deepcopy
 
 
 @singledispatch
-def numba_core_rv_funcify(op: Op, node: Apply) -> Callable:
+def numba_core_rv_funcify(
+    op: Op, node: Apply
+) -> Callable | tuple[Callable, int | None]:
     """Return the core function for a random variable operation."""
     raise NotImplementedError(f"Core implementation of {op} not implemented.")
 
@@ -64,7 +77,6 @@ def numba_core_rv_funcify(op: Op, node: Apply) -> Callable:
 @numba_core_rv_funcify.register(ptr.LaplaceRV)
 @numba_core_rv_funcify.register(ptr.BinomialRV)
 @numba_core_rv_funcify.register(ptr.NegBinomialRV)
-@numba_core_rv_funcify.register(ptr.MultinomialRV)
 @numba_core_rv_funcify.register(ptr.PermutationRV)
 @numba_core_rv_funcify.register(ptr.IntegersRV)
 def numba_core_rv_default(op, node):
@@ -92,7 +104,7 @@ def numba_core_rv_default(op, node):
 def numba_core_BernoulliRV(op, node):
     out_dtype = node.outputs[1].type.numpy_dtype
 
-    @numba_basic.numba_njit()
+    @numba_basic.numba_njit
     def random(rng, p):
         return (
             direct_cast(0, out_dtype)
@@ -101,6 +113,15 @@ def numba_core_BernoulliRV(op, node):
         )
 
     return random
+
+
+@numba_core_rv_funcify.register(ptr.StudentTRV)
+def numba_core_StudentTRV(op, node):
+    @numba_basic.numba_njit
+    def random_fn(rng, df, loc, scale):
+        return loc + scale * rng.standard_t(df)
+
+    return random_fn
 
 
 @numba_core_rv_funcify.register(ptr.HalfNormalRV)
@@ -116,7 +137,7 @@ def numba_core_HalfNormalRV(op, node):
 def numba_core_CauchyRV(op, node):
     @numba_basic.numba_njit
     def random(rng, loc, scale):
-        return (loc + rng.standard_cauchy()) / scale
+        return loc + scale * rng.standard_cauchy()
 
     return random
 
@@ -132,6 +153,15 @@ def numba_core_ParetoRV(op, node):
     return random
 
 
+@numba_core_rv_funcify.register(ptr.InvGammaRV)
+def numba_core_InvGammaRV(op, node):
+    @numba_basic.numba_njit
+    def random(rng, shape, scale):
+        return 1 / rng.gamma(shape, 1 / scale)
+
+    return random
+
+
 @numba_core_rv_funcify.register(ptr.CategoricalRV)
 def core_CategoricalRV(op, node):
     @numba_basic.numba_njit
@@ -142,28 +172,71 @@ def core_CategoricalRV(op, node):
     return random_fn
 
 
-@numba_core_rv_funcify.register(ptr.MvNormalRV)
-def core_MvNormalRV(op, node):
+@numba_core_rv_funcify.register(ptr.MultinomialRV)
+def core_MultinomialRV(op, node):
+    dtype = op.dtype
+
     @numba_basic.numba_njit
-    def random_fn(rng, mean, cov):
-        chol = np.linalg.cholesky(cov)
-        stdnorm = rng.normal(size=cov.shape[-1])
-        return np.dot(chol, stdnorm) + mean
+    def random_fn(rng, n, p, out=None):
+        n_cat = p.shape[0]
+        if out is None:
+            out = np.empty(n_cat, dtype=dtype)
+        out[:] = 0
+        remaining_p = np.float64(1.0)
+        remaining_n = n
+        for i in range(n_cat - 1):
+            out[i] = rng.binomial(remaining_n, p[i] / remaining_p)
+            remaining_n -= out[i]
+            if remaining_n <= 0:
+                break
+            remaining_p -= p[i]
+        if remaining_n > 0:
+            out[n_cat - 1] = remaining_n
+        return out
 
     random_fn.handles_out = True
+    return random_fn, 1
+
+
+@numba_core_rv_funcify.register(ptr.MvNormalRV)
+def core_MvNormalRV(op, node):
+    method = op.method
+
+    @numba_basic.numba_njit
+    def random_fn(rng, mean, cov):
+        if method == "cholesky":
+            A = np.linalg.cholesky(cov)
+        elif method == "svd":
+            A, s, _ = np.linalg.svd(cov)
+            A *= np.sqrt(s)[None, :]
+        else:
+            w, A = np.linalg.eigh(cov)
+            A *= np.sqrt(w)[None, :]
+
+        out = rng.normal(size=cov.shape[-1])
+        # out argument not working correctly: https://github.com/numba/numba/issues/9924
+        out[:] = np.dot(A, out)
+        out += mean
+        return out
+
     return random_fn
 
 
 @numba_core_rv_funcify.register(ptr.DirichletRV)
 def core_DirichletRV(op, node):
-    @numba_basic.numba_njit
-    def random_fn(rng, alpha):
-        y = np.empty_like(alpha)
-        for i in range(len(alpha)):
-            y[i] = rng.gamma(alpha[i], 1.0)
-        return y / y.sum()
+    dtype = op.dtype
 
-    return random_fn
+    @numba_basic.numba_njit
+    def random_fn(rng, alpha, out=None):
+        if out is None:
+            out = np.empty_like(alpha, dtype=dtype)
+        for i in range(len(alpha)):
+            out[i] = rng.gamma(alpha[i], 1.0)
+        out /= out.sum()
+        return out
+
+    random_fn.handles_out = True
+    return random_fn, 2
 
 
 @numba_core_rv_funcify.register(ptr.GumbelRV)
@@ -342,19 +415,41 @@ def numba_funcify_RandomVariable_core(op: RandomVariable, **kwargs):
     )
 
 
-@numba_funcify.register
+@register_funcify_and_cache_key(RandomVariableWithCoreShape)
 def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs):
     core_shape = node.inputs[0]
 
     [rv_node] = op.fgraph.apply_nodes
     rv_op: RandomVariable = rv_node.op
+
+    try:
+        core_rv_fn_and_cache_key = numba_core_rv_funcify(rv_op, rv_node)
+    except NotImplementedError:
+        py_impl = generate_fallback_impl(rv_op, node=rv_node, **kwargs)
+
+        @numba_basic.numba_njit
+        def fallback_rv(_core_shape, *args):
+            return py_impl(*args)
+
+        return fallback_rv, None
+
+    core_cache_key: int | str | None
+    match core_rv_fn_and_cache_key:
+        case (core_rv_fn, (int() | None) as core_cache_key):
+            pass
+        case (_core_rv_fn, invalid_core_cache_key):
+            raise ValueError(
+                f"Invalid core_cache_key returned from numba_core_rv_funcify: {invalid_core_cache_key}. Must be int or None."
+            )
+        case core_rv_fn:
+            core_cache_key = "__None__"
+
     size = rv_op.size_param(rv_node)
     dist_params = rv_op.dist_params(rv_node)
     size_len = None if isinstance(size.type, NoneTypeT) else get_vector_length(size)
     core_shape_len = get_vector_length(core_shape)
     inplace = rv_op.inplace
 
-    core_rv_fn = numba_core_rv_funcify(rv_op, rv_node)
     nin = 1 + len(dist_params)  # rng + params
     core_op_fn = store_core_outputs(core_rv_fn, nin=nin, nout=1)
 
@@ -370,28 +465,51 @@ def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs
     output_dtypes = encode_literals((rv_node.default_output().type.dtype,))
     inplace_pattern = encode_literals(())
 
-    def random_wrapper(core_shape, rng, size, *dist_params):
-        if not inplace:
-            rng = copy(rng)
-
-        draws = _vectorized(
-            core_op_fn,
-            input_bc_patterns,
-            output_bc_patterns,
-            output_dtypes,
-            inplace_pattern,
-            (rng,),
-            dist_params,
-            (numba_ndarray.to_fixed_tuple(core_shape, core_shape_len),),
-            None if size_len is None else numba_ndarray.to_fixed_tuple(size, size_len),
-        )
-        return rng, draws
-
     def random(core_shape, rng, size, *dist_params):
-        raise NotImplementedError("Non-jitted random variable not implemented")
+        raise NotImplementedError(
+            "Numba implementation of RandomVariable cannot be evaluated in Python (non-JIT) mode"
+        )
 
     @overload(random, jit_options=_jit_options)
     def ov_random(core_shape, rng, size, *dist_params):
-        return random_wrapper
+        def impl(core_shape, rng, size, *dist_params):
+            if not inplace:
+                rng = numba_deepcopy(rng)
 
-    return random
+            draws = _vectorized(
+                core_op_fn,
+                input_bc_patterns,
+                output_bc_patterns,
+                output_dtypes,
+                inplace_pattern,
+                True,  # allow_core_scalar
+                (rng,),
+                dist_params,
+                (numba_ndarray.to_fixed_tuple(core_shape, core_shape_len),),
+                NO_SIZE
+                if size_len is None
+                else numba_ndarray.to_fixed_tuple(size, size_len),
+                NO_INDEXED_INPUTS,
+                NO_INDEXED_OUTPUTS,
+                NO_REDUCE_OUTPUTS,
+            )
+            return rng, draws
+
+        return impl
+
+    if core_cache_key is None:
+        # If the core RV can't be cached, then the whole RV can't be cached
+        random_rv_key = None
+    else:
+        random_rv_key_contents = (
+            type(op),
+            type(rv_op),
+            tuple(rv_op._props_dict().items()),  # type: ignore[attr-defined]
+            size_len,
+            core_shape_len,
+            input_bc_patterns,
+            output_bc_patterns,
+            core_cache_key,
+        )
+        random_rv_key = sha256(str(random_rv_key_contents).encode()).hexdigest()
+    return random, random_rv_key

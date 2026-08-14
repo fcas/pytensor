@@ -3,14 +3,14 @@ import warnings
 from collections.abc import Sequence
 from functools import partial, reduce
 from itertools import pairwise
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
-from numpy.core.einsumfunc import _find_contraction, _parse_einsum_input  # type: ignore
-from numpy.core.numeric import (  # type: ignore
-    normalize_axis_index,
-    normalize_axis_tuple,
+from numpy._core.einsumfunc import (  # type: ignore[attr-defined]
+    _find_contraction,
+    _parse_einsum_input,
 )
+from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from pytensor.compile.builders import OpFromGraph
 from pytensor.tensor import TensorLike
@@ -32,6 +32,7 @@ from pytensor.tensor.variable import TensorVariable
 
 
 PATH = tuple[tuple[int] | tuple[int, int], ...]
+CONTRACTION_STEP = tuple[tuple[int, ...], set[str], str]
 
 
 class Einsum(OpFromGraph):
@@ -255,7 +256,7 @@ def _general_dot(
 
     .. testoutput::
 
-        (3, 4, 2)
+        (np.int64(3), np.int64(4), np.int64(2))
     """
     # Shortcut for non batched case
     if not batch_axes[0] and not batch_axes[1]:
@@ -329,7 +330,7 @@ def _general_dot(
 
 def _contraction_list_from_path(
     subscripts: str, operands: Sequence[TensorVariable], path: PATH
-):
+) -> list[CONTRACTION_STEP]:
     """
     Generate a list of contraction steps based on the provided einsum path.
 
@@ -361,11 +362,6 @@ def _contraction_list_from_path(
             The indices of the contracted indices (those removed from the einsum string at this step)
         - einsum_str: str
             The einsum string for the contraction step
-        - remaining: None
-            The remaining indices. Included to match the output of opt_einsum.contract_path, but not used.
-        - do_blas: None
-            Whether to use blas to perform this step. Included to match the output of opt_einsum.contract_path,
-            but not used.
     """
     fake_operands = [
         np.zeros([1 if dim == 1 else 0 for dim in x.type.shape]) for x in operands
@@ -379,8 +375,8 @@ def _contraction_list_from_path(
     input_sets = [set(x) for x in input_list]
     output_set = set(output_subscript)
 
-    # Build contraction tuple (positions, gemm, einsum_str, remaining)
-    contraction_list = []
+    # Build contraction tuple (positions, removed_idx, step_einsum_str)
+    contraction_list: list[CONTRACTION_STEP] = []
     for cnum, contract_inds in enumerate(path):
         # Make sure we remove inds from right to left
         contract_inds = cast(
@@ -388,7 +384,7 @@ def _contraction_list_from_path(
         )
 
         contract_tuple = _find_contraction(contract_inds, input_sets, output_set)
-        out_inds, input_sets, idx_removed, idx_contract = contract_tuple
+        out_inds, input_sets, idx_removed, _idx_contract = contract_tuple
 
         tmp_inputs = [input_list.pop(x) for x in contract_inds]
 
@@ -404,10 +400,28 @@ def _contraction_list_from_path(
         einsum_str = ",".join(tmp_inputs) + "->" + idx_result
 
         # We only need the first three inputs to build the forward graph
-        contraction = (contract_inds, idx_removed, einsum_str, None, None)
+        contraction = (contract_inds, idx_removed, einsum_str)
         contraction_list.append(contraction)
 
     return contraction_list
+
+
+def _right_to_left_path(n: int) -> tuple[tuple[int, int], ...]:
+    # Create a right to left contraction path
+    # if n = 5, out = ((4, 3), (3, 2), (2, 1), (1, 0))
+    return tuple(pairwise(reversed(range(n))))
+
+
+def _ensure_not_equal(elements):
+    """
+    Ensures that any pair in a list of elements are not the same object. If a pair of elements is found to be equal, then one of them is converted to a copy.
+    """
+    elements = list(elements)
+    for i, elem1 in enumerate(elements[:-1]):
+        for j, elem2 in enumerate(elements[i + 1 :], start=i + 1):
+            if elem1 is elem2:
+                elements[j] = elem1.copy()
+    return elements
 
 
 def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVariable:
@@ -546,12 +560,11 @@ def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVar
             "If you need this functionality open an issue in https://github.com/pymc-devs/pytensor/issues to let us know. "
         )
 
-    # TODO: Is this doing something clever about unknown shapes?
-    # contract_path = _poly_einsum_handlers.get(ty, _default_poly_einsum_handler)
-    tensor_operands = [as_tensor(operand) for operand in operands]
+    tensor_operands = _ensure_not_equal([as_tensor(operand) for operand in operands])
     shapes = [operand.type.shape for operand in tensor_operands]
 
     path: PATH
+    contraction_list: list[CONTRACTION_STEP]
     if any(None in shape for shape in shapes):
         # Case 1: At least one of the operands has an unknown shape. In this case, we can't use opt_einsum to optimize
         # the contraction order, so we just use a default path of (1,0) contractions. This will work left-to-right,
@@ -565,7 +578,7 @@ def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVar
         else:
             # By default, we try right to left because we assume that most graphs
             # have a lower dimensional rightmost operand
-            path = tuple(pairwise(reversed(range(len(tensor_operands)))))
+            path = _right_to_left_path(len(tensor_operands))
         contraction_list = _contraction_list_from_path(
             subscripts, tensor_operands, path
         )
@@ -575,15 +588,55 @@ def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVar
     else:
         # Case 2: All operands have known shapes. In this case, we can use opt_einsum to compute the optimal
         # contraction order.
-        _, contraction_list = np.einsum_path(
-            subscripts,
-            # Numpy einsum_path requires arrays even though only the shapes matter
-            # It's not trivial to duck-type our way around because of internal call to `asanyarray`
-            *[np.empty(shape) for shape in shapes],
-            einsum_call=True,  # Not part of public API
-            optimize="optimal",
-        )  # type: ignore
-        path = tuple(contraction[0] for contraction in contraction_list)
+        # Numpy einsum_path requires arrays even though only the shapes matter. It's not trivial to duck-type our way
+        # around because of internal call to `asanyarray`
+        _, contraction_list_raw = cast(
+            tuple[Any, list],
+            cast(
+                object,
+                np.einsum_path(
+                    subscripts,
+                    *[np.empty(shape) for shape in shapes],
+                    einsum_call=True,  # type: ignore[arg-type]
+                    optimize="optimal",
+                ),
+            ),
+        )
+        # Numpy API changed in v2.4.2, and now returns only 3 values instead of 5
+        # We never needed the last two but we need the code to work with both cases
+        contraction_list = []
+        if contraction_list_raw:
+            match len(contraction_list_raw[0]):
+                case 5:
+                    # Old API, the first 3 entries have what we need
+                    contraction_list = [c[:3] for c in contraction_list_raw]
+                case 3:
+                    # New API doesn't have index removed
+                    contraction_list = []
+                    for pos, step_ein_str, _ in contraction_list_raw:
+                        # e.g., 'ijp,oij->op' -> removed_str = {'i', 'j'}
+                        inp_str, out_str = step_ein_str.replace(",", "").split("->")
+                        removed_idx = set(inp_str) - set(out_str)
+                        contraction_list.append((pos, removed_idx, step_ein_str))
+                case _:
+                    raise ValueError("Unexpected contraction list template")
+        del contraction_list_raw
+
+        np_path: PATH | tuple[tuple[int, ...]] = tuple(
+            contraction[0]  # type: ignore[misc]
+            for contraction in contraction_list
+        )
+
+        if len(np_path) == 1 and len(np_path[0]) > 2:
+            # When there's nothing to optimize, einsum_path reduces all entries simultaneously instead of doing
+            # pairwise reductions, which our implementation below demands.
+            path = _right_to_left_path(len(tensor_operands))
+            contraction_list = _contraction_list_from_path(
+                subscripts, tensor_operands, path
+            )
+        else:
+            path = cast(PATH, np_path)
+
         optimized = True
 
     def removechars(s, chars):
@@ -638,12 +691,8 @@ def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVar
         return operand.squeeze(squeeze_axes), "".join(names[i] for i in keep_axes)
 
     einsum_operands = list(tensor_operands)  # So we can pop
-    for operand_indices, contracted_names, einstr, _, _ in contraction_list:
-        contracted_names = sorted(contracted_names)
-        assert len(contracted_names) == len(
-            set(contracted_names)
-        ), "The set was needed!"
-
+    for operand_indices, contracted_names_set, einstr in contraction_list:
+        contracted_names = sorted(contracted_names_set)
         input_str, result_names = einstr.split("->")
         input_names = input_str.split(",")
 
@@ -746,7 +795,7 @@ def einsum(subscripts: str, *operands: "TensorLike", optimize=None) -> TensorVar
                 )
         else:
             raise ValueError(
-                f"Each step of einsum must have 1 or 2 operands, got {len(operand_indices)}"
+                f"Each step of einsum must have 1 or 2 operands, got {len(operand_indices)}, {path=}."
             )
 
         # the resulting 'operand' with axis labels 'names' should be a permutation of the desired result

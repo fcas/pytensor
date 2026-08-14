@@ -10,17 +10,96 @@ from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
 
+import numpy as np
+
 
 __all__ = [
-    "get_unbound_function",
-    "maybe_add_to_os_environ_pathlist",
-    "subprocess_Popen",
-    "call_subprocess_Popen",
-    "output_subprocess_Popen",
     "LOCAL_BITWIDTH",
+    "NDARRAY_C_VERSION",
+    "NPY_RAVEL_AXIS",
     "PYTHON_INT_BITWIDTH",
     "NoDuplicateOptWarningFilter",
+    "add_lazy_dispatcher",
+    "call_subprocess_Popen",
+    "get_unbound_function",
+    "lazy_scipy_module",
+    "maybe_add_to_os_environ_pathlist",
+    "output_subprocess_Popen",
+    "subprocess_Popen",
 ]
+
+
+class _LazyScipyModule:
+    """Proxy that defers `scipy.<sub>` import until first attribute access."""
+
+    __slots__ = ("_name", "_real")
+
+    def __init__(self, name):
+        self._name = name
+        self._real = None
+
+    def __getattr__(self, name):
+        # `_real` is in __slots__, so this lookup hits the slot, not __getattr__.
+        if self._real is None:
+            import importlib
+
+            self._real = importlib.import_module(self._name)
+        return getattr(self._real, name)
+
+
+def lazy_scipy_module(submodule):
+    """Return a lazy proxy for `scipy.<submodule>` that defers the import.
+
+    Use this for slow scipy submodules that are only needed at runtime in
+    `Op.perform` / `impl()` paths (e.g. `scipy.signal`, `scipy.special`,
+    `scipy.linalg`, `scipy.stats`). The proxy caches the real module on
+    first attribute access; subsequent calls hit the cached module directly.
+    """
+    return _LazyScipyModule(f"scipy.{submodule}")
+
+
+def add_lazy_dispatcher(dispatcher):
+    """Extend a `functools.singledispatch` dispatcher with lazy fallback handlers.
+
+    The dispatcher gains a `register_lazy(fallback)` method. A fallback is
+    a callable `fallback(obj) -> handler | None`. When standard dispatch falls
+    through to the `object` default, registered fallbacks are tried in order;
+    the first to return a non-None handler has that handler registered for
+    `type(obj)` (so subsequent calls dispatch directly) and is then called.
+
+    This lets a package register a handler for a third-party type without
+    importing the third-party module at registration time -- the fallback can
+    detect the type by `type(obj).__module__` and trigger a lazy import only
+    when an instance actually shows up.
+
+    Calling this more than once on the same dispatcher is a no-op (returns
+    the already-extended dispatcher unchanged).
+    """
+    if hasattr(dispatcher, "register_lazy"):
+        return dispatcher
+
+    fallbacks: list = []
+    original_default = dispatcher.registry[object]
+
+    @dispatcher.register(object)
+    def _wrapped_default(arg, *args, **kwargs):
+        for fallback in fallbacks:
+            handler = fallback(arg)
+            # Guard against a fallback that hands back the wrapped default
+            # itself (e.g. when a lazy import didn't actually register a
+            # specific handler for type(arg)) -- registering it would cause
+            # infinite recursion on the next call.
+            if handler is not None and handler is not _wrapped_default:
+                dispatcher.register(type(arg))(handler)
+                return handler(arg, *args, **kwargs)
+        return original_default(arg, *args, **kwargs)
+
+    def register_lazy(fallback):
+        fallbacks.append(fallback)
+        return fallback
+
+    dispatcher.register_lazy = register_lazy
+    return dispatcher
 
 
 __excepthooks: list = []
@@ -34,7 +113,6 @@ By "architecture", we mean the size of memory pointers (size_t in C),
 
 Note that according to Python documentation, `platform.architecture()` is
 not reliable on OS X with universal binaries.
-Also, sys.maxsize does not exist in Python < 2.6.
 'P' denotes a void*, and the size is expressed in bytes.
 """
 
@@ -45,6 +123,13 @@ The bit width of Python int (C long int).
 Note that it can be different from the size of a memory pointer.
 'l' denotes a C long int, and the size is expressed in bytes.
 """
+
+NPY_RAVEL_AXIS = np.iinfo(np.int32).min
+"""
+The value of the numpy C API NPY_RAVEL_AXIS.
+"""
+
+NDARRAY_C_VERSION = np._core._multiarray_umath._get_ndarray_c_version()  # type: ignore[attr-defined]
 
 
 def __call_excepthooks(type, value, trace):
@@ -123,7 +208,7 @@ def maybe_add_to_os_environ_pathlist(var: str, newpath: Path | str) -> None:
         pass
 
 
-def subprocess_Popen(command: str | list[str], **params):
+def subprocess_Popen(command: list[str], **params) -> subprocess.Popen:
     """
     Utility function to work around windows behavior that open windows.
 
@@ -137,37 +222,17 @@ def subprocess_Popen(command: str | list[str], **params):
         except AttributeError:
             startupinfo.dwFlags |= subprocess._subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
 
-        # Anaconda for Windows does not always provide .exe files
-        # in the PATH, they also have .bat files that call the corresponding
-        # executable. For instance, "g++.bat" is in the PATH, not "g++.exe"
-        # Unless "shell=True", "g++.bat" is not executed when trying to
-        # execute "g++" without extensions.
-        # (Executing "g++.bat" explicitly would also work.)
-        params["shell"] = True
         # "If shell is True, it is recommended to pass args as a string rather than as a sequence." (cite taken from https://docs.python.org/2/library/subprocess.html#frequently-used-arguments)
         # In case when command arguments have spaces, passing a command as a list will result in incorrect arguments break down, and consequently
         # in "The filename, directory name, or volume label syntax is incorrect" error message.
         # Passing the command as a single string solves this problem.
         if isinstance(command, list):
-            command = " ".join(command)
+            command = " ".join(command)  # type: ignore[assignment]
 
-    # Using the dummy file descriptors below is a workaround for a
-    # crash experienced in an unusual Python 2.4.4 Windows environment
-    # with the default None values.
-    stdin = None
-    if "stdin" not in params:
-        stdin = Path(os.devnull).open()
-        params["stdin"] = stdin.fileno()
-
-    try:
-        proc = subprocess.Popen(command, startupinfo=startupinfo, **params)
-    finally:
-        if stdin is not None:
-            stdin.close()
-    return proc
+    return subprocess.Popen(command, startupinfo=startupinfo, **params)
 
 
-def call_subprocess_Popen(command, **params):
+def call_subprocess_Popen(command: list[str], **params) -> int:
     """
     Calls subprocess_Popen and discards the output, returning only the
     exit code.
@@ -185,13 +250,17 @@ def call_subprocess_Popen(command, **params):
     return returncode
 
 
-def output_subprocess_Popen(command, **params):
+def output_subprocess_Popen(command: list[str], **params) -> tuple[bytes, bytes, int]:
     """
     Calls subprocess_Popen, returning the output, error and exit code
     in a tuple.
     """
     if "stdout" in params or "stderr" in params:
         raise TypeError("don't use stderr or stdout with output_subprocess_Popen")
+    if "encoding" in params:
+        raise TypeError(
+            "adjust the output_subprocess_Popen type annotation to support str"
+        )
     params["stdout"] = subprocess.PIPE
     params["stderr"] = subprocess.PIPE
     p = subprocess_Popen(command, **params)
@@ -207,9 +276,8 @@ def hash_from_code(msg: str | bytes) -> str:
     # but Python 3 (unicode) strings don't.
     if isinstance(msg, str):
         msg = msg.encode()
-    # Python 3 does not like module names that start with
-    # a digit.
-    return "m" + hashlib.sha256(msg).hexdigest()
+    # Python 3 does not like module names that start with a digit.
+    return f"m{hashlib.sha256(msg).hexdigest()}"
 
 
 def uniq(seq: Sequence) -> list:
@@ -345,3 +413,14 @@ class Singleton:
 
     def __hash__(self):
         return hash(type(self))
+
+
+def unzip(iterable, n: int, strict: bool = False):
+    """Unzip a nested iterable, returns n empty tuples if empty.
+
+    It can be safely unpacked into n variables.
+    """
+    res = tuple(zip(*iterable, strict=strict))
+    if not res:
+        return ((),) * n
+    return res

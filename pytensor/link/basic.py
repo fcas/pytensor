@@ -14,7 +14,7 @@ from pytensor.utils import difference
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-    from pytensor.compile.profiling import ProfileStats
+    from pytensor.compile.debug.profiling import ProfileStats
     from pytensor.graph.op import (
         BasicThunkType,
         InputStorageType,
@@ -97,13 +97,7 @@ class Container:
             if self.allow_downcast is not None:
                 kwargs["allow_downcast"] = self.allow_downcast
 
-            try:
-                # Use in-place filtering when/if possible
-                self.storage[0] = self.type.filter_inplace(
-                    value, self.storage[0], **kwargs
-                )
-            except NotImplementedError:
-                self.storage[0] = self.type.filter(value, **kwargs)
+            self.storage[0] = self.type.filter(value, **kwargs)
 
         except Exception as e:
             e.args = (*e.args, f'Container name "{self.name}"')
@@ -156,6 +150,9 @@ class Linker(ABC):
         a list of Apply nodes. Defaults to the .toposort() method of
         the FunctionGraph.
     """
+
+    required_rewrites: tuple[str, ...] = ("minimum_compile",)
+    incompatible_rewrites: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -280,6 +277,9 @@ class PerformLinker(LocalLinker):
 
     """
 
+    required_rewrites: tuple[str, ...] = ("minimum_compile", "py_only")
+    incompatible_rewrites: tuple[str, ...] = ("cxx_only",)
+
     def __init__(
         self, allow_gc: bool | None = None, schedule: Callable | None = None
     ) -> None:
@@ -373,7 +373,12 @@ class PerformLinker(LocalLinker):
 
         # The function that actually runs your program is one of the f's in streamline.
         f = streamline(
-            fgraph, thunks, order, post_thunk_old_storage, no_recycling=no_recycling
+            fgraph,
+            thunks,
+            order,
+            post_thunk_old_storage=post_thunk_old_storage,
+            no_recycling=no_recycling,
+            output_storage=output_storage,
         )
 
         f.allow_gc = (
@@ -509,7 +514,7 @@ class WrapLinker(Linker):
         kwargs.pop("input_storage", None)
         make_all += [x.make_all(**kwargs) for x in self.linkers[1:]]
 
-        fns, input_lists, output_lists, thunk_lists, order_lists = zip(
+        _fns, input_lists, output_lists, thunk_lists, order_lists = zip(
             *make_all, strict=True
         )
 
@@ -539,20 +544,21 @@ class WrapLinker(Linker):
 
         def f():
             for inputs in input_lists[1:]:
-                # strict=False because we are in a hot loop
-                for input1, input2 in zip(inputs0, inputs, strict=False):
+                # zip strict not specified because we are in a hot loop
+                for input1, input2 in zip(inputs0, inputs):
                     input2.storage[0] = copy(input1.storage[0])
             for x in to_reset:
                 x[0] = None
             pre(self, [input.data for input in input_lists[0]], order, thunk_groups)
-            # strict=False because we are in a hot loop
-            for i, (thunks, node) in enumerate(zip(thunk_groups, order, strict=False)):
+            # zip strict not specified because we are in a hot loop
+            for i, (thunks, node) in enumerate(zip(thunk_groups, order)):
                 try:
                     wrapper(self.fgraph, i, node, *thunks)
                 except Exception:
                     raise_with_op(self.fgraph, node, *thunks)
 
         f.thunk_groups = thunk_groups
+        f.allow_gc = len(self.linkers) == 1
 
         return f, inputs0, outputs0
 
@@ -580,6 +586,9 @@ class JITLinker(PerformLinker):
     thunk that is run by an PyTensor ``VM``.
 
     """
+
+    required_rewrites: tuple[str, ...] = ("minimum_compile",)
+    incompatible_rewrites: tuple[str, ...] = ()
 
     @abstractmethod
     def fgraph_convert(
@@ -656,21 +665,37 @@ class JITLinker(PerformLinker):
         thunk_outputs = [storage_map[n] for n in self.fgraph.outputs]
         fgraph_jit = self.jit_compile(converted_fgraph)
 
-        def thunk(
-            fgraph_jit=fgraph_jit,
-            thunk_inputs=thunk_inputs,
-            thunk_outputs=thunk_outputs,
-        ):
-            try:
-                outputs = fgraph_jit(*(x[0] for x in thunk_inputs))
-            except Exception:
-                # TODO: Should we add a fake node that combines all outputs,
-                #  since the error may come from any of them?
-                raise_with_op(self.fgraph, output_nodes[0], thunk)
+        if thunk_outputs:
 
-            # strict=False because we are in a hot loop
-            for o_storage, o_val in zip(thunk_outputs, outputs, strict=False):
-                o_storage[0] = o_val
+            def thunk(
+                fgraph_jit=fgraph_jit,
+                thunk_inputs=thunk_inputs,
+                thunk_outputs=thunk_outputs,
+            ):
+                try:
+                    outputs = fgraph_jit(*(x[0] for x in thunk_inputs))
+                except Exception:
+                    # TODO: Should we add a fake node that combines all outputs,
+                    #  since the error may come from any of them?
+                    raise_with_op(self.fgraph, output_nodes[0], thunk)
+
+                # zip strict not specified because we are in a hot loop
+                for o_storage, o_val in zip(thunk_outputs, outputs):
+                    o_storage[0] = o_val
+
+        else:
+            # Edge case - functions without outputs
+            def thunk(
+                fgraph_jit=fgraph_jit,
+                thunk_inputs=thunk_inputs,
+                thunk_outputs=thunk_outputs,
+            ):
+                try:
+                    res = fgraph_jit(*(x[0] for x in thunk_inputs))
+                except Exception:
+                    raise_with_op(self.fgraph, output_nodes[0], thunk)
+                assert res is None
+                return thunk_outputs
 
         thunk.inputs = thunk_inputs
         thunk.outputs = thunk_outputs
@@ -714,3 +739,7 @@ class JITLinker(PerformLinker):
             thunks,
             nodes,
         )
+
+    def __repr__(self):
+        # Assumes no subclass needs init arguments
+        return f"{self.__class__.__name__}()"

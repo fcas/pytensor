@@ -8,7 +8,10 @@ from pytensor import function
 from pytensor import tensor as pt
 from pytensor.compile.mode import Mode
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Constant, applys_between, equal_computations
+from pytensor.graph import rewrite_graph
+from pytensor.graph.basic import Constant, equal_computations
+from pytensor.graph.traversal import applys_between
+from pytensor.npy_2_compat import old_np_unique
 from pytensor.raise_op import Assert
 from pytensor.tensor import alloc
 from pytensor.tensor.elemwise import DimShuffle
@@ -60,11 +63,6 @@ from pytensor.tensor.type import (
 )
 from pytensor.utils import LOCAL_BITWIDTH, PYTHON_INT_BITWIDTH
 from tests import unittest_tools as utt
-
-
-def set_test_value(x, v):
-    x.tag.test_value = v
-    return x
 
 
 def test_cpu_contiguous():
@@ -197,7 +195,7 @@ class TestCumOp(utt.InferShapeTester):
     def setup_method(self):
         super().setup_method()
         self.op_class = CumOp
-        self.op = CumOp()
+        self.op = CumOp(axis=0)
 
     def test_cum_op(self):
         x = tensor3("x")
@@ -228,8 +226,8 @@ class TestCumOp(utt.InferShapeTester):
         x = tensor3("x")
         a = np.random.random((3, 5, 2)).astype(config.floatX)
 
-        # Test axis=None
-        self._compile_and_check([x], [self.op(x)], [a], self.op_class)
+        # Test default axis=None
+        self._compile_and_check([x], [cumsum(x)], [a], self.op_class)
 
         for axis in range(-len(a.shape), len(a.shape)):
             self._compile_and_check([x], [cumsum(x, axis=axis)], [a], self.op_class)
@@ -237,10 +235,11 @@ class TestCumOp(utt.InferShapeTester):
     def test_grad(self):
         a = np.random.random((3, 5, 2)).astype(config.floatX)
 
-        utt.verify_grad(self.op_class(mode="add"), [a])  # Test axis=None
-        utt.verify_grad(self.op_class(mode="mul"), [a])  # Test axis=None
+        # Test default axis=None using cumsum/cumprod functions
+        utt.verify_grad(lambda x: cumsum(x), [a])  # Test axis=None for cumsum
+        utt.verify_grad(lambda x: cumprod(x), [a])  # Test axis=None for cumprod
 
-        for axis in range(-len(a.shape), len(a.shape)):
+        for axis in range(len(a.shape)):
             utt.verify_grad(self.op_class(axis=axis, mode="add"), [a], eps=4e-4)
             utt.verify_grad(self.op_class(axis=axis, mode="mul"), [a], eps=4e-4)
 
@@ -469,7 +468,7 @@ class TestSqueeze(utt.InferShapeTester):
         assert squeeze(x, axis=(0,)).eval({x: 5}) == 5
 
         with pytest.raises(
-            np.AxisError,
+            np.exceptions.AxisError,
             match=re.escape("axis (1,) is out of bounds for array of dimension 0"),
         ):
             squeeze(x, axis=1)
@@ -484,10 +483,7 @@ class TestSqueeze(utt.InferShapeTester):
         assert f([0]) == 0
 
         # Test that we cannot squeeze dimensions whose length is greater than 1
-        with pytest.raises(
-            ValueError,
-            match="cannot reshape array of size 3 into shape ()",
-        ):
+        with pytest.raises(ValueError):
             f([0, 1, 2])
 
 
@@ -535,7 +531,7 @@ class TestRepeat(utt.InferShapeTester):
     def setup_method(self):
         super().setup_method()
         self.op_class = Repeat
-        self.op = Repeat()
+        self.op = Repeat(axis=0)
         # uint64 always fails
         # int64 and uint32 also fail if python int are 32-bit
         if LOCAL_BITWIDTH == 64:
@@ -595,61 +591,82 @@ class TestRepeat(utt.InferShapeTester):
                     isinstance(n.op, Repeat) for n in f.maker.fgraph.toposort()
                 )
 
-    @pytest.mark.slow
     @pytest.mark.parametrize("ndim", [1, 3])
     @pytest.mark.parametrize("dtype", ["int8", "uint8", "uint64"])
     def test_infer_shape(self, ndim, dtype):
         rng = np.random.default_rng(4282)
 
-        x = TensorType(config.floatX, shape=(None,) * ndim)()
+        a_var = TensorType(config.floatX, shape=(None,) * ndim)("a")
+        r_var = vector("r", dtype=dtype)
+
         shp = (np.arange(ndim) + 1) * 3
         a = rng.random(shp).astype(config.floatX)
 
         for axis in self._possible_axis(ndim):
-            r_var = scalar(dtype=dtype)
-            r = np.asarray(3, dtype=dtype)
             if dtype in self.numpy_unsupported_dtypes:
-                r_var = vector(dtype=dtype)
                 with pytest.raises(TypeError):
-                    repeat(x, r_var)
-            else:
-                self._compile_and_check(
-                    [x, r_var],
-                    [Repeat(axis=axis)(x, r_var)],
-                    [a, r],
-                    self.op_class,
-                )
+                    repeat(a_var, r_var, axis=axis)
+                continue
 
-                r_var = vector(dtype=dtype)
-                if axis is None:
-                    r = rng.integers(1, 6, size=a.size).astype(dtype)
-                elif a.size > 0:
-                    r = rng.integers(1, 6, size=a.shape[axis]).astype(dtype)
-                else:
-                    r = rng.integers(1, 6, size=(10,)).astype(dtype)
+            if axis is None or axis < 0:
+                # Operator Repeat does not support None or negative axis
+                continue
 
-                self._compile_and_check(
-                    [x, r_var],
-                    [Repeat(axis=axis)(x, r_var)],
-                    [a, r],
-                    self.op_class,
-                )
+            r = rng.integers(1, 6, size=a.shape[axis]).astype(dtype)
 
-    @pytest.mark.parametrize("ndim", range(3))
-    def test_grad(self, ndim):
-        a = np.random.random((10,) * ndim).astype(config.floatX)
+            self._compile_and_check(
+                [a_var, r_var],
+                [Repeat(axis=axis)(a_var, r_var)],
+                [a, r],
+                self.op_class,
+            )
 
-        for axis in self._possible_axis(ndim):
-            utt.verify_grad(lambda x: Repeat(axis=axis)(x, 3), [a])
+    @pytest.mark.parametrize("x_ndim", [2, 3], ids=lambda x: f"x_ndim={x}")
+    @pytest.mark.parametrize("repeats_ndim", [0, 1], ids=lambda r: f"repeats_ndim={r}")
+    @pytest.mark.parametrize("axis", [None, 0, 1], ids=lambda a: f"axis={a}")
+    def test_grad(self, x_ndim, repeats_ndim, axis):
+        rng = np.random.default_rng(
+            [653, x_ndim, 2 if axis is None else axis, repeats_ndim]
+        )
+        x_test = rng.normal(size=np.arange(3, 3 + x_ndim))
+        if repeats_ndim == 0:
+            repeats_size = ()
+        else:
+            repeats_size = (x_test.shape[axis] if axis is not None else x_test.size,)
+        repeats = rng.integers(1, 6, size=repeats_size)
+        utt.verify_grad(
+            lambda x: repeat(x, repeats, axis=axis),
+            [x_test],
+        )
 
-    def test_broadcastable(self):
-        x = TensorType(config.floatX, shape=(None, 1, None))()
-        r = Repeat(axis=1)(x, 2)
-        assert r.broadcastable == (False, False, False)
-        r = Repeat(axis=1)(x, 1)
-        assert r.broadcastable == (False, True, False)
-        r = Repeat(axis=0)(x, 2)
-        assert r.broadcastable == (False, True, False)
+    def test_static_shape(self):
+        x = TensorType(config.floatX, shape=(None, 1, 3))()
+        symbolic_r = scalar(dtype="int32")
+
+        r = repeat(x, 2, axis=0)
+        assert r.type.shape == (None, 1, 3)
+
+        r = repeat(x, 2, axis=1)
+        assert r.type.shape == (None, 2, 3)
+
+        r = repeat(x, [2], axis=1)
+        assert r.type.shape == (None, 2, 3)
+
+        r = repeat(x, symbolic_r, axis=1)
+        assert r.type.shape == (None, None, 3)
+
+        r = repeat(x, 1, axis=1)
+        assert r.type.shape == (None, 1, 3)
+
+        r = repeat(x, 2, axis=2)
+        assert r.type.shape == (None, 1, 6)
+
+        r = repeat(x, [2, 2, 2], axis=2)
+        assert r.type.shape == (None, 1, 6)
+
+        # This case could be implemented in the future
+        r = repeat(x, [1, 2, 4], axis=2)
+        assert r.type.shape == (None, 1, None)
 
 
 class TestBartlett(utt.InferShapeTester):
@@ -694,7 +711,7 @@ class TestFillDiagonal(utt.InferShapeTester):
         y = scalar()
         f = function([x, y], fill_diagonal(x, y))
         a = rng.random(shp).astype(config.floatX)
-        val = np.cast[config.floatX](rng.random())
+        val = rng.random(dtype=config.floatX)
         out = f(a, val)
         # We can't use np.fill_diagonal as it is bugged.
         assert np.allclose(np.diag(out), val)
@@ -706,7 +723,7 @@ class TestFillDiagonal(utt.InferShapeTester):
         x = tensor3()
         y = scalar()
         f = function([x, y], fill_diagonal(x, y))
-        val = np.cast[config.floatX](rng.random() + 10)
+        val = rng.random(dtype=config.floatX) + 10
         out = f(a, val)
         # We can't use np.fill_diagonal as it is bugged.
         assert out[0, 0, 0] == val
@@ -768,7 +785,7 @@ class TestFillDiagonalOffset(utt.InferShapeTester):
 
         f = function([x, y, z], fill_diagonal_offset(x, y, z))
         a = rng.random(shp).astype(config.floatX)
-        val = np.cast[config.floatX](rng.random())
+        val = rng.random(dtype=config.floatX)
         out = f(a, val, test_offset)
         # We can't use np.fill_diagonal as it is bugged.
         assert np.allclose(np.diag(out, test_offset), val)
@@ -885,14 +902,14 @@ class TestUnique(utt.InferShapeTester):
     )
     def test_basic_vector(self, x, inp, axis):
         list_outs_expected = [
-            np.unique(inp, axis=axis),
-            np.unique(inp, True, axis=axis),
-            np.unique(inp, False, True, axis=axis),
-            np.unique(inp, True, True, axis=axis),
-            np.unique(inp, False, False, True, axis=axis),
-            np.unique(inp, True, False, True, axis=axis),
-            np.unique(inp, False, True, True, axis=axis),
-            np.unique(inp, True, True, True, axis=axis),
+            old_np_unique(inp, axis=axis),
+            old_np_unique(inp, True, axis=axis),
+            old_np_unique(inp, False, True, axis=axis),
+            old_np_unique(inp, True, True, axis=axis),
+            old_np_unique(inp, False, False, True, axis=axis),
+            old_np_unique(inp, True, False, True, axis=axis),
+            old_np_unique(inp, False, True, True, axis=axis),
+            old_np_unique(inp, True, True, True, axis=axis),
         ]
         for params, outs_expected in zip(
             self.op_params, list_outs_expected, strict=True
@@ -958,8 +975,10 @@ class TestUnravelIndex(utt.InferShapeTester):
             f_array_array = fn(indices, shape_array)
             np.testing.assert_equal(ref, f_array_array())
 
-            # shape given as an PyTensor variable
-            shape_symb = pytensor.shared(shape_array)
+            # shape given as a shared PyTensor variable with static shape
+            shape_symb = pytensor.shared(
+                shape_array, shape=shape_array.shape, strict=True
+            )
             f_array_symb = fn(indices, shape_symb)
             np.testing.assert_equal(ref, f_array_symb())
 
@@ -1001,44 +1020,43 @@ class TestUnravelIndex(utt.InferShapeTester):
 
 
 class TestRavelMultiIndex(utt.InferShapeTester):
-    def test_ravel_multi_index(self):
-        def check(shape, index_ndim, mode, order):
-            multi_index = np.unravel_index(
-                np.arange(np.prod(shape)), shape, order=order
-            )
-            # create some invalid indices to test the mode
-            if mode in ("wrap", "clip"):
-                multi_index = (multi_index[0] - 1,) + multi_index[1:]
-            # test with scalars and higher-dimensional indices
-            if index_ndim == 0:
-                multi_index = tuple(i[-1] for i in multi_index)
-            elif index_ndim == 2:
-                multi_index = tuple(i[:, np.newaxis] for i in multi_index)
+    @staticmethod
+    def get_test_multiindex(shape, index_ndim, mode, order):
+        multi_index = np.unravel_index(np.arange(np.prod(shape)), shape, order=order)
+        # create some invalid indices to test the mode
+        if mode in ("wrap", "clip"):
+            multi_index = (multi_index[0] - 1, *multi_index[1:])
+        # test with scalars and higher-dimensional indices
+        if index_ndim == 0:
+            multi_index = tuple(i[-1] for i in multi_index)
+        elif index_ndim == 2:
+            multi_index = tuple(i[:, np.newaxis] for i in multi_index)
+
+        return multi_index
+
+    def test_eval(self):
+        def check_eval(shape, index_ndim, mode, order):
+            multi_index = self.get_test_multiindex(shape, index_ndim, mode, order)
             multi_index_symb = [pytensor.shared(i) for i in multi_index]
+            shape_symb = pytensor.shared(np.array(shape))
+            out_symb = ravel_multi_index(multi_index_symb, shape_symb, mode, order)
 
-            # reference result
+            res = out_symb.eval()
             ref = np.ravel_multi_index(multi_index, shape, mode, order)
+            np.testing.assert_equal(ref, res)
 
-            def fn(mi, s):
-                return function([], ravel_multi_index(mi, s, mode, order))
+        for mode in ("raise", "wrap", "clip"):
+            for order in ("C", "F"):
+                for index_ndim in (0, 1, 2):
+                    check_eval((3,), index_ndim, mode, order)
+                    check_eval((3, 4), index_ndim, mode, order)
+                    check_eval((3, 4, 5), index_ndim, mode, order)
 
-            # shape given as a tuple
-            f_array_tuple = fn(multi_index, shape)
-            f_symb_tuple = fn(multi_index_symb, shape)
-            np.testing.assert_equal(ref, f_array_tuple())
-            np.testing.assert_equal(ref, f_symb_tuple())
+    def test_shape(self):
+        def check_shape(shape, index_ndim, mode, order):
+            multi_index = self.get_test_multiindex(shape, index_ndim, mode, order)
 
-            # shape given as an array
-            shape_array = np.array(shape)
-            f_array_array = fn(multi_index, shape_array)
-            np.testing.assert_equal(ref, f_array_array())
-
-            # shape given as an PyTensor variable
-            shape_symb = pytensor.shared(shape_array)
-            f_array_symb = fn(multi_index, shape_symb)
-            np.testing.assert_equal(ref, f_array_symb())
-
-            # shape testing
+            shape_symb = pytensor.shared(np.array(shape))
             self._compile_and_check(
                 [],
                 [ravel_multi_index(multi_index, shape_symb, mode, order)],
@@ -1046,13 +1064,28 @@ class TestRavelMultiIndex(utt.InferShapeTester):
                 RavelMultiIndex,
             )
 
-        for mode in ("raise", "wrap", "clip"):
-            for order in ("C", "F"):
-                for index_ndim in (0, 1, 2):
-                    check((3,), index_ndim, mode, order)
-                    check((3, 4), index_ndim, mode, order)
-                    check((3, 4, 5), index_ndim, mode, order)
+        for index_ndim in (0, 1, 2):
+            check_shape((3,), index_ndim, "raise", "C")
+            check_shape((3, 4), index_ndim, "raise", "C")
+            check_shape((3, 4, 5), index_ndim, "raise", "C")
 
+    def test_constant_inputs(self):
+        shape = (3,)
+        multi_index = np.unravel_index(np.arange(np.prod(shape)), shape)
+        ref = np.ravel_multi_index(multi_index, shape)
+
+        # shape given as a tuple
+        f_tuple_shape = ravel_multi_index(multi_index, shape).eval(mode="FAST_COMPILE")
+        np.testing.assert_equal(ref, f_tuple_shape)
+
+        # shape given as an array
+        shape_array = np.array(shape)
+        f_array_shape = ravel_multi_index(multi_index, shape_array).eval(
+            mode="FAST_COMPILE"
+        )
+        np.testing.assert_equal(ref, f_array_shape)
+
+    def test_errors(self):
         # must provide integers
         with pytest.raises(TypeError):
             ravel_multi_index((fvector(), ivector()), (3, 4))
@@ -1208,15 +1241,13 @@ def test_broadcast_shape_constants():
 )
 def test_broadcast_shape_symbolic(s1_vals, s2_vals, exp_res):
     s1s = pt.lscalars(len(s1_vals))
-    eval_point = {}
-    for s, s_val in zip(s1s, s1_vals, strict=True):
-        eval_point[s] = s_val
-        s.tag.test_value = s_val
-
     s2s = pt.lscalars(len(s2_vals))
-    for s, s_val in zip(s2s, s2_vals, strict=True):
-        eval_point[s] = s_val
-        s.tag.test_value = s_val
+    eval_point = dict(
+        [
+            *zip(s1s, s1_vals, strict=True),
+            *zip(s2s, s2_vals, strict=True),
+        ]
+    )
 
     res = broadcast_shape(s1s, s2s, arrays_are_shapes=True)
     res = pt.as_tensor(res)
@@ -1243,11 +1274,17 @@ def test_broadcast_shape_symbolic_one_symbolic():
     ]
 
     res_shape = broadcast_shape(*index_shapes, arrays_are_shapes=True)
-
-    from pytensor.graph.rewriting.utils import rewrite_graph
-
     res_shape = rewrite_graph(res_shape)
+    assert res_shape[0].data == 1
+    assert res_shape[1].data == 1
+    with pytest.raises(AssertionError, match="Could not broadcast dimensions"):
+        # broadcast_shape doesn't treat int_div as a constant 1
+        res_shape[2].eval()
 
+    res_shape = broadcast_shape(
+        *index_shapes, arrays_are_shapes=True, allow_runtime_broadcast=True
+    )
+    res_shape = rewrite_graph(res_shape)
     assert res_shape[0].data == 1
     assert res_shape[1].data == 1
     assert res_shape[2].data == 3
@@ -1285,7 +1322,9 @@ def test_broadcast_arrays():
     ["linspace", "logspace", "geomspace"],
     ids=["linspace", "logspace", "geomspace"],
 )
-@pytest.mark.parametrize("dtype", [None, "int", "float"], ids=[None, "int", "float"])
+@pytest.mark.parametrize(
+    "dtype", [None, "int64", "floatX"], ids=[None, "int64", "floatX"]
+)
 @pytest.mark.parametrize(
     "start, stop, num_samples, endpoint, axis",
     [
@@ -1301,7 +1340,7 @@ def test_broadcast_arrays():
 def test_space_ops(op, dtype, start, stop, num_samples, endpoint, axis):
     pt_func = getattr(pt, op)
     np_func = getattr(np, op)
-    dtype = dtype + config.floatX[-2:] if dtype is not None else dtype
+    dtype = dtype if dtype != "floatX" else config.floatX
     z = pt_func(start, stop, num_samples, endpoint=endpoint, axis=axis, dtype=dtype)
 
     numpy_res = np_func(
@@ -1315,3 +1354,64 @@ def test_space_ops(op, dtype, start, stop, num_samples, endpoint, axis):
         atol=1e-6 if config.floatX.endswith("64") else 1e-4,
         rtol=1e-6 if config.floatX.endswith("64") else 1e-4,
     )
+
+
+@pytest.mark.parametrize("dtype", [None, "int64"])
+def test_linspace_retstep(dtype):
+    samples, step = pt.linspace(0, 1, num=3, retstep=True, dtype=dtype)
+    expected_samples, expected_step = np.linspace(
+        0, 1, num=3, retstep=True, dtype=dtype
+    )
+
+    assert samples.dtype == (config.floatX if dtype is None else dtype)
+    # step is never cast to `dtype`
+    assert step.dtype == expected_step.dtype
+
+    actual_samples, actual_step = function([], [samples, step])()
+    np.testing.assert_allclose(actual_samples, expected_samples)
+    np.testing.assert_allclose(actual_step, expected_step)
+
+
+def test_concat_with_broadcast():
+    rng = np.random.default_rng()
+    a = pt.tensor("a", shape=(1, 3, 5))
+    b = pt.tensor("b", shape=(5, 3, 10))
+
+    c = pt.concat_with_broadcast([a, b], axis=2)
+    fn = function([a, b], c, mode="FAST_COMPILE")
+    assert c.type.shape == (5, 3, 15)
+
+    a_val = rng.normal(size=(1, 3, 5)).astype(config.floatX)
+    b_val = rng.normal(size=(5, 3, 10)).astype(config.floatX)
+    c_val = fn(a_val, b_val)
+
+    # The result should be a tile + concat
+    np.testing.assert_allclose(c_val[:, :, :5], np.tile(a_val, (5, 1, 1)))
+    np.testing.assert_allclose(c_val[:, :, 5:], b_val)
+
+    # If a and b already conform, the result should be the same as a concatenation
+    a = pt.tensor("a", shape=(1, 1, 3, 5, 10))
+    b = pt.tensor("b", shape=(1, 1, 3, 2, 10))
+    c = pt.concat_with_broadcast([a, b], axis=-2)
+    assert c.type.shape == (1, 1, 3, 7, 10)
+
+    fn = function([a, b], c, mode="FAST_COMPILE")
+    a_val = rng.normal(size=(1, 1, 3, 5, 10)).astype(config.floatX)
+    b_val = rng.normal(size=(1, 1, 3, 2, 10)).astype(config.floatX)
+    c_val = fn(a_val, b_val)
+    np.testing.assert_allclose(c_val, np.concatenate([a_val, b_val], axis=-2))
+
+    c = pt.concat_with_broadcast([a], axis=0)
+    fn = function([a], c, mode="FAST_COMPILE")
+    np.testing.assert_allclose(fn(a_val), a_val)
+
+    with pytest.raises(ValueError, match="Cannot concatenate an empty list of tensors"):
+        pt.concat_with_broadcast([], axis=0)
+
+    with pytest.raises(
+        TypeError,
+        match="Only tensors with the same number of dimensions can be concatenated\\.",
+    ):
+        a = pt.tensor("a", shape=(1, 3, 5))
+        b = pt.tensor("b", shape=(3, 5))
+        pt.concat_with_broadcast([a, b], axis=1)

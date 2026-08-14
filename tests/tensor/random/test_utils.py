@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import numpy as np
 import pytest
 
@@ -7,9 +9,12 @@ from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.tensor.random.utils import (
     RandomStream,
     broadcast_params,
+    custom_rng_deepcopy,
+    normalize_size_param,
     supp_shape_from_ref_param_shape,
 )
-from pytensor.tensor.type import matrix, tensor
+from pytensor.tensor.type import TensorType, matrix, tensor
+from pytensor.tensor.type_other import NoneTypeT, none_type_t
 from tests import unittest_tools as utt
 
 
@@ -17,7 +22,7 @@ from tests import unittest_tools as utt
 def set_pytensor_flags():
     rewrites_query = RewriteDatabaseQuery(include=[None], exclude=[])
     py_mode = Mode("py", rewrites_query)
-    with config.change_flags(mode=py_mode, compute_test_value="warn"):
+    with config.change_flags(mode=py_mode):
         yield
 
 
@@ -71,17 +76,16 @@ def test_broadcast_params():
     assert np.array_equal(res[1], np.broadcast_to(cov, (3, 1, 1)))
 
     # Try it in PyTensor
-    with config.change_flags(compute_test_value="raise"):
-        mean = tensor(dtype=config.floatX, shape=(None, 1))
-        mean.tag.test_value = np.array([[0], [10], [100]], dtype=config.floatX)
-        cov = matrix()
-        cov.tag.test_value = np.diag(np.array([1e-6], dtype=config.floatX))
-        params = [mean, cov]
-        res = broadcast_params(params, ndims_params)
-        assert np.array_equal(res[0].get_test_value(), mean.get_test_value())
-        assert np.array_equal(
-            res[1].get_test_value(), np.broadcast_to(cov.get_test_value(), (3, 1, 1))
-        )
+    mean = tensor(dtype=config.floatX, shape=(None, 1))
+    mean_val = np.array([[0], [10], [100]], dtype=config.floatX)
+    cov = matrix()
+    cov_val = np.diag(np.array([1e-6], dtype=config.floatX))
+    params = [mean, cov]
+    res = broadcast_params(params, ndims_params)
+    f = function([mean, cov], res, on_unused_input="ignore")
+    res_vals = f(mean_val, cov_val)
+    assert np.array_equal(res_vals[0], mean_val)
+    assert np.array_equal(res_vals[1], np.broadcast_to(cov_val, (3, 1, 1)))
 
 
 class TestSharedRandomStream:
@@ -165,14 +169,20 @@ class TestSharedRandomStream:
         state_rng = random.state_updates[0][0].get_value(borrow=True)
 
         if hasattr(state_rng, "get_state"):
-            ref_state = ref_rng.get_state()
             random_state = state_rng.get_state()
+
+            # hack to try to get something reasonable for ref_rng
+            try:
+                ref_state = ref_rng.get_state()
+            except AttributeError:
+                ref_state = list(ref_rng.bit_generator.state.values())
+
             assert np.array_equal(random_state[1], ref_state[1])
             assert random_state[0] == ref_state[0]
             assert random_state[2:] == ref_state[2:]
         else:
-            ref_state = ref_rng.__getstate__()
-            random_state = state_rng.__getstate__()
+            ref_state = ref_rng.bit_generator.state
+            random_state = state_rng.bit_generator.state
             assert random_state["bit_generator"] == ref_state["bit_generator"]
             assert random_state["state"] == ref_state["state"]
 
@@ -278,7 +288,7 @@ class TestSharedRandomStream:
 
 
 def test_supp_shape_from_ref_param_shape():
-    with pytest.raises(ValueError, match="^ndim_supp*"):
+    with pytest.raises(ValueError, match=r"^ndim_supp*"):
         supp_shape_from_ref_param_shape(
             ndim_supp=0,
             dist_params=(np.array([1, 2]), 0),
@@ -300,7 +310,7 @@ def test_supp_shape_from_ref_param_shape():
     )
     assert res == (2,)
 
-    with pytest.raises(ValueError, match="^Reference parameter*"):
+    with pytest.raises(ValueError, match=r"^Reference parameter*"):
         supp_shape_from_ref_param_shape(
             ndim_supp=1,
             dist_params=(np.array(1),),
@@ -321,3 +331,47 @@ def test_supp_shape_from_ref_param_shape():
         ref_param_idx=1,
     )
     assert res == (3, 4)
+
+
+def test_normalize_size_param():
+    assert normalize_size_param(None).type == NoneTypeT()
+
+    sym_none_size = none_type_t()
+    assert normalize_size_param(sym_none_size) is sym_none_size
+
+    empty_size = normalize_size_param(())
+    assert empty_size.type == TensorType(dtype="int64", shape=(0,))
+
+    int_size = normalize_size_param(5)
+    assert int_size.type == TensorType(dtype="int64", shape=(1,))
+
+    seq_int_size = normalize_size_param((5, 3, 4))
+    assert seq_int_size.type == TensorType(dtype="int64", shape=(3,))
+
+    sym_tensor_size = tensor(shape=(3,), dtype="int64")
+    assert normalize_size_param(sym_tensor_size) is sym_tensor_size
+
+
+def test_custom_rng_deepcopy_matches_deepcopy():
+    rng = np.random.default_rng(123)
+
+    dp = deepcopy(rng).bit_generator
+    fc = custom_rng_deepcopy(rng).bit_generator
+
+    # Same state
+    assert dp.state == fc.state
+    # Same seed sequence
+    assert dp.seed_seq.state == fc.seed_seq.state
+
+
+def test_custom_rng_deepcopy_output_identical():
+    rng = np.random.default_rng(123)
+
+    rng1 = deepcopy(rng)
+    rng2 = custom_rng_deepcopy(rng)
+
+    # Generate numbers from each
+    x1 = rng1.normal(size=10)
+    x2 = rng2.normal(size=10)
+
+    assert np.allclose(x1, x2)

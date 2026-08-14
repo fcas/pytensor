@@ -11,11 +11,12 @@ from pytensor import tensor as pt
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Constant, OptionalApplyType, Variable
 from pytensor.graph.utils import MetaType
-from pytensor.scalar import ComplexError, IntegerDivisionError
+from pytensor.scalar import (
+    ComplexError,
+)
 from pytensor.tensor import _get_vector_length
-from pytensor.tensor.exceptions import AdvancedIndexingError
 from pytensor.tensor.type import TensorType
-from pytensor.tensor.type_other import NoneConst
+from pytensor.tensor.type_other import NoneTypeT
 from pytensor.tensor.utils import hash_from_ndarray
 
 
@@ -23,53 +24,54 @@ _TensorTypeType = TypeVar("_TensorTypeType", bound=TensorType)
 
 
 class _tensor_py_operators:
+    # These can't work because Python requires native output types
+    def __bool__(self):
+        raise TypeError(
+            "TensorVariable cannot be converted to Python boolean. "
+            "Call `.astype(bool)` for the symbolic equivalent."
+        )
+
+    def __index__(self):
+        raise TypeError(
+            "TensorVariable cannot be converted to Python integer. "
+            "Call `.astype(int)` for the symbolic equivalent."
+        )
+
+    def __int__(self):
+        raise TypeError(
+            "TensorVariable cannot be converted to Python integer. "
+            "Call `.astype(int)` for the symbolic equivalent."
+        )
+
+    def __float__(self):
+        raise TypeError(
+            "TensorVariables cannot be converted to Python float. "
+            "Call `.astype(float)` for the symbolic equivalent."
+        )
+
+    def __complex__(self):
+        raise TypeError(
+            "TensorVariables cannot be converted to Python complex number. "
+            "Call `.astype(complex)` for the symbolic equivalent."
+        )
+
     def __abs__(self):
         return pt.math.abs(self)
 
     def __neg__(self):
         return pt.math.neg(self)
 
-    # These won't work because Python requires an int return value
-    # def __int__(self): return convert_to_int32(self)
-    # def __float__(self): return convert_to_float64(self)
-    # def __complex__(self): return convert_to_complex128(self)
-
-    _is_nonzero = True
-
     def __lt__(self, other):
-        rval = pt.math.lt(self, other)
-        rval._is_nonzero = False
-        return rval
+        return pt.math.lt(self, other)
 
     def __le__(self, other):
-        rval = pt.math.le(self, other)
-        rval._is_nonzero = False
-        return rval
+        return pt.math.le(self, other)
 
     def __gt__(self, other):
-        rval = pt.math.gt(self, other)
-        rval._is_nonzero = False
-        return rval
+        return pt.math.gt(self, other)
 
     def __ge__(self, other):
-        rval = pt.math.ge(self, other)
-        rval._is_nonzero = False
-        return rval
-
-    def __bool__(self):
-        # This is meant to prohibit stuff like a < b < c, which is internally
-        # implemented as (a < b) and (b < c). The trouble with this is the
-        # side-effect that checking for a non-NULL a by typing "if a: ..."
-        # uses the same __nonzero__ method.  We want these both to work, but
-        # it seems impossible.  Currently, all vars evaluate to nonzero except
-        # the return values of comparison operators, which raise this
-        # exception.  If you can think of a better solution, go for it!
-        #
-        # __bool__ is Python 3.x data model. __nonzero__ is Python 2.x.
-        if self._is_nonzero:
-            return True
-        else:
-            raise TypeError("Variables do not support boolean operations.")
+        return pt.math.ge(self, other)
 
     def __invert__(self):
         return pt.math.invert(self)
@@ -105,9 +107,7 @@ class _tensor_py_operators:
         try:
             return pt.math.add(self, other)
         # We should catch the minimum number of exception here.
-        # Otherwise this will convert error when PyTensor flags
-        # compute_test_value is used
-        # Evidently, we need to catch NotImplementedError
+        # We need to catch NotImplementedError
         # TypeError from as_tensor_variable are caught in Elemwise.make_node
         # Otherwise TensorVariable * SparseVariable won't work!
         except (NotImplementedError, TypeError):
@@ -131,18 +131,6 @@ class _tensor_py_operators:
         # and the return value in that case
         try:
             return pt.math.mul(self, other)
-        except (NotImplementedError, TypeError):
-            return NotImplemented
-
-    def __div__(self, other):
-        # See explanation in __add__ for the error caught
-        # and the return value in that case
-        try:
-            return pt.math.div_proxy(self, other)
-        except IntegerDivisionError:
-            # This is to raise the exception that occurs when trying to divide
-            # two integer arrays (currently forbidden).
-            raise
         except (NotImplementedError, TypeError):
             return NotImplemented
 
@@ -205,9 +193,6 @@ class _tensor_py_operators:
 
     def __rmul__(self, other):
         return pt.math.mul(other, self)
-
-    def __rdiv__(self, other):
-        return pt.math.div_proxy(other, self)
 
     def __rmod__(self, other):
         return pt.math.mod(other, self)
@@ -342,9 +327,12 @@ class _tensor_py_operators:
         DimShuffle
 
         """
-        if (len(pattern) == 1) and (isinstance(pattern[0], list | tuple)):
+        if (len(pattern) == 1) and (isinstance(pattern[0], list | tuple | np.ndarray)):
             pattern = pattern[0]
         ds_op = pt.elemwise.DimShuffle(input_ndim=self.type.ndim, new_order=pattern)
+        if ds_op.new_order == tuple(range(self.type.ndim)):
+            # No-op
+            return self
         return ds_op(self)
 
     def flatten(self, ndim=1):
@@ -453,6 +441,10 @@ class _tensor_py_operators:
                 hasattr(args_el, "dtype") and args_el.dtype == "bool"
             ):
                 return True
+            # 0-d ndarrays satisfy ``isinstance(_, Iterable)`` but raise on
+            # iteration; the dtype branch above already handles them.
+            if isinstance(args_el, np.ndarray) and args_el.ndim == 0:
+                return False
             if not isinstance(args_el, Variable) and isinstance(args_el, Iterable):
                 for el in args_el:
                     if includes_bool(el):
@@ -464,15 +456,14 @@ class _tensor_py_operators:
         elif not isinstance(args, tuple):
             args = (args,)
 
-        # Count the dimensions, check for bools and find ellipses.
         ellipses = []
         index_dim_count = 0
         for i, arg in enumerate(args):
-            if arg is np.newaxis or arg is NoneConst:
-                # no increase in index_dim_count
+            if arg is None or (
+                isinstance(arg, Variable) and isinstance(arg.type, NoneTypeT)
+            ):
                 pass
             elif arg is Ellipsis:
-                # no increase in index_dim_count
                 ellipses.append(i)
             elif (
                 isinstance(arg, np.ndarray | Variable)
@@ -499,7 +490,9 @@ class _tensor_py_operators:
 
         # Check if the number of dimensions isn't too large.
         if self.ndim < index_dim_count:
-            raise IndexError("too many indices for array")
+            raise IndexError(
+                f"too many indices for tensor: tensor is {self.ndim}-dimensional, but {index_dim_count} were indexed"
+            )
 
         # Convert an Ellipsis if provided into an appropriate number of
         # slice(None).
@@ -511,6 +504,41 @@ class _tensor_py_operators:
             args[ellipsis_pt : ellipsis_pt + 1] = [slice(None)] * (
                 self.ndim - index_dim_count
             )
+
+        if any(
+            arg is None
+            or (isinstance(arg, Variable) and isinstance(arg.type, NoneTypeT))
+            for arg in args
+        ):
+            expansion_axes = []
+            new_args = []
+            # Track dims consumed by args and inserted `None`s after ellipsis
+            counter = 0
+            nones = 0
+            for arg in args:
+                if arg is None or (
+                    isinstance(arg, Variable) and isinstance(arg.type, NoneTypeT)
+                ):
+                    expansion_axes.append(counter + nones)  # Expand here
+                    nones += 1
+                    new_args.append(slice(None))
+                else:
+                    new_args.append(arg)
+                    consumed = 1
+                    if hasattr(arg, "dtype") and arg.dtype == "bool":
+                        consumed = arg.ndim
+                    counter += consumed
+
+            expanded = pt.expand_dims(self, expansion_axes)
+            if all(
+                isinstance(arg, slice)
+                and arg.start is None
+                and arg.stop is None
+                and arg.step is None
+                for arg in new_args
+            ):
+                return expanded
+            return expanded[tuple(new_args)]
 
         def is_empty_array(val):
             return (isinstance(val, tuple | list) and len(val) == 0) or (
@@ -527,74 +555,16 @@ class _tensor_py_operators:
             for inp in args
         )
 
-        # Determine if advanced indexing is needed or not.  The logic is
-        # already in `index_vars_to_types`: if it succeeds, standard indexing is
-        # used; if it fails with `AdvancedIndexingError`, advanced indexing is
-        # used
-        advanced = False
-        for i, arg in enumerate(args):
-            if includes_bool(arg):
-                advanced = True
-                break
-
-            if arg is not np.newaxis and arg is not NoneConst:
-                try:
-                    pt.subtensor.index_vars_to_types(arg)
-                except AdvancedIndexingError:
-                    if advanced:
-                        break
-                    else:
-                        advanced = True
-
-        if advanced:
-            return pt.subtensor.advanced_subtensor(self, *args)
+        if all(
+            (
+                isinstance(arg, slice | int | float | np.number)
+                or (hasattr(arg, "ndim") and arg.ndim == 0 and arg.dtype != "bool")
+            )
+            for arg in args
+        ):
+            return pt.subtensor.basic_subtensor(self, *args)
         else:
-            if np.newaxis in args or NoneConst in args:
-                # `np.newaxis` (i.e. `None`) in NumPy indexing mean "add a new
-                # broadcastable dimension at this location".  Since PyTensor adds
-                # new broadcastable dimensions via the `DimShuffle` `Op`, the
-                # following code uses said `Op` to add one of the new axes and
-                # then uses recursion to apply any other indices and add any
-                # remaining new axes.
-
-                counter = 0
-                pattern = []
-                new_args = []
-                for arg in args:
-                    if arg is np.newaxis or arg is NoneConst:
-                        pattern.append("x")
-                        new_args.append(slice(None, None, None))
-                    else:
-                        pattern.append(counter)
-                        counter += 1
-                        new_args.append(arg)
-
-                pattern.extend(list(range(counter, self.ndim)))
-
-                view = self.dimshuffle(pattern)
-                full_slices = True
-                for arg in new_args:
-                    # We can't do arg == slice(None, None, None) as in
-                    # Python 2.7, this call __lt__ if we have a slice
-                    # with some symbolic variable.
-                    if not (
-                        isinstance(arg, slice)
-                        and (arg.start is None or arg.start is NoneConst)
-                        and (arg.stop is None or arg.stop is NoneConst)
-                        and (arg.step is None or arg.step is NoneConst)
-                    ):
-                        full_slices = False
-                if full_slices:
-                    return view
-                else:
-                    return view.__getitem__(tuple(new_args))
-            else:
-                return pt.subtensor.Subtensor(args)(
-                    self,
-                    *pt.subtensor.get_slice_elements(
-                        args, lambda entry: isinstance(entry, Variable)
-                    ),
-                )
+            return pt.subtensor.advanced_subtensor(self, *args)
 
     def __setitem__(self, key, value):
         raise TypeError(
@@ -621,8 +591,7 @@ class _tensor_py_operators:
             # This prevents accidental iteration via sum(self)
             raise TypeError(
                 "TensorType does not support iteration.\n"
-                "\tDid you pass a PyTensor variable to a function that expects a list?\n"
-                "\tMaybe you are using builtins.sum instead of pytensor.tensor.sum?"
+                "\tDid you try to unpack a Variable or used a function that expects a list?\n"
             )
 
     @property
@@ -1042,17 +1011,9 @@ class TensorConstantSignature(tuple):
 
 def get_unique_constant_value(x: TensorVariable) -> Number | None:
     """Return the unique value of a tensor, if there is one"""
-    if isinstance(x, Constant):
-        data = x.data
-
-        if isinstance(data, np.ndarray) and data.size > 0:
-            if data.size == 1:
-                return data.squeeze()
-
-            flat_data = data.ravel()
-            if (flat_data == flat_data[0]).all():
-                return flat_data[0]
-
+    warnings.warn("get_unique_constant_value is deprecated.", FutureWarning)
+    if isinstance(x, TensorConstant):
+        return x.unique_value
     return None
 
 
@@ -1080,6 +1041,30 @@ class TensorConstant(TensorVariable, Constant[_TensorTypeType]):
 
     def signature(self):
         return TensorConstantSignature((self.type, self.data))
+
+    @property
+    def unique_value(self) -> Number | None:
+        """Return the unique value of a tensor, if there is one"""
+        try:
+            return self._unique_value
+        except AttributeError:
+            data = self.data
+            unique_value = None
+            if data.size > 0:
+                if data.size == 1:
+                    unique_value = data.squeeze()
+                else:
+                    flat_data = data.ravel()
+                    if (flat_data == flat_data[0]).all():
+                        unique_value = flat_data[0]
+
+                if unique_value is not None:
+                    # Don't allow the unique value to be changed
+                    unique_value.setflags(write=False)
+
+            self._unique_value = unique_value
+
+        return self._unique_value
 
     def equals(self, other):
         # Override Constant.equals to allow to compare with

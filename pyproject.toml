@@ -2,7 +2,7 @@
 requires = [
     "setuptools>=59.0.0",
     "cython",
-    "numpy>=1.17.0",
+    "numpy>=2.0",
     "versioneer[toml]==0.29",
 ]
 build-backend = "setuptools.build_meta"
@@ -10,17 +10,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pytensor"
 dynamic = ['version']
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.15"
 authors = [{ name = "pymc-devs", email = "pymc.devs@gmail.com" }]
 description = "Optimizing compiler for evaluating mathematical expressions on CPUs and GPUs."
 readme = "README.rst"
-license = { file = "LICENSE.txt" }
+license = "BSD-3-Clause"
+license-files = ["LICENSE.txt"]
 classifiers = [
     "Development Status :: 6 - Mature",
     "Intended Audience :: Education",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: BSD License",
     "Programming Language :: Python",
     "Topic :: Software Development :: Code Generators",
     "Topic :: Software Development :: Compilers",
@@ -30,9 +30,10 @@ classifiers = [
     "Operating System :: Unix",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 1 - Unstable",
 ]
 
 keywords = [
@@ -48,12 +49,9 @@ keywords = [
 dependencies = [
     "setuptools>=59.0.0",
     "scipy>=1,<2",
-    "numpy>=1.17.0,<2",
+    "numpy>=2.0",
+    "numba>=0.58,<=0.66.0",
     "filelock>=3.15",
-    "etuples",
-    "logical-unification",
-    "miniKanren",
-    "cons",
 ]
 
 [project.urls]
@@ -76,10 +74,17 @@ tests = [
     "pytest-benchmark",
     "pytest-mock",
     "pytest-sphinx",
+    "pytensor[kanren]",
 ]
-rtd = ["sphinx>=5.1.0,<6", "pygments", "pydot", "pydot2", "pydot-ng"]
+rtd = ["sphinx>=5.1.0,<6", "pygments", "pydot"]
 jax = ["jax", "jaxlib"]
-numba = ["numba>=0.57", "llvmlite"]
+numba = ["numba>=0.58,<=0.66.0", "llvmlite"]
+kanren = [
+    "etuples",
+    "logical-unification",
+    "miniKanren",
+    "cons",
+]
 
 [tool.setuptools.packages.find]
 include = ["pytensor*"]
@@ -117,19 +122,22 @@ versionfile_build = "pytensor/_version.py"
 tag_prefix = "rel-"
 
 [tool.pytest.ini_options]
-addopts = "--durations=50 --doctest-modules --ignore=pytensor/link --ignore=pytensor/misc/check_duplicate_key.py"
+addopts = "--durations=50 --doctest-modules --ignore=pytensor/link --ignore=pytensor/misc/check_duplicate_key.py --ignore=pytensor/ipython.py --ignore=pytensor/graph/rewriting/kanren.py"
 testpaths = ["pytensor/", "tests/"]
 xfail_strict = true
+filterwarnings =[
+    'ignore:^Numba will use object mode to run.*perform method\.:UserWarning',
+]
 
 [tool.ruff]
 line-length = 88
-exclude = ["doc/", "pytensor/_version.py"]
+exclude = ["pytensor/_version.py"]
 
 [tool.ruff.format]
 docstring-code-format = true
 
 [tool.ruff.lint]
-select = ["B905", "C", "E", "F", "I", "UP", "W", "RUF", "PERF", "PTH", "ISC"]
+select = ["C", "E", "F", "I", "UP", "W", "RUF", "PERF", "PTH", "ISC", "T20", "NPY201"]
 ignore = ["C408", "C901", "E501", "E741", "RUF012", "PERF203", "ISC001"]
 unfixable = [
     # zip-strict: the auto-fix adds `strict=False` but we might want `strict=True` instead
@@ -144,24 +152,27 @@ lines-after-imports = 2
 # TODO: Get rid of these:
 "**/__init__.py" = ["F401", "E402", "F403"]
 "pytensor/tensor/linalg.py" = ["F403"]
-"pytensor/link/c/cmodule.py" = ["PTH"]
-# For the tests we skip because `pytest.importorskip` is used:
-"tests/link/jax/test_scalar.py" = ["E402"]
-"tests/link/jax/test_tensor_basic.py" = ["E402"]
-"tests/link/numba/test_basic.py" = ["E402"]
-"tests/link/numba/test_cython_support.py" = ["E402"]
-"tests/link/numba/test_performance.py" = ["E402"]
-"tests/link/numba/test_sparse.py" = ["E402"]
-"tests/link/numba/test_tensor_basic.py" = ["E402"]
-"tests/tensor/test_math_scipy.py" = ["E402"]
-"tests/sparse/test_basic.py" = ["E402"]
-"tests/sparse/test_sp2.py" = ["E402"]
-"tests/sparse/test_utils.py" = ["E402"]
-"tests/sparse/sandbox/test_sp.py" = ["E402", "F401"]
+# Modules that use print-statements, skip "T201"
+"pytensor/link/c/cmodule.py" = ["PTH", "T201"]
+"pytensor/misc/elemwise_time_test.py" = ["T201"]
+"pytensor/misc/elemwise_openmp_speedup.py" = ["T201"]
+"pytensor/misc/check_duplicate_key.py" = ["T201"]
+"pytensor/misc/check_blas.py" = ["T201"]
+"pytensor/bin/pytensor_cache.py" = ["T201"]
+"tests/compile/debug/test_monitormode.py" = ["T201"]
+"scripts/run_mypy.py" = ["T201"]
+"scripts/bump_numba_upper_bound.py" = ["T201"]
+# Test modules of optional backends that use `pytest.importorskip`, skip "E402"
+"tests/link/jax/**/test_*.py" = ["E402"]
+"tests/link/numba/**/test_*.py" = ["E402"]
+"tests/link/pytorch/**/test_*.py" = ["E402"]
+"tests/link/mlx/**/test_*.py" = ["E402"]
+"tests/xtensor/**/*.py" = ["E402"]
+
 
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 ignore_missing_imports = true
 strict_equality = true
 warn_redundant_casts = true
@@ -170,18 +181,24 @@ warn_unused_ignores = true
 warn_return_any = true
 warn_unreachable = true
 files = ["pytensor", "tests"]
-plugins = ["numpy.typing.mypy_plugin"]
 
 [tool.cibuildwheel]
 build = "*"
 # Uncomment to skip builds that compile but fail when trying to test (maybe due to incompatibility with runner)
 # archs = ["auto64"]
-# Disable any-platform (pp*), and 32-bit builds.
+# Disable any-platform (pp*) and 32-bit builds
 # Additional options to consider: "*musllinux*"
 skip = ["pp*", "*-win32", "*-manylinux_i686"]
+# Free-threaded (cp*t-*) wheels are built by default. The compiled extensions
+# are not marked free-threading-safe, so importing them re-enables the GIL
+# (with a warning). That's fine: they're no longer loaded by default.
 build-frontend = "build"
-test-command = 'python -c "import pytensor; print(pytensor.__version__); from pytensor.scan import scan_perform; print(scan_perform.get_version())"'
-test-skip = ["cp37*", "*musllinux*", "*win32*", "*i686*"]
+# Import the compiled extensions and evaluate a function to check the wheel loads and
+# runs everywhere, including free-threaded builds. cxx="" disables the C backend (the
+# minimal wheel-test env has no libpython to link a runtime-compiled thunk against) and
+# FAST_COMPILE avoids numba, which crashes on free-threaded Windows.
+test-command = '''python -c "import pytensor; pytensor.config.cxx = ''; import pytensor.tensor as pt; print(pytensor.__version__); from pytensor.scan import scan_perform; print(scan_perform.get_version()); x = pt.vector(); f = pytensor.function([x], (x * 2).sum(), mode='FAST_COMPILE'); assert float(f([1.0, 2.0, 3.0])) == 12.0"'''
+test-skip = ["*musllinux*", "*i686*"]
 
 # Testing seems to be running into issues locating libs where expected
 # test-requires = ["pytest", "numba", "jax", "jaxlib"]

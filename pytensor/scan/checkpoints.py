@@ -1,6 +1,5 @@
 import pytensor.tensor.basic as ptb
 from pytensor.scan.basic import scan
-from pytensor.tensor.basic import Join
 from pytensor.tensor.math import ceil, eq, neq
 from pytensor.tensor.subtensor import set_subtensor
 
@@ -14,6 +13,7 @@ def scan_checkpoints(
     n_steps=None,
     save_every_N=10,
     padding=True,
+    return_updates=True,
 ):
     """Scan function that uses less memory, but is more restrictive.
 
@@ -127,14 +127,12 @@ def scan_checkpoints(
 
     # Pad the sequences if needed
     if padding:
-        # Since padding could be an empty tensor, Join returns a view of s.
-        join = Join(view=0)
         for i, s in enumerate(sequences):
             overshoots_by = s.shape[0] % save_every_N
             overshoots = neq(overshoots_by, 0)
             n = (save_every_N - overshoots_by) * overshoots
             z = ptb.zeros((n, *s.shape[1:]), dtype=s.dtype)
-            sequences[i] = join(0, s, z)
+            sequences[i] = ptb.join(0, s, z)
 
     # Establish the input variables of the outer scan
     o_sequences = [
@@ -160,24 +158,28 @@ def scan_checkpoints(
         ] * len(new_nitsots)
 
         # Call the user-provided function with the proper arguments
-        results, updates = scan(
+        results_and_updates = scan(
             fn=fn,
             sequences=i_sequences[:-1],
             outputs_info=i_outputs_infos,
             non_sequences=i_non_sequences,
             name=name + "_inner",
             n_steps=i_sequences[-1],
+            return_updates=return_updates,
         )
+        if return_updates:
+            results, updates = results_and_updates
+        else:
+            results = results_and_updates
+            updates = {}
+
         if not isinstance(results, list):
             results = [results]
 
         # Keep only the last timestep of every output but keep all the updates
-        if not isinstance(results, list):
-            return results[-1], updates
-        else:
-            return [r[-1] for r in results], updates
+        return [r[-1] for r in results], updates
 
-    results, updates = scan(
+    return scan(
         fn=outer_step,
         sequences=o_sequences,
         outputs_info=outputs_info,
@@ -185,6 +187,5 @@ def scan_checkpoints(
         name=name + "_outer",
         n_steps=o_n_steps,
         allow_gc=True,
+        return_updates=return_updates,
     )
-
-    return results, updates

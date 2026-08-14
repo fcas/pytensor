@@ -5,19 +5,25 @@ import pytest
 
 import pytensor
 import pytensor.tensor as pt
+from pytensor.compile import get_mode
 from pytensor.tensor.basic import AllocEmpty
 from pytensor.tensor.blas import Ger
-from pytensor.tensor.blas_c import CGemv, CGer, check_force_gemv_init
-from pytensor.tensor.blas_scipy import ScipyGer
-from pytensor.tensor.type import dmatrix, dvector, matrix, scalar, tensor, vector
+from pytensor.tensor.blas.blas_c import CGemv, CGer, must_initialize_y_gemv
+from pytensor.tensor.type import (
+    dmatrix,
+    dscalar,
+    dvector,
+    matrix,
+    scalar,
+    tensor,
+    vector,
+)
 from tests import unittest_tools
 from tests.tensor.test_blas import BaseGemv, TestBlasStrides
 from tests.unittest_tools import OptimizationTestMixin
 
 
-mode_blas_opt = pytensor.compile.get_default_mode().including(
-    "BlasOpt", "specialize", "InplaceBlasOpt", "c_blas"
-)
+mode_blas_opt = get_mode("CVM")
 
 
 def skip_if_blas_ldflags_empty(*functions_detected):
@@ -39,7 +45,7 @@ class TestCGer(OptimizationTestMixin):
     def manual_setup_method(self, dtype="float64"):
         # This tests can run even when pytensor.config.blas__ldflags is empty.
         self.dtype = dtype
-        self.mode = pytensor.compile.get_default_mode().including("fast_run")
+        self.mode = mode_blas_opt
         self.A = tensor(dtype=dtype, shape=(None, None))
         self.a = tensor(dtype=dtype, shape=())
         self.x = tensor(dtype=dtype, shape=(None,))
@@ -68,8 +74,6 @@ class TestCGer(OptimizationTestMixin):
         assert CGer(False) == CGer(False)
         assert CGer(False) != CGer(True)
 
-        assert CGer(True) != ScipyGer(True)
-        assert CGer(False) != ScipyGer(False)
         assert CGer(True) != Ger(True)
         assert CGer(False) != Ger(False)
 
@@ -125,36 +129,41 @@ class TestCGemv(OptimizationTestMixin):
     """
 
     def setup_method(self):
-        # This tests can run even when pytensor.config.blas__ldflags is empty.
         dtype = "float64"
         self.dtype = dtype
-        self.mode = pytensor.compile.get_default_mode().including("fast_run")
+        self.mode = mode_blas_opt
         # matrix
-        self.A = tensor(dtype=dtype, shape=(None, None))
+        self.A = tensor("A", dtype=dtype, shape=(None, None))
         self.Aval = np.ones((2, 3), dtype=dtype)
 
         # vector
-        self.x = tensor(dtype=dtype, shape=(None,))
-        self.y = tensor(dtype=dtype, shape=(None,))
+        self.x = tensor("x", dtype=dtype, shape=(None,))
+        self.y = tensor("y", dtype=dtype, shape=(None,))
         self.xval = np.asarray([1, 2], dtype=dtype)
         self.yval = np.asarray([1.5, 2.7, 3.9], dtype=dtype)
 
         # scalar
-        self.a = tensor(dtype=dtype, shape=())
+        self.a = tensor("a", dtype=dtype, shape=())
 
-    def test_nan_beta_0(self):
+    @pytest.mark.parametrize("inplace", [True, False])
+    def test_nan_beta_0(self, inplace):
         mode = self.mode.including()
         mode.check_isfinite = False
+        beta = self.a.type("beta")
         f = pytensor.function(
-            [self.A, self.x, self.y, self.a],
-            self.a * self.y + pt.dot(self.A, self.x),
+            [self.A, self.x, pytensor.In(self.y, mutable=inplace), beta],
+            beta * self.y + pt.dot(self.A, self.x),
             mode=mode,
         )
-        Aval = np.ones((3, 1), dtype=self.dtype)
-        xval = np.ones((1,), dtype=self.dtype)
-        yval = float("NaN") * np.ones((3,), dtype=self.dtype)
-        zval = f(Aval, xval, yval, 0)
-        assert not np.isnan(zval).any()
+        [node] = f.maker.fgraph.apply_nodes
+        assert isinstance(node.op, CGemv) and node.op.inplace == inplace
+        for rows in (3, 1, 0):
+            for cols in (1, 0):
+                Aval = np.ones((rows, cols), dtype=self.dtype)
+                xval = np.ones((cols,), dtype=self.dtype)
+                yval = np.full((rows,), np.nan, dtype=self.dtype)
+                zval = f(Aval, xval, yval, beta=0)
+                assert not np.isnan(zval).any(), f"{rows=}, {cols=}"
 
     def test_optimizations_vm(self):
         skip_if_blas_ldflags_empty()
@@ -191,8 +200,10 @@ class TestCGemv(OptimizationTestMixin):
             np.dot(self.Aval[::-1, ::-1], self.yval),
         )
 
-    def test_force_gemv_init(self):
-        if check_force_gemv_init():
+    def test_must_initialize_y_gemv(self):
+        if must_initialize_y_gemv():
+            # FIME: This warn should be emitted by the function if we find it relevant
+            # Not in a test that doesn't care about the outcome either way
             warn(
                 "WARNING: The current BLAS requires PyTensor to initialize"
                 " memory for some GEMV calls which will result in a minor"
@@ -243,6 +254,7 @@ class TestCGemv(OptimizationTestMixin):
         self.t_gemv1((0, 2))
         self.t_gemv1((3, 1))
         self.t_gemv1((3, 0))
+        self.t_gemv1((1, 1))
         self.t_gemv1((1, 0))
         self.t_gemv1((0, 1))
         self.t_gemv1((0, 0))
@@ -289,6 +301,26 @@ class TestCGemv(OptimizationTestMixin):
             len([n for n in f.maker.fgraph.apply_nodes if isinstance(n.op, AllocEmpty)])
             == 2
         )
+
+    def test_empty_A(self):
+        A = dmatrix("A")
+        x = dvector("x")
+        y = dvector("y")
+        alpha = 1.0
+        beta = dscalar("beta")
+        gemv = CGemv(inplace=True)(y, alpha, A, x, beta)
+        fn = pytensor.function(
+            [A, x, y, beta],
+            gemv,
+            accept_inplace=True,
+        )
+        test_A = np.empty((10, 0))
+        test_x = np.empty((0,))
+        test_y = np.random.random((10,))
+        for test_beta in [0.0, 1.0, 2.0]:
+            out = fn(test_A, test_x, test_y.copy(), test_beta)
+            expected = test_beta * test_y
+            np.testing.assert_allclose(out, expected)
 
 
 class TestCGemvFloat32(BaseGemv, OptimizationTestMixin):

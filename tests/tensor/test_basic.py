@@ -1,4 +1,5 @@
 import itertools
+import pickle
 from functools import partial
 from tempfile import mkstemp
 
@@ -10,14 +11,17 @@ import pytensor.scalar as ps
 import pytensor.tensor.basic as ptb
 import pytensor.tensor.math as ptm
 from pytensor import compile, config, function, shared
-from pytensor.compile import SharedVariable
 from pytensor.compile.io import In, Out
-from pytensor.compile.mode import Mode, get_default_mode
+from pytensor.compile.mode import Mode, get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.gradient import grad, hessian
 from pytensor.graph.basic import Apply, equal_computations
 from pytensor.graph.op import Op
-from pytensor.graph.replace import clone_replace
+from pytensor.graph.replace import clone_replace, vectorize_graph
+from pytensor.graph.rewriting.basic import node_rewriter
+from pytensor.graph.rewriting.db import RewriteDatabaseQuery
+from pytensor.graph.traversal import apply_ancestors
+from pytensor.link.numba import NumbaLinker
 from pytensor.raise_op import Assert
 from pytensor.scalar import autocast_float, autocast_float_as
 from pytensor.tensor import NoneConst, vectorize
@@ -34,7 +38,6 @@ from pytensor.tensor.basic import (
     ScalarFromTensor,
     Split,
     TensorFromScalar,
-    Tri,
     alloc,
     alloc_diag,
     arange,
@@ -43,10 +46,8 @@ from pytensor.tensor.basic import (
     cast,
     choose,
     constant,
-    default,
     diag,
     expand_dims,
-    extract_constant,
     eye,
     fill,
     flatnonzero,
@@ -71,6 +72,7 @@ from pytensor.tensor.basic import (
     roll,
     scalar_from_tensor,
     second,
+    split,
     stack,
     stacklists,
     swapaxes,
@@ -90,7 +92,7 @@ from pytensor.tensor.basic import (
     where,
     zeros_like,
 )
-from pytensor.tensor.blockwise import Blockwise
+from pytensor.tensor.blockwise import Blockwise, BlockwiseWithCoreShape
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.math import dense_dot
@@ -151,7 +153,12 @@ from tests.tensor.utils import (
 )
 
 
-pytestmark = pytest.mark.filterwarnings("error")
+pytestmark = pytest.mark.filterwarnings(
+    "error",
+    r"ignore:^Numba will use object mode to run.*perform method\.:UserWarning",
+    r"ignore:Cannot cache compiled function \"numba_funcified_fgraph.*:numba.NumbaWarning",
+    r"ignore::numba.NumbaPerformanceWarning",
+)
 
 if config.mode == "FAST_COMPILE":
     mode_opt = "FAST_RUN"
@@ -191,15 +198,7 @@ TestSecondBroadcast = makeTester(
     name="SecondBroadcastTester",
     op=second,
     expected=_numpy_second,
-    good=dict(
-        itertools.chain(
-            multi_dtype_checks((4, 5), (5,)),
-            multi_dtype_checks((2, 3, 2), (3, 2)),
-            multi_dtype_checks((2, 3, 2), (2,)),
-        )
-    ),
-    # I can't think of any way to make this fail at build time
-    # Just some simple smoke tests
+    good=dict(multi_dtype_checks((4, 2, 3, 2), (3, 2))),
     bad_runtime=dict(
         fail1=(random(5, 4), random(5)),
         fail2=(random(3, 2, 3), random(6, 9)),
@@ -207,28 +206,17 @@ TestSecondBroadcast = makeTester(
     ),
 )
 
-# We exclude local_fill_to_alloc because it optimizes the "second" node
-# away from the graph.
+# We exclude local_second_to_alloc because it optimizes the "second" node away from the graph.
 TestSecondSameRank = makeTester(
     name="SecondSameRankTester",
     op=second,
     expected=_numpy_second,
-    good=dict(
-        itertools.chain(
-            multi_dtype_checks((4, 5), (4, 5)),
-            multi_dtype_checks((1, 2), (3, 2)),
-            multi_dtype_checks((3, 2), (1, 2)),
-        )
-    ),
-    # These sizes are not broadcastable to one another
-    # and SHOULD raise an error, but currently don't.
+    good=dict(multi_dtype_checks((4, 5), (4, 1))),
     bad_runtime=dict(
-        itertools.chain(
-            multi_dtype_checks((4, 5), (5, 4)),
-            multi_dtype_checks((1, 5), (5, 4)),
-        )
+        fail1=(random(4, 5), random(5, 4)),
+        fail2=(integers(1, 5), integers(5, 4)),
     ),
-    mode=get_default_mode().excluding("local_fill_to_alloc", "local_useless_fill"),
+    mode=get_default_mode().excluding("local_second_to_alloc", "local_useless_fill"),
 )
 
 # Alloc
@@ -288,7 +276,7 @@ TestAlloc13GradBroadcast = makeBroadcastTester(
     ),
 )
 
-# unbroadcast a row to a matrix
+# broadcast a row to a matrix
 TestAllocb1GradBroadcast = makeBroadcastTester(
     name="Allocb1GradTester",
     op=lambda x: alloc(x, s1, s2),
@@ -300,7 +288,7 @@ TestAllocb1GradBroadcast = makeBroadcastTester(
     ),
 )
 
-# unbroadcast a row to a tensor3
+# broadcast a row to a tensor3
 TestAllocb2GradBroadcast = makeBroadcastTester(
     name="Allocb2GradTester",
     op=lambda x: alloc(x, s1, s2, s3),
@@ -312,7 +300,7 @@ TestAllocb2GradBroadcast = makeBroadcastTester(
     ),
 )
 
-# unbroadcast a col to a matrix
+# broadcast a col to a matrix
 TestAllocb3GradBroadcast = makeBroadcastTester(
     name="Allocb3GradTester",
     op=lambda x: alloc(x, s1, s2),
@@ -324,7 +312,7 @@ TestAllocb3GradBroadcast = makeBroadcastTester(
     ),
 )
 
-# unbroadcast a col to a tensor3
+# broadcast a col to a tensor3
 TestAllocb4GradBroadcast = makeBroadcastTester(
     name="Allocb4GradTester",
     op=lambda x: alloc(x, s1, s2, s3),
@@ -337,7 +325,7 @@ TestAllocb4GradBroadcast = makeBroadcastTester(
 )
 
 
-# Partial unbroadcast of a dimshuffled input
+# Partial broadcast of a dimshuffled input
 TestAllocDimshuffleGradBroadcast = makeBroadcastTester(
     name="Allocb4GradTester",
     op=lambda x: alloc(x.dimshuffle("x", "x", 0), 1, s2, s3),
@@ -584,14 +572,6 @@ class TestAsTensorVariable:
             _ = as_tensor_variable(bad_apply_var)
 
     def test_list(self):
-        # Make sure our exception handling during `Sequence` processing doesn't
-        # mask exceptions caused by unrelated logic (e.g.  computing test
-        # values)
-        with config.change_flags(compute_test_value="raise"), pytest.raises(ValueError):
-            a = lscalar("a")
-            y = (a, a, 1)
-            _ = as_tensor_variable(y)
-
         bad_apply_var = ApplyDefaultTestOp([0, 1]).make_node(self.x)
         with pytest.raises(TypeError):
             as_tensor_variable(bad_apply_var)
@@ -608,7 +588,7 @@ class TestAsTensorVariable:
 
     def test_ndim_incompatible(self):
         x = TensorType(config.floatX, shape=(1, None))("x")
-        with pytest.raises(ValueError, match="^Tensor of type.*"):
+        with pytest.raises(ValueError, match=r"^Tensor of type.*"):
             as_tensor_variable(x, ndim=0)
 
     def test_bool(self):
@@ -716,10 +696,78 @@ class TestAsTensorVariable:
         with pytest.raises(NotImplementedError, match="MaskedArrays are not supported"):
             ptb.as_tensor(x)
 
+    def test_range_returns_arange(self) -> None:
+        res = as_tensor_variable(range(10))
+
+        assert isinstance(res.owner.op, ARange)
+
+    @pytest.mark.parametrize(
+        "dtype, expected",
+        [
+            pytest.param(None, "int64", id="int64-default"),
+            pytest.param(config.floatX, config.floatX, id="config-floatX"),
+        ],
+    )
+    def test_range_dtype(self, dtype, expected) -> None:
+        res = as_tensor_variable(range(10), dtype=dtype)
+        assert res.dtype == expected
+
+    @pytest.mark.parametrize(
+        "step, expected",
+        [
+            pytest.param(None, 1, id="1-default"),
+            pytest.param(5, 5, id="specify"),
+        ],
+    )
+    def test_range_step(self, step, expected) -> None:
+        x = range(0, 2) if step is None else range(0, 2, step)
+        res = as_tensor_variable(x)
+        *_, actual = res.owner.inputs
+
+        assert actual.value == expected
+
+    def test_range_name(self) -> None:
+        x = range(10)
+        res = as_tensor_variable(x)
+        assert res.name is None
+
+        res = as_tensor_variable(x, name="something")
+        assert res.name == "something"
+
+    def test_range_ndim_raises(self) -> None:
+        with pytest.raises(ValueError, match="ndim for range must be 1"):
+            as_tensor_variable(range(10), ndim=2)
+
+
+def check_alloc_runtime_broadcast(mode):
+    """Check we emmit a clear error when runtime broadcasting would occur according to Numpy rules."""
+    floatX = config.floatX
+    x_v = vector("x", shape=(None,))
+
+    out = alloc(x_v, 5, 3)
+    f = pytensor.function([x_v], out, mode=mode)
+    TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
+
+    np.testing.assert_array_equal(
+        f(x=np.zeros((3,), dtype=floatX)),
+        np.zeros((5, 3), dtype=floatX),
+    )
+    with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
+        f(x=np.zeros((1,), dtype=floatX))
+
+    out = alloc(specify_shape(x_v, (1,)), 5, 3)
+    f = pytensor.function([x_v], out, mode=mode)
+    TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
+
+    np.testing.assert_array_equal(
+        f(x=np.zeros((1,), dtype=floatX)),
+        np.zeros((5, 3), dtype=floatX),
+    )
+
 
 class TestAlloc:
     dtype = config.floatX
-    mode = mode_opt
+    mode = get_mode(mode_opt)
     shared = staticmethod(pytensor.shared)
     allocs = [Alloc()] * 3
 
@@ -730,70 +778,50 @@ class TestAlloc:
             == n
         )
 
-    @staticmethod
-    def check_runtime_broadcast(mode):
-        """Check we emmit a clear error when runtime broadcasting would occur according to Numpy rules."""
-        floatX = config.floatX
-        x_v = vector("x", shape=(None,))
-
-        out = alloc(x_v, 5, 3)
-        f = pytensor.function([x_v], out, mode=mode)
-        TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
-
-        np.testing.assert_array_equal(
-            f(x=np.zeros((3,), dtype=floatX)),
-            np.zeros((5, 3), dtype=floatX),
-        )
-        with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
-            f(x=np.zeros((1,), dtype=floatX))
-
-        out = alloc(specify_shape(x_v, (1,)), 5, 3)
-        f = pytensor.function([x_v], out, mode=mode)
-        TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
-
-        np.testing.assert_array_equal(
-            f(x=np.zeros((1,), dtype=floatX)),
-            np.zeros((5, 3), dtype=floatX),
-        )
-
     def setup_method(self):
         self.rng = np.random.default_rng(seed=utt.fetch_seed())
 
-    def test_alloc_constant_folding(self):
+    @pytest.mark.parametrize(
+        "subtensor_fn, expected_grad_n_alloc",
+        [
+            # IncSubtensor1
+            (lambda x: x[:59], 1),
+            # AdvancedIncSubtensor1
+            (lambda x: x[np.arange(60)], 1),
+            # AdvancedIncSubtensor
+            (lambda x: x[np.arange(50), np.arange(50)], 1),
+        ],
+    )
+    def test_alloc_constant_folding(self, subtensor_fn, expected_grad_n_alloc):
         test_params = np.asarray(self.rng.standard_normal(50 * 60), self.dtype)
 
         some_vector = vector("some_vector", dtype=self.dtype)
         some_matrix = some_vector.reshape((60, 50))
         variables = self.shared(np.ones((50,), dtype=self.dtype))
-        idx = constant(np.arange(50))
 
-        for alloc_, (subtensor, n_alloc) in zip(
-            self.allocs,
-            [
-                # IncSubtensor1
-                (some_matrix[:60], 2),
-                # AdvancedIncSubtensor1
-                (some_matrix[arange(60)], 2),
-                # AdvancedIncSubtensor
-                (some_matrix[idx, idx], 1),
-            ],
-            strict=True,
-        ):
-            derp = pt_sum(dense_dot(subtensor, variables))
+        subtensor = subtensor_fn(some_matrix)
 
-            fobj = pytensor.function([some_vector], derp, mode=self.mode)
-            grad_derp = pytensor.grad(derp, some_vector)
-            fgrad = pytensor.function([some_vector], grad_derp, mode=self.mode)
+        derp = pt_sum(dense_dot(subtensor, variables))
+        fobj = pytensor.function(
+            [some_vector], derp, mode=get_mode(self.mode).excluding("BlasOpt")
+        )
+        assert (
+            sum(isinstance(node.op, Alloc) for node in fobj.maker.fgraph.apply_nodes)
+            == 0
+        )
+        # TODO: Assert something about the value if we bothered to call it?
+        fobj(test_params)
 
-            topo_obj = fobj.maker.fgraph.toposort()
-            assert sum(isinstance(node.op, type(alloc_)) for node in topo_obj) == 0
-
-            topo_grad = fgrad.maker.fgraph.toposort()
-            assert (
-                sum(isinstance(node.op, type(alloc_)) for node in topo_grad) == n_alloc
-            ), (alloc_, subtensor, n_alloc, topo_grad)
-            fobj(test_params)
-            fgrad(test_params)
+        grad_derp = pytensor.grad(derp, some_vector)
+        fgrad = pytensor.function(
+            [some_vector], grad_derp, mode=self.mode.excluding("BlasOpt")
+        )
+        assert (
+            sum(isinstance(node.op, Alloc) for node in fgrad.maker.fgraph.apply_nodes)
+            == expected_grad_n_alloc
+        )
+        # TODO: Assert something about the value if we bothered to call it?
+        fgrad(test_params)
 
     def test_alloc_output(self):
         val = constant(self.rng.standard_normal((1, 1)), dtype=self.dtype)
@@ -913,11 +941,11 @@ class TestAlloc:
 
     @pytest.mark.parametrize("mode", (Mode("py"), Mode("c")))
     def test_runtime_broadcast(self, mode):
-        self.check_runtime_broadcast(mode)
+        check_alloc_runtime_broadcast(mode)
 
 
 def test_infer_static_shape():
-    with pytest.raises(TypeError, match="^Shapes must be scalar integers.*"):
+    with pytest.raises(TypeError, match=r"^Shapes must be scalar integers.*"):
         infer_static_shape([constant(1.0)])
 
     with (
@@ -926,38 +954,56 @@ def test_infer_static_shape():
     ):
         infer_static_shape([dscalar("x")])
 
-    with pytest.raises(ValueError, match=".*could not be cast to have 0 dimensions"):
+    with pytest.raises(ValueError, match=r".*could not be cast to have 0 dimensions"):
         infer_static_shape((as_tensor_variable([[1, 2]]),))
 
     constant_size = constant([1])
     specify_size = specify_shape(constant_size, [1])
-    sh, static_shape = infer_static_shape(specify_size)
+    _sh, static_shape = infer_static_shape(specify_size)
     assert static_shape == (1,)
 
     x = scalar("x")
-    sh, static_shape = infer_static_shape([x.size])
+    _sh, static_shape = infer_static_shape([x.size])
     assert static_shape == (1,)
+
+
+def test_cached_equilibrium_db_invalidates_on_register():
+    # Registering after the default query is cached must drop the cache, so the
+    # newly registered rewrite is picked up on the next query.
+    db = ptb.CachedEquilibrimDB(default_query=RewriteDatabaseQuery(include=("tag",)))
+
+    @node_rewriter(None)
+    def noop(fgraph, node):
+        return None
+
+    db.register("noop", noop, "tag")
+    # Populate the cache.
+    assert db.default_query is not None
+    assert db._cached_default_query is not None
+
+    @node_rewriter(None)
+    def noop2(fgraph, node):
+        return None
+
+    db.register("noop2", noop2, "tag")
+    assert db._cached_default_query is None
 
 
 class TestEye:
     # This is slow for the ('int8', 3) version.
     def test_basic(self):
-        def check(dtype, N, M_=None, k=0):
-            # PyTensor does not accept None as a tensor.
-            # So we must use a real value.
-            M = M_
-            # Currently DebugMode does not support None as inputs even if this is
-            # allowed.
-            if M is None and config.mode in ["DebugMode", "DEBUG_MODE"]:
-                M = N
+        def check(dtype, N, M=None, k=0):
             N_symb = iscalar()
             M_symb = iscalar()
             k_symb = iscalar()
+            test_inputs = [N, k] if M is None else [N, M, k]
+            inputs = [N_symb, k_symb] if M is None else [N_symb, M_symb, k_symb]
             f = function(
-                [N_symb, M_symb, k_symb], eye(N_symb, M_symb, k_symb, dtype=dtype)
+                inputs,
+                eye(N_symb, None if (M is None) else M_symb, k_symb, dtype=dtype),
             )
-            result = f(N, M, k)
-            assert np.allclose(result, np.eye(N, M_, k, dtype=dtype))
+            result = f(*test_inputs)
+            assert np.allclose(result, np.eye(N, M, k, dtype=dtype))
             assert result.dtype == np.dtype(dtype)
 
         for dtype in ALL_DTYPES:
@@ -983,22 +1029,17 @@ class TestEye:
 
 class TestTriangle:
     def test_tri(self):
-        def check(dtype, N, M_=None, k=0):
-            # PyTensor does not accept None as a tensor.
-            # So we must use a real value.
-            M = M_
-            # Currently DebugMode does not support None as inputs even if this is
-            # allowed.
-            if M is None and config.mode in ["DebugMode", "DEBUG_MODE"]:
+        def check(dtype, N, M=None, k=0):
+            if M is None:
                 M = N
-            N_symb = iscalar()
-            M_symb = iscalar()
-            k_symb = iscalar()
+            N_symb = iscalar("N")
+            M_symb = iscalar("M")
+            k_symb = iscalar("k")
             f = function(
                 [N_symb, M_symb, k_symb], tri(N_symb, M_symb, k_symb, dtype=dtype)
             )
             result = f(N, M, k)
-            assert np.allclose(result, np.tri(N, M_, k, dtype=dtype))
+            assert np.allclose(result, np.tri(N, M, k, dtype=dtype))
             assert result.dtype == np.dtype(dtype)
 
         for dtype in ["int32", "int64", "float32", "float64", "uint16", "complex64"]:
@@ -1055,7 +1096,7 @@ class TestTriangle:
             assert np.allclose(result_indx, result_from)
             assert result.dtype == np.dtype(dtype)
 
-        def check_l_batch(m, k=0):
+        def check_l_batch(m):
             m_symb = tensor3(dtype=m.dtype)
             k_symb = iscalar()
             f = function([m_symb, k_symb], tril(m_symb, k_symb))
@@ -1073,12 +1114,23 @@ class TestTriangle:
                 assert np.allclose(result, np.triu(m, k))
                 assert result.dtype == np.dtype(dtype)
 
-        for dtype in ["int32", "int64", "float32", "float64", "uint16", "complex64"]:
+        for dtype in ["int32", "int64", "uint16"]:
             m = random_of_dtype((10, 10), dtype)
             check_l(m, 0)
             check_l(m, 1)
             check_l(m, -1)
 
+            m = random_of_dtype((10, 5), dtype)
+            check_u(m, 0)
+            check_u(m, 1)
+            check_u(m, -1)
+
+            m = random_of_dtype((5, 5, 5), dtype)
+            check_l_batch(m)
+            check_u_batch(m)
+
+        for dtype in ["float32", "float64", "complex64"]:
+            m = random_of_dtype((10, 10), dtype)
             check_u(m, 0)
             check_u(m, 1)
             check_u(m, -1)
@@ -1087,14 +1139,6 @@ class TestTriangle:
             check_l(m, 0)
             check_l(m, 1)
             check_l(m, -1)
-
-            check_u(m, 0)
-            check_u(m, 1)
-            check_u(m, -1)
-
-            m = random_of_dtype((5, 5, 5), dtype)
-            check_l_batch(m)
-            check_u_batch(m)
 
             m = random_of_dtype((5, 10, 5), dtype)
             check_l_batch(m)
@@ -1107,17 +1151,15 @@ class TestTriangle:
 
 
 class TestNonzero:
-    @config.change_flags(compute_test_value="raise")
     def test_nonzero(self):
         def check(m):
             m_symb = tensor(dtype=m.dtype, shape=(None,) * m.ndim)
-            m_symb.tag.test_value = m
 
             res_tuple_pt = nonzero(m_symb, return_matrix=False)
             res_matrix_pt = nonzero(m_symb, return_matrix=True)
 
-            res_tuple = tuple(r.tag.test_value for r in res_tuple_pt)
-            res_matrix = res_matrix_pt.tag.test_value
+            res_tuple = tuple(r.eval({m_symb: m}) for r in res_tuple_pt)
+            res_matrix = res_matrix_pt.eval({m_symb: m})
 
             assert np.allclose(res_matrix, np.vstack(np.nonzero(m)))
 
@@ -1136,15 +1178,13 @@ class TestNonzero:
         rand2d[:4] = 0
         check(rand2d)
 
-    @config.change_flags(compute_test_value="raise")
     def test_flatnonzero(self):
         def check(m):
             m_symb = tensor(dtype=m.dtype, shape=(None,) * m.ndim)
-            m_symb.tag.test_value = m
 
             res_pt = flatnonzero(m_symb)
 
-            result = res_pt.tag.test_value
+            result = res_pt.eval({m_symb: m})
             assert np.allclose(result, np.flatnonzero(m))
 
         rand0d = np.empty(())
@@ -1165,15 +1205,13 @@ class TestNonzero:
         f = function([], out)
         assert np.array_equal(f(), np.flatnonzero(m))
 
-    @config.change_flags(compute_test_value="raise")
     def test_nonzero_values(self):
         def check(m):
             m_symb = tensor(dtype=m.dtype, shape=(None,) * m.ndim)
-            m_symb.tag.test_value = m
 
             res_pt = nonzero_values(m_symb)
 
-            result = res_pt.tag.test_value
+            result = res_pt.eval({m_symb: m})
             assert np.allclose(result, m[np.nonzero(m)], equal_nan=True)
 
         rand0d = np.empty(())
@@ -1283,12 +1321,9 @@ def test_get_vector_length():
     assert isinstance(z.owner.op, Join)
     assert get_vector_length(z) == 3
 
-    z = join(
-        lscalar(),
-        as_tensor_variable([1, 2], ndim=1),
-        as_tensor_variable([3, 4], ndim=1),
-    )
-    with pytest.raises(ValueError, match="^Length of .*"):
+    # A `Join` whose components have undeterminable length cannot be measured
+    z = Join(0)(vector("v"), vector("w"))
+    with pytest.raises(ValueError, match=r"^Length of .*"):
         get_vector_length(z)
 
     # Test `MakeVector`s
@@ -1321,7 +1356,7 @@ class TestJoinAndSplit:
         Join.debug = False
 
         self.mode = pytensor.compile.get_default_mode().excluding("constant_folding")
-        self.join_op = Join()
+        self.join_op = Join(0)
         self.split_op_class = Split
         self.make_vector_op = MakeVector()
         self.floatX = config.floatX
@@ -1348,14 +1383,19 @@ class TestJoinAndSplit:
         return variables
 
     def test_input_validation(self):
-        with pytest.raises(TypeError, match=".*integer.*"):
-            Split(2)(matrix(), dscalar(), [1, 1])
+        # `splits` must be of integer type
+        with pytest.raises(TypeError, match=r".*integer.*"):
+            Split(2, 0)(matrix(), dvector())
 
-        with pytest.raises(TypeError, match=".*integer.*"):
-            Split(2)(matrix(), ivector(), [1, 1])
+        # A symbolic (non-constant) axis is no longer supported
+        with pytest.raises(TypeError, match=r".*[Ss]ymbolic.*"):
+            Split(2, lscalar())
 
-        with pytest.raises(TypeError, match=".*integer.*"):
-            join(dscalar(), matrix(), matrix())
+        with pytest.raises(TypeError, match=r".*[Ss]ymbolic.*"):
+            Join(lscalar())
+
+        with pytest.raises(TypeError, match=r".*constant integer.*"):
+            join(lscalar(), matrix(), matrix())
 
     def test_join_scalar(self):
         a = as_tensor_variable(1)
@@ -1711,60 +1751,16 @@ class TestJoinAndSplit:
 
         utt.verify_grad(lambda a, b: join(1, a, b), [av, bv], mode=self.mode)
 
-    def test_join_matrixV(self):
-        # variable join axis
+    def test_symbolic_axis_rejected(self):
+        # A symbolic (non-constant) axis is no longer supported by Join/Split.
         v = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=self.floatX)
         a = self.shared(v)
         b = as_tensor_variable(v)
-        ax = lscalar()
-        s = join(ax, a, b)
-
-        f = inplace_func([ax], [s], mode=self.mode)
-        topo = f.maker.fgraph.toposort()
-        assert [True for node in topo if isinstance(node.op, type(self.join_op))]
-
-        want = np.array(
-            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-        )
-        got = f(0)
-        assert np.allclose(got, want)
-
-        want = np.array(
-            [[0.1, 0.2, 0.3, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6, 0.4, 0.5, 0.6]]
-        )
-        got = f(1)
-        assert np.allclose(got, want)
-
-        utt.verify_grad(lambda a, b: join(0, a, b), [v, 2 * v], mode=self.mode)
-        utt.verify_grad(lambda a, b: join(1, a, b), [v, 2 * v], mode=self.mode)
-
-    def test_join_matrixV_negative_axis(self):
-        # variable join negative axis
-        v = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=self.floatX)
-        a = self.shared(v)
-        b = as_tensor_variable(v)
-        ax = lscalar()
-        s = join(ax, a, b)
-
-        f = inplace_func([ax], [s], mode=self.mode)
-        topo = f.maker.fgraph.toposort()
-        assert [True for node in topo if isinstance(node.op, type(self.join_op))]
-
-        want = np.array(
-            [[0.1, 0.2, 0.3, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6, 0.4, 0.5, 0.6]]
-        )
-
-        got = f(-1)
-        assert np.allclose(got, want)
-
-        want = np.array(
-            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-        )
-        got = f(-2)
-        assert np.allclose(got, want)
-
-        with pytest.raises(IndexError):
-            f(-3)
+        with pytest.raises(TypeError, match=r".*constant integer.*"):
+            join(lscalar(), a, b)
+        # A constant scalar variable is still accepted and normalized.
+        out = join(constant(-1), a, b)
+        assert out.owner.op == Join(1)
 
     @pytest.mark.parametrize("py_impl", (False, True))
     def test_join_matrixC_negative_axis(self, py_impl):
@@ -1806,7 +1802,7 @@ class TestJoinAndSplit:
         got = f()
         assert np.allclose(got, want)
 
-        with pytest.raises(IndexError):
+        with pytest.raises(ValueError):
             join(-3, a, b)
 
         with impl_ctxt:
@@ -1822,15 +1818,15 @@ class TestJoinAndSplit:
 
         a = self.shared(a_val, shape=(None, None, 1))
         b = self.shared(b_val, shape=(1, None, 1))
-        c = self.join_op(1, a, b)
+        c = join(1, a, b)
         assert c.type.shape == (1, None, 1)
 
         # Opt can remplace the int by an PyTensor constant
-        c = self.join_op(constant(1), a, b)
+        c = join(constant(1), a, b)
         assert c.type.shape == (1, None, 1)
 
         # In case futur opt insert other useless stuff
-        c = self.join_op(cast(constant(1), dtype="int32"), a, b)
+        c = join(cast(constant(1), dtype="int32"), a, b)
         assert c.type.shape == (1, None, 1)
 
         f = function([], c, mode=self.mode)
@@ -1857,7 +1853,7 @@ class TestJoinAndSplit:
 
         a = self.shared(a_val, shape=(None, None, 1))
         b = self.shared(b_val, shape=(1, None, 1))
-        c = self.join_op(0, a, b)
+        c = join(0, a, b)
         assert c.type.shape[0] != 1
 
         f = function([], c, mode=self.mode)
@@ -1874,7 +1870,7 @@ class TestJoinAndSplit:
             b.set_value(rng.random((3, 4, 1)).astype(self.floatX))
         a = TensorType(dtype=self.floatX, shape=(None, None, 1))()
         b = TensorType(dtype=self.floatX, shape=(1, None, 1))()
-        c = self.join_op(0, a, b)
+        c = join(0, a, b)
         f = function([a, b], c, mode=self.mode)
         bad_b_val = rng.random((3, 4, 1)).astype(self.floatX)
         with pytest.raises(TypeError):
@@ -1890,7 +1886,7 @@ class TestJoinAndSplit:
 
         a = self.shared(a_val, shape=(1, None, 1))
         b = self.shared(b_val, shape=(1, None, 1))
-        c = self.join_op(0, a, b)
+        c = join(0, a, b)
         assert c.type.shape[0] != 1
 
         f = function([], c, mode=self.mode)
@@ -1908,7 +1904,7 @@ class TestJoinAndSplit:
         rng = np.random.default_rng(seed=utt.fetch_seed())
         a_val = rng.random((1, 4, 1)).astype(self.floatX)
         a = self.shared(a_val, shape=(1, None, 1))
-        b = self.join_op(0, a)
+        b = join(0, a)
         assert b.type.shape[0] == 1
         assert b.type.shape[2] == 1
         assert b.type.shape[1] != 1
@@ -1937,17 +1933,17 @@ class TestJoinAndSplit:
         d = TensorType(dtype=self.floatX, shape=(1, None, 1, 1, None, 1))()
         e = TensorType(dtype=self.floatX, shape=(1, None, 1, None, None, 1))()
 
-        f = self.join_op(0, a, b, c, d, e)
+        f = join(0, a, b, c, d, e)
         fb = tuple(s == 1 for s in f.type.shape)
         assert f.type.shape == (5, 1, 1, 1, None, 1)
         assert fb == (False, True, True, True, False, True)
 
-        g = self.join_op(1, a, b, c, d, e)
+        g = join(1, a, b, c, d, e)
         gb = tuple(s == 1 for s in g.type.shape)
         assert g.type.shape == (1, None, 1, 1, None, 1)
         assert gb == (True, False, True, True, False, True)
 
-        h = self.join_op(4, a, b, c, d, e)
+        h = join(4, a, b, c, d, e)
         hb = tuple(s == 1 for s in h.type.shape)
         assert h.type.shape == (1, 1, 1, 1, None, 1)
         assert hb == (True, True, True, True, False, True)
@@ -2007,7 +2003,7 @@ class TestJoinAndSplit:
         x3 = self.shared(get_mat(1, 4))
 
         # Test dim 0
-        z = self.join_op(0, x1, x2, x3)
+        z = join(0, x1, x2, x3)
         f = pytensor.function([], z.shape, mode=self.mode)
         topo = f.maker.fgraph.toposort()
 
@@ -2022,7 +2018,7 @@ class TestJoinAndSplit:
         x1.set_value(get_mat(3, 4))
         x2.set_value(get_mat(3, 4))
         x3.set_value(get_mat(3, 5))
-        z = self.join_op(1, x1, x2, x3)
+        z = join(1, x1, x2, x3)
         f = pytensor.function([], z.shape, mode=self.mode)
         topo = f.maker.fgraph.toposort()
         out = f()
@@ -2039,31 +2035,12 @@ class TestJoinAndSplit:
         # This line used to crash.
         ptb.concatenate([x, -u], axis=2)
 
-    def test_concatenate_same(self):
-        # Test that we can concatenate the same tensor multiple time.
-
-        # In the past it was broken on the GPU.
-        rng = np.random.default_rng(seed=utt.fetch_seed())
-        T_shared = self.shared(rng.random((3, 4)).astype(self.floatX))
-        Tout = ptb.concatenate([T_shared, T_shared])
-        f = function([], Tout, mode=self.mode)
-        out = f()
-        if config.mode != "FAST_COMPILE":
-            assert [
-                True
-                for node in f.maker.fgraph.toposort()
-                if isinstance(node.op, type(self.join_op))
-            ]
-        assert np.allclose(
-            out, np.concatenate([T_shared.get_value(), T_shared.get_value()])
-        )
-
     def test_mixed_ndim_error(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
         v = self.shared(rng.random(4).astype(self.floatX))
         m = self.shared(rng.random((4, 4)).astype(self.floatX))
         with pytest.raises(TypeError, match="same number of dimensions"):
-            self.join_op(0, v, m)
+            join(0, v, m)
 
     def test_static_shape_inference(self):
         a = ptb.tensor(dtype="int8", shape=(2, 3))
@@ -2090,7 +2067,7 @@ class TestJoinAndSplit:
     def test_split_0elem(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
         m = self.shared(rng.random((4, 6)).astype(self.floatX))
-        o = self.split_op_class(2)(m, 0, [4, 0])
+        o = self.split_op_class(2, 0)(m, [4, 0])
         f = function([], o, mode=self.mode)
         assert any(
             isinstance(node.op, self.split_op_class)
@@ -2100,11 +2077,10 @@ class TestJoinAndSplit:
         assert np.allclose(o1, m.get_value(borrow=True))
         assert np.allclose(o2, m.get_value(borrow=True)[4:])
 
-    @config.change_flags(compute_test_value="off")
     def test_split_neg(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
         m = self.shared(rng.random((4, 6)).astype(self.floatX))
-        o = self.split_op_class(2)(m, 0, [5, -1])
+        o = self.split_op_class(2, 0)(m, [5, -1])
         f = function([], o, mode=self.mode)
         assert any(
             isinstance(node.op, self.split_op_class)
@@ -2116,30 +2092,8 @@ class TestJoinAndSplit:
     def test_split_static_shape(self):
         x = TensorType("floatX", shape=(5,))("x")
         s = iscalar("s")
-        y = Split(2)(x, 0, [s, 5 - s])[0]
+        y = Split(2, 0)(x, [s, 5 - s])[0]
         assert y.type.shape == (None,)
-
-    def test_join_inplace(self):
-        # Test join to work inplace.
-        #
-        # This function tests the case when several elements are passed to the
-        # join function but all except one of them are empty. In this case join
-        # should work inplace and the output should be the view of the non-empty
-        # element.
-        s = lscalar()
-        x = vector("x")
-        z = ptb.zeros((s,))
-
-        join = Join(view=0)
-        c = join(0, x, z, z)
-
-        f = pytensor.function([In(x, borrow=True), s], Out(c, borrow=True))
-
-        data = np.array([3, 4, 5], dtype=config.floatX)
-
-        if config.mode not in ["DebugMode", "DEBUG_MODE"]:
-            assert f(data, 0) is data
-        assert np.allclose(f(data, 0), [3, 4, 5])
 
     def test_join_oneInput(self):
         # Test join when only 1 input is given.
@@ -2160,10 +2114,9 @@ class TestJoinAndSplit:
     @pytest.mark.parametrize("linker", ("py", "c"))
     def test_split_view(self, linker):
         x = vector("x")
-        axis = 0
-        op = Split(len_splits=3)
+        op = Split(len_splits=3, axis=0)
         assert op.view_map == {0: [0], 1: [0], 2: [0]}
-        splits = op(x, axis, [0, 3, 2])
+        splits = op(x, [0, 3, 2])
 
         mode = Mode(linker)
         f = pytensor.function(
@@ -2173,11 +2126,61 @@ class TestJoinAndSplit:
         res = f(x_test)
         for r, expected in zip(res, ([], [0, 1, 2], [3, 4]), strict=True):
             assert np.allclose(r, expected)
-            if linker == "py":
-                assert r.base is x_test
-            else:
-                # C impl always makes a copy
-                assert r.base is not x_test
+            assert r.base is x_test
+
+    def test_join_negative_axis_rewrite(self):
+        """Test that a constant negative axis is normalized to a positive axis."""
+        v = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=self.floatX)
+        a = self.shared(v)
+        b = as_tensor_variable(v)
+
+        assert equal_computations([join(-1, a, b)], [join(1, a, b)])
+        assert equal_computations([join(-2, a, b)], [join(0, a, b)])
+
+    def test_axis_is_op_property(self):
+        # The axis is an Op property, not an Apply-node input.
+        a = matrix("a")
+        b = matrix("b")
+
+        join_node = join(1, a, b).owner
+        assert join_node.op.axis == 1
+        assert join_node.inputs == [a, b]
+        assert Join(0) == Join(0)
+        assert Join(0) != Join(1)
+        assert hash(Join(0)) == hash(Join(0))
+
+        split_node = Split(2, 1)(a, [1, 2])[0].owner
+        assert split_node.op.axis == 1
+        assert split_node.op.len_splits == 2
+        assert split_node.inputs[0] is a
+        assert Split(2, 0) != Split(2, 1)
+        assert Split(2, 0) != Split(3, 0)
+
+    def test_negative_axis(self):
+        # The Op rejects negative axes; the join/split helpers normalize them
+        # against the input rank before constructing the Op.
+        a = matrix("a")
+        b = matrix("b")
+        with pytest.raises(ValueError, match="non-negative"):
+            Join(-1)
+        with pytest.raises(ValueError, match="non-negative"):
+            Split(2, -1)
+        assert join(-1, a, b).owner.op == Join(1)
+        assert split(a, [1, 1], n_splits=2, axis=-1)[0].owner.op == Split(2, 1)
+
+    def test_pickle_roundtrip(self):
+        # Compiled functions with Join/Split round-trip through pickle.
+        a = matrix("a")
+        b = matrix("b")
+        joined = join(1, a, b)
+        split_out = Split(2, 0)(a, [1, 1])
+        f = function([a, b], [joined, *split_out], mode=self.mode)
+
+        reloaded = pickle.loads(pickle.dumps(f))
+        a_val = np.ones((2, 3), dtype=config.floatX)
+        b_val = np.zeros((2, 4), dtype=config.floatX)
+        for orig, new in zip(f(a_val, b_val), reloaded(a_val, b_val), strict=True):
+            assert np.array_equal(orig, new)
 
 
 def test_TensorFromScalar():
@@ -2215,27 +2218,41 @@ def test_ScalarFromTensor(cast_policy):
         assert ss.owner.op is scalar_from_tensor
         assert ss.type.dtype == tc.type.dtype
 
-        v = eval_outputs([ss])
+        mode = get_default_mode()
+        v = eval_outputs([ss], mode=mode)
 
         assert v == 56
-        assert v.shape == ()
-
-        if cast_policy == "custom":
-            assert isinstance(v, np.int8)
-        elif cast_policy == "numpy+floatX":
-            assert isinstance(v, np.int64)
+        if isinstance(mode.linker, NumbaLinker):
+            # Numba doesn't return numpy scalars
+            assert isinstance(v, int)
+        else:
+            assert v.shape == ()
+            if cast_policy == "custom":
+                assert isinstance(v, np.int8)
+            elif cast_policy == "numpy+floatX":
+                assert isinstance(v, np.int64)
 
         pts = lscalar()
         ss = scalar_from_tensor(pts)
-        ss.owner.op.grad([pts], [ss])
+        ss.owner.op.pullback([pts], [ss], [ss])
         fff = function([pts], ss)
         v = fff(np.asarray(5))
         assert v == 5
-        assert isinstance(v, np.int64)
-        assert v.shape == ()
+        if isinstance(mode.linker, NumbaLinker):
+            assert isinstance(v, int)
+        else:
+            assert isinstance(v, np.int64)
+            assert v.shape == ()
 
         with pytest.raises(TypeError):
             scalar_from_tensor(vector())
+
+
+def test_bool_scalar_from_tensor():
+    x = scalar("x", dtype="bool")
+    fn = function([x], scalar_from_tensor(x))
+    assert fn(np.array(True, dtype=bool))
+    assert not fn(np.array(False, dtype=bool))
 
 
 def test_op_cache():
@@ -2387,194 +2404,120 @@ def test_is_flat():
     assert not ptb.is_flat(X.reshape((iscalar(),) * 3))
 
 
-def test_tile():
-    """
-    TODO FIXME: Split this apart and parameterize.  Also, find out why it's
-    unreasonably slow.
-    """
+class TestTile:
+    @pytest.mark.parametrize(
+        "A_shape, reps_test",
+        [
+            ((), (2,)),
+            ((5,), (2,)),
+            ((2, 4), (2, 3)),
+            ((2, 4), (2, 3, 4)),
+            ((2, 4, 3), (2, 3)),
+            ((2, 4, 3), (2, 3, 4)),
+            ((2, 4, 3, 5), (2, 3, 4, 6)),
+        ],
+    )
+    def test_tile_separate_reps_entries(self, A_shape, reps_test):
+        rng = np.random.default_rng(2400)
 
-    def run_tile(x, x_, reps, use_symbolic_reps):
-        if use_symbolic_reps:
-            rep_symbols = [iscalar() for _ in range(len(reps))]
-            f = function([x, *rep_symbols], tile(x, rep_symbols))
-            return f(*([x_, *reps]))
-        else:
-            f = function([x], tile(x, reps))
-            return f(x_)
+        A = tensor("A", shape=(None,) * len(A_shape))
+        reps = [iscalar(f"r{i}") for i in range(len(reps_test))]
+        tile_out = tile(A, reps)
 
-    rng = np.random.default_rng(utt.fetch_seed())
+        tile_fn = function([A, *reps], tile_out)
 
-    for use_symbolic_reps in [False, True]:
-        # Test the one-dimensional case.
-        x = vector()
-        x_ = rng.standard_normal(5).astype(config.floatX)
-        assert np.all(run_tile(x, x_, (2,), use_symbolic_reps) == np.tile(x_, (2,)))
-
-        # Test the two-dimensional case.
-        x = matrix()
-        x_ = rng.standard_normal((2, 4)).astype(config.floatX)
-        assert np.all(run_tile(x, x_, (2, 3), use_symbolic_reps) == np.tile(x_, (2, 3)))
-
-        # Test the three-dimensional case.
-        x = tensor3()
-        x_ = rng.standard_normal((2, 4, 3)).astype(config.floatX)
-        assert np.all(
-            run_tile(x, x_, (2, 3, 4), use_symbolic_reps) == np.tile(x_, (2, 3, 4))
+        A_test = rng.standard_normal(A_shape).astype(config.floatX)
+        np.testing.assert_array_equal(
+            tile_fn(A_test, *reps_test),
+            np.tile(A_test, reps_test),
+            strict=True,
         )
 
-        # Test the four-dimensional case.
-        x = tensor4()
-        x_ = rng.standard_normal((2, 4, 3, 5)).astype(config.floatX)
-        assert np.all(
-            run_tile(x, x_, (2, 3, 4, 6), use_symbolic_reps)
-            == np.tile(x_, (2, 3, 4, 6))
+    @pytest.mark.parametrize("reps", (2, np.array([2, 3, 4])))
+    def test_combined_reps_entries(self, reps):
+        rng = np.random.default_rng(2422)
+        A_test = rng.standard_normal((2, 4, 3)).astype(config.floatX)
+        expected_eval = np.tile(A_test, reps)
+
+        A = tensor3("A")
+        np.testing.assert_array_equal(
+            tile(A, reps).eval({A: A_test}),
+            expected_eval,
+            strict=True,
         )
 
-        # Test passing a float
-        x = scalar()
-        x_val = 1.0
-        assert np.array_equal(
-            run_tile(x, x_val, (2,), use_symbolic_reps), np.tile(x_val, (2,))
+        sym_reps = as_tensor_variable(reps).type()
+        np.testing.assert_array_equal(
+            tile(A, sym_reps).eval({A: A_test, sym_reps: reps}),
+            expected_eval,
+            strict=True,
         )
 
+    def test_mixed_reps_type(self):
+        A = np.arange(9).reshape(3, 3)
+        reps = [2, iscalar("3"), 4]
+        np.testing.assert_array_equal(
+            tile(A, reps).eval({"3": 3}),
+            np.tile(A, [2, 3, 4]),
+            strict=True,
+        )
+
+    def test_tensorlike_A(self):
         # Test when x is a list
-        x = matrix()
         x_val = [[1.0, 2.0], [3.0, 4.0]]
-        assert np.array_equal(
-            run_tile(x, x_val, (2,), use_symbolic_reps), np.tile(x_val, (2,))
+        assert equal_computations(
+            [tile(x_val, (2,))],
+            [tile(as_tensor_variable(x_val), (2,))],
         )
 
-    # Test when reps is integer, scalar or vector.
-    # Test 1,2,3,4-dimensional cases.
-    # Test input x has the shape [2], [2, 4], [2, 4, 3], [2, 4, 3, 5].
-    test_shape = [2, 4, 3, 5]
-    k = 0
-    for xtype in [vector(), matrix(), tensor3(), tensor4()]:
-        x = xtype
-        k = k + 1
-        x_ = rng.standard_normal(test_shape[0:k]).astype(config.floatX)
-
-        # integer:
-        reps_ = 2
-        f = function([x], tile(x, reps_))
-        assert np.all(f(x_) == np.tile(x_, reps_))
-
-        # scalar:
-        reps = iscalar()
-        reps_ = 2
-        f = function([x, reps], tile(x, reps))
-        assert np.all(f(x_, reps_) == np.tile(x_, reps_))
-
-        # vector:
-        reps = ivector()
-        reps_ = [2] if k == 1 or k == 2 else [2, 3]
-        ndim_ = k
-        f = function([x, reps], tile(x, reps, ndim_))
-        assert np.all(f(x_, reps_) == np.tile(x_, reps_))
-
-        # list of integers:
-        reps_ = [2, 3, 4]
-        f = function([x], tile(x, reps_))
-        assert np.all(f(x_) == np.tile(x_, reps_))
-
-        # list of integers and scalars:
-        d = iscalar()
-        reps = [2, d, 4]
-        f = function([x, d], tile(x, reps))
-        reps_ = [2, 3, 4]
-        assert np.all(f(x_, 3) == np.tile(x_, reps_))
-
-        # reps is list, len(reps) > x.ndim, 3 cases below:
-        r = [2, 3, 4, 5, 6]
-        reps_ = r[: k + 1]  # len(reps_) = x.ndim+1
-        # (1) ndim = None.
-        f = function([x], tile(x, reps_))
-        assert np.all(f(x_) == np.tile(x_, reps_))
-        # (2) ndim = len(reps).
-        ndim_ = len(reps_)
-        f = function([x], tile(x, reps_, ndim_))
-        assert np.all(f(x_) == np.tile(x_, reps_))
-        # (3) ndim > len(reps)
-        ndim_ = len(reps_) + 1
-        f = function([x], tile(x, reps_, ndim_))
-        assert np.all(f(x_) == np.tile(x_, [1, *reps_]))
-
-        # reps is list, ndim > x.ndim > len(reps):
-        r = [2, 3, 4, 5]
-        if k > 1:
-            ndim_ = k + 1
-            reps_ = r[: k - 1]
-            f = function([x], tile(x, reps_, ndim_))
-            assert np.all(f(x_) == np.tile(x_, [1, 1, *reps_]))
-
+    def test_error_unknown_reps_length(self):
         # error raising test: ndim not specified when reps is vector
         reps = ivector()
-        with pytest.raises(ValueError):
-            tile(x, reps)
+        with pytest.raises(ValueError, match="Use specify_shape to set the length"):
+            tile(arange(3), reps)
 
-        # error raising test: not a integer
-        for reps in [2.5, fscalar(), fvector()]:
+        # fine with specify_shape
+        out = tile(arange(3), specify_shape(reps, 2))
+        np.testing.assert_array_equal(
+            out.eval({reps: [2, 3]}),
+            np.tile(np.arange(3), [2, 3]),
+            strict=True,
+        )
+
+    def test_error_non_integer_reps(self):
+        for reps in (
+            2.5,
+            fscalar(),
+            vector(shape=(3,), dtype="float64"),
+            [2, fscalar()],
+        ):
             with pytest.raises(ValueError):
-                tile(x, reps)
+                tile(arange(3), reps)
 
-        # error raising test: the dimension of reps exceeds 1
-        reps = imatrix()
-        with pytest.raises(ValueError):
-            tile(x, reps)
+    def test_error_reps_ndim(self):
+        for reps in (
+            matrix(shape=(3, 1), dtype=int),
+            [2, vector(shape=(2,), dtype=int)],
+        ):
+            with pytest.raises(ValueError):
+                tile(arange(3), reps)
 
-        # error raising test: ndim is not None, ndim < x.ndim
-        # 3 cases below (reps is list/scalar/vector):
-        for reps in [[2, 3, 4], iscalar(), ivector()]:
-            if k > 1:
-                ndim = k - 1
-                with pytest.raises(ValueError):
-                    tile(x, reps, ndim)
+    def test_tile_grad(self):
+        A = tensor3("A")
+        reps = vector("reps", shape=(3,), dtype=int)
+        A_tile = tile(A, reps)
+        grad_tile = grad(A_tile.sum(), A)
 
-        # error raising test: reps is list, len(reps) > ndim
-        r = [2, 3, 4, 5, 6]
-        reps = r[: k + 1]
-        ndim = k
-        with pytest.raises(ValueError):
-            tile(x, reps, ndim)
-
-        # error raising test:
-        # reps is vector and len(reps_value) > ndim,
-        # reps_value is the real value when executing the function.
-        reps = ivector()
-        r = [2, 3, 4, 5, 6, 7]
-        reps_ = r[: k + 2]
-        ndim_ = k + 1
-        f = function([x, reps], tile(x, reps, ndim_))
-        with pytest.raises(AssertionError):
-            f(x_, reps_)
-
-
-def test_tile_grad():
-    def grad_tile(x, reps, np_x):
-        y = tile(x, reps)
-        z = y.sum()
-        g = pytensor.function([x], grad(z, x))
-        grad_res = g(np_x)
         # The gradient should be the product of the tiling dimensions
         # (since the gradients are additive through the tiling operation)
-        assert np.all(grad_res == np.prod(reps))
-
-    rng = np.random.default_rng(utt.fetch_seed())
-
-    # test vector
-    grad_tile(vector("x"), [3], rng.standard_normal(5).astype(config.floatX))
-    # test matrix
-    grad_tile(matrix("x"), [3, 4], rng.standard_normal((2, 3)).astype(config.floatX))
-    # test tensor3
-    grad_tile(
-        tensor3("x"), [3, 4, 5], rng.standard_normal((2, 4, 3)).astype(config.floatX)
-    )
-    # test tensor4
-    grad_tile(
-        tensor4("x"),
-        [3, 4, 5, 6],
-        rng.standard_normal((2, 4, 3, 5)).astype(config.floatX),
-    )
+        rng = np.random.default_rng(2489)
+        A_test = rng.normal(size=(2, 4, 3)).astype(config.floatX)
+        reps_test = [3, 4, 5]
+        np.testing.assert_array_equal(
+            grad_tile.eval({A: A_test, reps: reps_test}),
+            np.full(A_test.shape, np.prod(reps_test).astype(config.floatX)),
+            strict=True,
+        )
 
 
 class TestARange:
@@ -2676,7 +2619,7 @@ class TestARange:
                         start_v_, stop_v_, step_v_, dtype=out.dtype
                     )
 
-                assert np.all(f_val == expected_val)
+                np.testing.assert_allclose(f_val, expected_val, strict=True, rtol=3e-7)
 
     @pytest.mark.parametrize(
         "cast_policy",
@@ -2713,7 +2656,7 @@ class TestARange:
                 elif config.cast_policy == "numpy+floatX":
                     expected_val = np.arange(start_v_, stop_v_, step_v_)
 
-                assert np.all(f_val == expected_val)
+                np.testing.assert_allclose(f_val, expected_val, strict=True)
 
     @pytest.mark.parametrize(
         "cast_policy",
@@ -2900,7 +2843,6 @@ class TestARange:
             out = arange(start, stop, 1)
             f = function([start, stop], out.shape, mode=mode)
             assert len(f.maker.fgraph.toposort()) == 5
-            # 4 [Elemwise{sub,no_inplace}(stop, start), Elemwise{Cast{int64}}(Elemwise{sub,no_inplace}.0), Elemwise{Maximum{output_types_preference=transfer_type{0}}}[(0, 0)](Elemwise{Cast{int64}}.0, 0), MakeVector(Elemwise{Maximum{output_types_preference=transfer_type{0}}}[(0, 0)].0)]
             if config.cast_policy == "custom":
                 assert out.dtype == "int64"
             elif config.cast_policy == "numpy+floatX":
@@ -2935,6 +2877,25 @@ class TestARange:
             assert np.all(f(2) == len(np.arange(0, 2)))
             assert np.all(f(2) == len(np.arange(0, 2)))
             assert np.all(f(0) == len(np.arange(0, 0)))
+
+    def test_static_shape(self):
+        assert np.arange(1, 10).shape == arange(1, 10).type.shape
+        assert np.arange(10, 1, -1).shape == arange(10, 1, -1).type.shape
+        assert np.arange(1, -9, 2).shape == arange(1, -9, 2).type.shape
+        assert np.arange(1.3, 17.48, 2.67).shape == arange(1.3, 17.48, 2.67).type.shape
+        assert np.arange(-64, 64).shape == arange(-64, 64).type.shape
+
+    def test_c_cache_bug(self):
+        # Regression test for bug caused by issues in hash of `np.dtype()` objects
+        # https://github.com/numpy/numpy/issues/17864
+        end = iscalar("end")
+        arange1 = ARange(np.dtype("float64"))(0, end, 1)
+        arange2 = ARange("float64")(0, end + 1, 1)
+        assert arange1.owner.op == arange2.owner.op
+        assert hash(arange1.owner.op) == hash(arange2.owner.op)
+        fn = function([end], [arange1, arange2])
+        res1, res2 = fn(10)
+        np.testing.assert_array_equal(res1, res2[:-1], strict=True)
 
 
 class TestNdGrid:
@@ -3183,42 +3144,6 @@ def test_stack():
     assert [-4, -2] == list(rval)
 
 
-@pytest.mark.skipif(
-    isinstance(get_default_mode(), pytensor.compile.debugmode.DebugMode),
-    reason="This test fails in DEBUG_MODE, but the generated code is OK. "
-    "It is actually a problem of DEBUG_MODE, see #626.",
-)
-def test_default():
-    x, y = scalars("xy")
-    z = default(x, y)
-    f = function([x, y], z)
-    assert f(1, 2) == 1
-    assert f(None, 2) == 2
-    assert f(1, None) == 1
-
-    with pytest.raises(TypeError, match=".*compatible types.*"):
-        default(x, vector())
-
-
-@pytest.mark.skipif(
-    isinstance(get_default_mode(), pytensor.compile.debugmode.DebugMode),
-    reason="This test fails in DEBUG_MODE, but the generated code is OK. "
-    "It is actually a problem of DEBUG_MODE, see #626.",
-)
-def test_default_state():
-    x, y = scalars("xy")
-    # print config.floatX
-    # print x.type
-    # print y.type
-    z = default(x, 3.8)
-    new_x = y + z
-    f = function([y, compile.In(x, update=new_x, value=12.0)], new_x)
-    assert f(3) == 15
-    f["x"] = None
-    assert np.allclose(f(1), 4.8)
-    assert np.allclose(f(np.asarray(2.2, dtype=config.floatX)), 7)
-
-
 @config.change_flags(cast_policy="custom")
 def test_autocast_custom():
     # Called from `test_autocast`.
@@ -3273,7 +3198,6 @@ def test_autocast_custom():
         assert (dvector() + 1.1).dtype == "float64"
         assert (fvector() + np.float32(1.1)).dtype == "float32"
         assert (fvector() + np.float64(1.1)).dtype == "float64"
-        assert (fvector() + 1.1).dtype == config.floatX
         assert (lvector() + np.int64(1)).dtype == "int64"
         assert (lvector() + np.int32(1)).dtype == "int64"
         assert (lvector() + np.int16(1)).dtype == "int64"
@@ -3552,11 +3476,10 @@ class TestGetUnderlyingScalarConstantValue:
         a = Assert()(c, c > 1)
         assert get_underlying_scalar_constant_value(a) == 2
 
-        with config.change_flags(compute_test_value="off"):
-            # condition is always False
-            a = Assert()(c, c > 2)
-            with pytest.raises(NotScalarConstantError):
-                get_underlying_scalar_constant_value(a)
+        # condition is always False
+        a = Assert()(c, c > 2)
+        with pytest.raises(NotScalarConstantError):
+            get_underlying_scalar_constant_value(a)
 
         # condition is not constant
         a = Assert()(c, c > x)
@@ -3574,9 +3497,9 @@ class TestGetUnderlyingScalarConstantValue:
         # Make sure we do not return the internal storage of a constant,
         # so we cannot change the value of a constant by mistake.
         c = constant(3)
-        d = extract_constant(c)
+        d = get_scalar_constant_value(c)
         d += 1
-        e = extract_constant(c)
+        e = get_scalar_constant_value(c)
         assert e == 3, (c, d, e)
 
     @pytest.mark.parametrize("only_process_constants", (True, False))
@@ -3687,7 +3610,7 @@ class TestDiag:
     @pytest.mark.parametrize("inp", (scalar, tensor3))
     def test_diag_invalid_input_ndim(self, inp):
         x = inp()
-        with pytest.raises(ValueError, match="Input must be 1- or 2-d."):
+        with pytest.raises(ValueError, match="Input must be 1- or 2-d\\."):
             diag(x)
 
 
@@ -3922,35 +3845,22 @@ class TestInferShape(utt.InferShapeTester):
     def test_Flatten(self):
         atens3 = tensor3()
         atens3_val = random(4, 5, 3)
-        for ndim in (3, 2, 1):
+        for ndim in (2, 1):
             self._compile_and_check(
                 [atens3],
                 [flatten(atens3, ndim)],
                 [atens3_val],
                 Reshape,
-                excluding=["local_useless_reshape"],
             )
 
         amat = matrix()
         amat_val = random(4, 5)
-        for ndim in (2, 1):
-            self._compile_and_check(
-                [amat],
-                [flatten(amat, ndim)],
-                [amat_val],
-                Reshape,
-                excluding=["local_useless_reshape"],
-            )
-
-        avec = vector()
-        avec_val = random(4)
         ndim = 1
         self._compile_and_check(
-            [avec],
-            [flatten(avec, ndim)],
-            [avec_val],
+            [amat],
+            [flatten(amat, ndim)],
+            [amat_val],
             Reshape,
-            excluding=["local_useless_reshape"],
         )
 
     def test_Eye(self):
@@ -3967,22 +3877,6 @@ class TestInferShape(utt.InferShapeTester):
 
         self._compile_and_check(
             [aiscal, biscal, ciscal], [Eye()(aiscal, biscal, ciscal)], [3, 5, 0], Eye
-        )
-
-    def test_Tri(self):
-        aiscal = iscalar()
-        biscal = iscalar()
-        ciscal = iscalar()
-        self._compile_and_check(
-            [aiscal, biscal, ciscal], [Tri()(aiscal, biscal, ciscal)], [4, 4, 0], Tri
-        )
-
-        self._compile_and_check(
-            [aiscal, biscal, ciscal], [Tri()(aiscal, biscal, ciscal)], [4, 5, 0], Tri
-        )
-
-        self._compile_and_check(
-            [aiscal, biscal, ciscal], [Tri()(aiscal, biscal, ciscal)], [3, 5, 0], Tri
         )
 
     def test_ExtractDiag(self):
@@ -4002,43 +3896,41 @@ class TestInferShape(utt.InferShapeTester):
         self._compile_and_check([atens3], [atens3_diag], [atens3_val], ExtractDiag)
 
     def test_Split(self):
-        aiscal = iscalar()
         aivec = ivector()
         adtens = tensor3()
         adtens_val = random(4, 10, 3)
         aivec_val = [2, 5, 3]
-        for aiscal_val in [1, -2]:
+        for axis in [1, -2]:
             self._compile_and_check(
-                [adtens, aiscal, aivec],
-                [Split(3)(adtens, aiscal, aivec)[0]],
-                [adtens_val, aiscal_val, aivec_val],
+                [adtens, aivec],
+                [split(adtens, aivec, n_splits=3, axis=axis)[0]],
+                [adtens_val, aivec_val],
                 (Split),
             )
 
     def test_Join(self):
-        aiscal = iscalar()
         cdmat = dmatrix()
         admat_val = random(1, 3)
         bdmat_val = random(2, 3)
         cdmat_val = random(4, 3)
         admat = dmatrix()
         bdmat = dmatrix()
-        for aiscal_val in [0, -2]:
+        for axis in [0, -2]:
             self._compile_and_check(
-                [aiscal, admat, bdmat, cdmat],
-                [Join()(aiscal, admat, bdmat, cdmat)],
-                [aiscal_val, admat_val, bdmat_val, cdmat_val],
+                [admat, bdmat, cdmat],
+                [join(axis, admat, bdmat, cdmat)],
+                [admat_val, bdmat_val, cdmat_val],
                 Join,
             )
 
         admat_val = random(4, 1)
         bdmat_val = random(4, 3)
         cdmat_val = random(4, 2)
-        for aiscal_val in [-1, 1]:
+        for axis in [-1, 1]:
             self._compile_and_check(
-                [aiscal, admat, bdmat, cdmat],
-                [Join()(aiscal, admat, bdmat, cdmat)],
-                [aiscal_val, admat_val, bdmat_val, cdmat_val],
+                [admat, bdmat, cdmat],
+                [join(axis, admat, bdmat, cdmat)],
+                [admat_val, bdmat_val, cdmat_val],
                 Join,
             )
 
@@ -4047,13 +3939,12 @@ class TestInferShape(utt.InferShapeTester):
         advec = dvector()
         aivec = ivector()
 
-        abool = True
         rng = np.random.default_rng(utt.fetch_seed())
         advec_val = random(5)
         aivec_val = rng.permutation(5).astype("int32")
         self._compile_and_check(
             [advec, aivec],
-            [PermuteRowElements()(advec, aivec, abool)],
+            [PermuteRowElements(inverse=True)(advec, aivec)],
             [advec_val, aivec_val],
             PermuteRowElements,
         )
@@ -4061,7 +3952,7 @@ class TestInferShape(utt.InferShapeTester):
         admat_val = random(3, 5)
         self._compile_and_check(
             [admat, aivec],
-            [PermuteRowElements()(admat, aivec, abool)],
+            [PermuteRowElements(inverse=False)(admat, aivec)],
             [admat_val, aivec_val],
             PermuteRowElements,
         )
@@ -4070,7 +3961,7 @@ class TestInferShape(utt.InferShapeTester):
         adtens3_val = random(3, 2, 5)
         self._compile_and_check(
             [adtens3, aivec],
-            [PermuteRowElements()(adtens3, aivec, abool)],
+            [PermuteRowElements(inverse=True)(adtens3, aivec)],
             [adtens3_val, aivec_val],
             PermuteRowElements,
         )
@@ -4083,7 +3974,7 @@ class TestInferShape(utt.InferShapeTester):
         admat_val = random(3, 5)
         self._compile_and_check(
             [admat, aimat],
-            [PermuteRowElements()(admat, aimat, abool)],
+            [PermuteRowElements(inverse=False)(admat, aimat)],
             [admat_val, aimat_val],
             PermuteRowElements,
         )
@@ -4098,7 +3989,7 @@ class TestInferShape(utt.InferShapeTester):
         aitens3_val[1, ::, ::] = bimat_val
         self._compile_and_check(
             [admat, aitens3],
-            [PermuteRowElements()(admat, aitens3, abool)],
+            [PermuteRowElements(inverse=True)(admat, aitens3)],
             [admat_val, aitens3_val],
             PermuteRowElements,
         )
@@ -4440,7 +4331,8 @@ def test_atleast_Nd():
 
     for n in range(1, 3):
         ary1, ary2 = dscalar(), dvector()
-        res_ary1, res_ary2 = atleast_Nd(ary1, ary2, n=n)
+        res_ary1 = atleast_Nd(ary1, n=n)
+        res_ary2 = atleast_Nd(ary2, n=n)
 
         assert res_ary1.ndim == n
         if n == ary2.ndim:
@@ -4638,7 +4530,7 @@ def test_vectorize_make_vector(batch_shapes):
     )
 
 
-@pytest.mark.parametrize("axis", [constant(1), constant(-2), shared(1)])
+@pytest.mark.parametrize("axis", [1, -2, constant(1)])
 @pytest.mark.parametrize("broadcasting_y", ["none", "implicit", "explicit"])
 @config.change_flags(cxx="")  # C code not needed
 def test_vectorize_join(axis, broadcasting_y):
@@ -4649,7 +4541,7 @@ def test_vectorize_join(axis, broadcasting_y):
         return join(axis, x, y)
 
     def core_np(x, y):
-        return np.concatenate([x, y], axis=axis.eval())
+        return np.concatenate([x, y], axis=int(getattr(axis, "data", axis)))
 
     x = tensor(shape=(4, 2, 3, 5))
     y_shape = {"none": (4, 2, 3, 5), "implicit": (2, 3, 5), "explicit": (1, 2, 3, 5)}
@@ -4657,9 +4549,10 @@ def test_vectorize_join(axis, broadcasting_y):
 
     vectorize_pt = function([x, y], vectorize(core_pt, signature=signature)(x, y))
 
-    blockwise_needed = isinstance(axis, SharedVariable) or broadcasting_y != "none"
+    blockwise_needed = broadcasting_y != "none"
     has_blockwise = any(
-        isinstance(node.op, Blockwise) for node in vectorize_pt.maker.fgraph.apply_nodes
+        isinstance(node.op, Blockwise | BlockwiseWithCoreShape)
+        for node in vectorize_pt.maker.fgraph.apply_nodes
     )
     assert has_blockwise == blockwise_needed
 
@@ -4670,6 +4563,25 @@ def test_vectorize_join(axis, broadcasting_y):
         vectorize_pt(x_test, y_test),
         vectorize_np(x_test, y_test),
     )
+
+
+@pytest.mark.parametrize("implicit_dims", [True, False])
+def test_vectorize_alloc(implicit_dims):
+    x = scalar("x")
+    if implicit_dims:
+        out = alloc(x, 3, 5)
+    else:
+        out = alloc(x[None, None], 3, 5)
+
+    vect_x = tensor("vect_x", shape=(7,))
+    vect_out = vectorize_graph(out, {x: vect_x})
+    assert not any(
+        isinstance(node.op, Blockwise) for node in apply_ancestors([vect_out])
+    )
+
+    x_test = np.random.normal(size=(7,)).astype(config.floatX)
+    expected = np.broadcast_to(x_test[:, None, None], (7, 3, 5))
+    np.testing.assert_allclose(vect_out.eval({vect_x: x_test}), expected)
 
 
 def test_where():

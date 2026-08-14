@@ -421,7 +421,7 @@ def makeSharedTester(
             topo_cst = shape_constant_fct.maker.fgraph.toposort()
             if pytensor.config.mode != "FAST_COMPILE":
                 assert len(topo_cst) == 1
-                topo_cst[0].op == pytensor.compile.function.types.deep_copy_op
+                topo_cst[0].op == pytensor.compile.ops.deep_copy_op
 
             # Test that we can take the grad.
             shape_grad = pytensor.gradient.grad(x1_specify_shape.sum(), x1_shared)
@@ -513,6 +513,7 @@ def makeSharedTester(
                 updates=[
                     (s_shared, pytensor.tensor.dot(a_shared, b_shared) + s_shared)
                 ],
+                mode="CVM",
             )
             topo = f.maker.fgraph.toposort()
             f()
@@ -546,6 +547,7 @@ def makeSharedTester(
                         pytensor.tensor.dot(a_shared, b_shared) + s_shared_specify,
                     )
                 ],
+                mode="CVM",
             )
             topo = f.maker.fgraph.toposort()
             shp = f()
@@ -577,6 +579,7 @@ def makeSharedTester(
                         pytensor.tensor.dot(a_shared, b_shared) + s_shared_specify,
                     )
                 ],
+                mode="CVM",
             )
             topo = f.maker.fgraph.toposort()
             shp = f()
@@ -605,6 +608,7 @@ def makeSharedTester(
         def test_values_eq(self):
             # Test the type.values_eq[_approx] function
             dtype = self.dtype
+
             if dtype is None:
                 dtype = pytensor.config.floatX
 
@@ -691,8 +695,12 @@ def test_scalar_shared_deprecated():
 
 
 def test_get_vector_length():
-    x = pytensor.shared(np.array((2, 3, 4, 5)))
+    arr = np.array((2, 3, 4, 5))
+    x = pytensor.shared(arr, shape=arr.shape, strict=True)
     assert get_vector_length(x) == 4
+
+    with pytest.raises(ValueError):
+        get_vector_length(pytensor.shared(arr))
 
 
 def test_shared_masked_array_not_implemented():

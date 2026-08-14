@@ -2,34 +2,38 @@ from functools import partial
 
 import numpy as np
 import pytest
+import scipy.special
 
 import pytensor.tensor as pt
+from pytensor import Mode
 from pytensor.compile import shared
 from pytensor.compile.builders import OpFromGraph
-from pytensor.compile.function import function
+from pytensor.compile.maker import function
 from pytensor.configdefaults import config
 from pytensor.gradient import (
     DisconnectedType,
-    Rop,
     disconnected_type,
     grad,
+    pushforward,
     verify_grad,
 )
 from pytensor.graph.basic import equal_computations
 from pytensor.graph.fg import FunctionGraph
-from pytensor.graph.null_type import NullType, null_type
+from pytensor.graph.rewriting.basic import MergeOptimizer
 from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.graph.utils import MissingInputError
+from pytensor.link.vm import VMLinker
 from pytensor.printing import debugprint
+from pytensor.scan.basic import scan
 from pytensor.tensor.basic import constant
 from pytensor.tensor.math import dot, exp, sigmoid
 from pytensor.tensor.math import round as pt_round
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.random.utils import RandomStream
+from pytensor.tensor.random.basic import normal
+from pytensor.tensor.random.type import random_generator_type
 from pytensor.tensor.rewriting.shape import ShapeOptimizer
 from pytensor.tensor.shape import specify_shape
 from pytensor.tensor.type import (
-    TensorType,
     dscalars,
     matrices,
     matrix,
@@ -43,9 +47,9 @@ from tests.graph.utils import MyVariable
 
 class TestOpFromGraph(unittest_tools.InferShapeTester):
     def test_valid_input(self):
-        x, y, z = matrices("xyz")
+        x, _y, _z = matrices("xyz")
 
-        with pytest.raises(ValueError, match="Expected at least.*"):
+        with pytest.raises(ValueError, match=r"Expected 1 input\(s\)"):
             OpFromGraph([x], [x])()
 
         with pytest.raises(ValueError, match=r"Expected 1 input\(s\)"):
@@ -61,15 +65,13 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
             OpFromGraph([x], [x], updates={})
 
     def test_clone(self):
-        x, y, z = matrices("xyz")
+        x, _y, _z = matrices("xyz")
 
         ofg = OpFromGraph([x], [2 * x])
 
-        ofg_clone = ofg.clone()
-
-        assert ofg_clone.fgraph is not ofg.fgraph
-        assert ofg_clone.fgraph.outputs != ofg.fgraph.outputs
-        assert equal_computations(ofg_clone.fgraph.outputs, ofg.fgraph.outputs)
+        # OpFromGraph is immutable (single frozen inner graph), so cloning
+        # returns self -- mirroring Composite.
+        assert ofg.clone() is ofg
 
     @pytest.mark.parametrize(
         "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
@@ -110,16 +112,9 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
     def test_overrides_deprecated_api(self):
         inp = scalar("x")
         out = inp + 1
-        for kwarg in ("lop_overrides", "grad_overrides", "rop_overrides"):
-            with pytest.raises(
-                ValueError, match="'default' is no longer a valid value for overrides"
-            ):
-                OpFromGraph([inp], [out], **{kwarg: "default"})
-
-            with pytest.raises(
-                TypeError, match="Variables are no longer valid types for overrides"
-            ):
-                OpFromGraph([inp], [out], **{kwarg: null_type()})
+        for kwarg in ("lop_overrides", "rop_overrides"):
+            with pytest.warns(FutureWarning):
+                OpFromGraph([inp], [out], **{kwarg: lambda *args: [inp + 1]})
 
     @pytest.mark.parametrize(
         "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
@@ -156,132 +151,12 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
     @pytest.mark.parametrize(
         "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
     )
-    def test_shared(self, cls_ofg):
-        x, y, z = matrices("xyz")
-        s = shared(np.random.random((2, 2)).astype(config.floatX))
-        e = x + y * z + s
-        op = cls_ofg([x, y, z], [e])
-        # (1+3*5=array of 16) - (3+1*5=array of 8)
-        f = op(x, y, z) - op(y, z, x)
-
-        fn = function([x, y, z], f)
-        xv = np.ones((2, 2), dtype=config.floatX)
-        yv = np.ones((2, 2), dtype=config.floatX) * 3
-        zv = np.ones((2, 2), dtype=config.floatX) * 5
-        # print function, function.__module__
-        # print fn.maker.fgraph.toposort()
-        np.testing.assert_array_almost_equal(8.0, fn(xv, yv, zv), 4)
-        np.testing.assert_array_almost_equal(8.0, fn(xv, yv, zv), 4)
-
-    @pytest.mark.parametrize(
-        "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
-    )
-    def test_shared_grad(self, cls_ofg):
-        x, y, z = matrices("xyz")
-        s = shared(np.random.random((2, 2)).astype(config.floatX))
-        e = x + y * z + s
-        op = cls_ofg([x, y, z], [e])
-        f = op(x, y, z)
-        f = f - grad(pt_sum(f), y)
-        fn = function([x, y, z], f)
-        xv = np.ones((2, 2), dtype=config.floatX)
-        yv = np.ones((2, 2), dtype=config.floatX) * 3
-        zv = np.ones((2, 2), dtype=config.floatX) * 5
-        np.testing.assert_array_almost_equal(11.0 + s.get_value(), fn(xv, yv, zv), 4)
-
-        # grad again the shared variable
-        f = op(x, y, z)
-        f = f - grad(pt_sum(f), s)
-        fn = function([x, y, z], f)
-        np.testing.assert_array_almost_equal(15.0 + s.get_value(), fn(xv, yv, zv), 4)
-
-    @pytest.mark.parametrize(
-        "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
-    )
-    def test_grad_override(self, cls_ofg):
-        x, y = vectors("xy")
-
-        def go(inps, gs):
-            x, y = inps
-            (g,) = gs
-            return [g * y * 2, g * x * 1.5]
-
-        dedz = vector("dedz")
-        op_mul_grad = cls_ofg([x, y, dedz], go([x, y], [dedz]))
-
-        with pytest.warns(FutureWarning, match="grad_overrides is deprecated"):
-            op_mul = cls_ofg([x, y], [x * y], grad_overrides=go)
-            op_mul2 = cls_ofg([x, y], [x * y], grad_overrides=op_mul_grad)
-
-        # single override case (function or OfG instance)
-        xx, yy = vector("xx"), vector("yy")
-        for op in [op_mul, op_mul2]:
-            zz = pt_sum(op(xx, yy))
-            dx, dy = grad(zz, [xx, yy])
-            fn = function([xx, yy], [dx, dy])
-            xv = np.random.random((16,)).astype(config.floatX)
-            yv = np.random.random((16,)).astype(config.floatX)
-            dxv, dyv = fn(xv, yv)
-            np.testing.assert_array_almost_equal(yv * 2, dxv, 4)
-            np.testing.assert_array_almost_equal(xv * 1.5, dyv, 4)
-
-        # list override case
-        def go1(inps, gs):
-            x, w, b = inps
-            g = gs[0]
-            return g * w * 2
-
-        def go2(inps, gs):
-            x, w, b = inps
-            g = gs[0]
-            return g * x * 1.5
-
-        w, b = vectors("wb")
-        # we make the 3rd gradient default (no override)
-        with pytest.warns(FutureWarning, match="grad_overrides is deprecated"):
-            op_linear = cls_ofg([x, w, b], [x * w + b], grad_overrides=[go1, go2, None])
-        xx, ww, bb = vector("xx"), vector("yy"), vector("bb")
-        zz = pt_sum(op_linear(xx, ww, bb))
-        dx, dw, db = grad(zz, [xx, ww, bb])
-        fn = function([xx, ww, bb], [dx, dw, db])
-        xv = np.random.random((16,)).astype(config.floatX)
-        wv = np.random.random((16,)).astype(config.floatX)
-        bv = np.random.random((16,)).astype(config.floatX)
-        dxv, dwv, dbv = fn(xv, wv, bv)
-        np.testing.assert_array_almost_equal(wv * 2, dxv, 4)
-        np.testing.assert_array_almost_equal(xv * 1.5, dwv, 4)
-        np.testing.assert_array_almost_equal(np.ones(16, dtype=config.floatX), dbv, 4)
-
-        # NullType and DisconnectedType
-        with pytest.warns(FutureWarning, match="grad_overrides is deprecated"):
-            op_linear2 = cls_ofg(
-                [x, w, b],
-                [x * w + b],
-                grad_overrides=[go1, NullType()(), DisconnectedType()()],
-                # This is a fake override, so a fake connection_pattern must be provided as well
-                connection_pattern=[[True], [True], [False]],
-            )
-        zz2 = pt_sum(op_linear2(xx, ww, bb))
-        dx2, dw2, db2 = grad(
-            zz2,
-            [xx, ww, bb],
-            return_disconnected="Disconnected",
-            disconnected_inputs="ignore",
-            null_gradients="return",
-        )
-        assert isinstance(dx2.type, TensorType)
-        assert dx2.ndim == 1
-        assert isinstance(dw2.type, NullType)
-        assert isinstance(db2.type, DisconnectedType)
-
-    @pytest.mark.parametrize(
-        "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
-    )
-    def test_lop_override(self, cls_ofg):
+    @pytest.mark.parametrize("use_deprecated_name", [False, True])
+    def test_pullback_override(self, cls_ofg, use_deprecated_name):
         x = vector()
         y = 1.0 / (1.0 + exp(-x))
 
-        def lop_ov(inps, outs, grads):
+        def pullback_ov(inps, outs, grads):
             (y_,) = outs
             (dedy_,) = grads
             return [2.0 * y_ * (1.0 - y_) * dedy_]
@@ -293,8 +168,12 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         yy1 = pt_sum(sigmoid(xx))
         gyy1 = 2.0 * grad(yy1, xx)
 
-        for ov in [lop_ov, op_lop_ov]:
-            op = cls_ofg([x], [y], lop_overrides=ov)
+        for ov in [pullback_ov, op_lop_ov]:
+            if use_deprecated_name:
+                with pytest.warns(FutureWarning, match="lop_overrides is deprecated"):
+                    op = cls_ofg([x], [y], lop_overrides=ov)
+            else:
+                op = cls_ofg([x], [y], pullback=ov)
             yy2 = pt_sum(op(xx))
             gyy2 = grad(yy2, xx)
             fn = function([xx], [gyy1, gyy2])
@@ -306,7 +185,8 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
     @pytest.mark.parametrize(
         "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
     )
-    def test_rop(self, cls_ofg):
+    @pytest.mark.parametrize("use_op_pushforward", [True, False])
+    def test_pushforward(self, cls_ofg, use_op_pushforward):
         a = vector()
         M = matrix()
         b = dot(a, M)
@@ -315,7 +195,7 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         W = matrix()
         y = op_matmul(x, W)
         du = vector()
-        dv = Rop(y, x, du)
+        dv = pushforward(y, x, du, use_op_pushforward=use_op_pushforward)
         fn = function([x, W, du], dv)
         xval = np.random.random((16,)).astype(config.floatX)
         Wval = np.random.random((16, 16)).astype(config.floatX)
@@ -324,7 +204,8 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         dvval2 = fn(xval, Wval, duval)
         np.testing.assert_array_almost_equal(dvval2, dvval, 4)
 
-    def test_rop_multiple_outputs(self):
+    @pytest.mark.parametrize("use_op_pushforward", [True, False])
+    def test_pushforward_multiple_outputs(self, use_op_pushforward):
         a = vector()
         M = matrix()
         b = dot(a, M)
@@ -339,21 +220,21 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         duval = np.random.random((16,)).astype(config.floatX)
 
         y = op_matmul(x, W)[0]
-        dv = Rop(y, x, du)
+        dv = pushforward(y, x, du, use_op_pushforward=use_op_pushforward)
         fn = function([x, W, du], dv)
         result_dvval = fn(xval, Wval, duval)
         expected_dvval = np.dot(duval, Wval)
         np.testing.assert_array_almost_equal(result_dvval, expected_dvval, 4)
 
         y = op_matmul(x, W)[1]
-        dv = Rop(y, x, du)
+        dv = pushforward(y, x, du, use_op_pushforward=use_op_pushforward)
         fn = function([x, W, du], dv)
         result_dvval = fn(xval, Wval, duval)
         expected_dvval = -np.dot(duval, Wval)
         np.testing.assert_array_almost_equal(result_dvval, expected_dvval, 4)
 
         y = pt.add(*op_matmul(x, W))
-        dv = Rop(y, x, du)
+        dv = pushforward(y, x, du, use_op_pushforward=use_op_pushforward)
         fn = function([x, W, du], dv)
         result_dvval = fn(xval, Wval, duval)
         expected_dvval = np.zeros_like(np.dot(duval, Wval))
@@ -362,7 +243,19 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
     @pytest.mark.parametrize(
         "cls_ofg", [OpFromGraph, partial(OpFromGraph, inline=True)]
     )
-    def test_rop_override(self, cls_ofg):
+    @pytest.mark.parametrize(
+        "use_op_pushforward",
+        [
+            True,
+            pytest.param(
+                False, marks=pytest.mark.xfail(reason="Custom ROp is ignored")
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("use_deprecated_name", [False, True])
+    def test_pushforward_override(
+        self, cls_ofg, use_op_pushforward, use_deprecated_name
+    ):
         x, y = vectors("xy")
 
         def ro(inps, epts):
@@ -372,15 +265,25 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
 
         u, v = vectors("uv")
         op_mul_rop = cls_ofg([x, y, u, v], ro([x, y], [u, v]))
-        op_mul = cls_ofg([x, y], [x * y], rop_overrides=ro)
-        op_mul2 = cls_ofg([x, y], [x * y], rop_overrides=op_mul_rop)
+        if use_deprecated_name:
+            with pytest.warns(FutureWarning, match="rop_overrides is deprecated"):
+                op_mul = cls_ofg([x, y], [x * y], rop_overrides=ro)
+                op_mul2 = cls_ofg([x, y], [x * y], rop_overrides=op_mul_rop)
+        else:
+            op_mul = cls_ofg([x, y], [x * y], pushforward=ro)
+            op_mul2 = cls_ofg([x, y], [x * y], pushforward=op_mul_rop)
 
         # single override case
         xx, yy = vector("xx"), vector("yy")
         du, dv = vector("du"), vector("dv")
         for op in [op_mul, op_mul2]:
             zz = op_mul(xx, yy)
-            dw = Rop(zz, [xx, yy], [du, dv])
+            dw = pushforward(
+                zz,
+                [xx, yy],
+                [du, dv],
+                use_op_pushforward=use_op_pushforward,
+            )
             fn = function([xx, yy, du, dv], dw)
             vals = np.random.random((4, 32)).astype(config.floatX)
             dwval = fn(*vals)
@@ -402,17 +305,16 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
             # and we don't care about the gradient wrt y.
             return y + pt_round(y)
 
-        def f1_back(inputs, output_gradients):
+        def f1_back(inputs, outputs, output_gradients):
             return [output_gradients[0], disconnected_type()]
 
-        with pytest.warns(FutureWarning, match="grad_overrides is deprecated"):
-            op = cls_ofg(
-                inputs=[x, y],
-                outputs=[f1(x, y)],
-                grad_overrides=f1_back,
-                connection_pattern=[[True], [False]],
-                on_unused_input="ignore",
-            )
+        op = cls_ofg(
+            inputs=[x, y],
+            outputs=[f1(x, y)],
+            pullback=f1_back,
+            connection_pattern=[[True], [False]],
+            on_unused_input="ignore",
+        )
 
         c = op(x, y)
 
@@ -467,23 +369,6 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         expect_result = [[True, False], [True, True], [False, True], [True, True]]
         assert results == expect_result
 
-        # Inner graph where some computation doesn't rely on explicit inputs
-        srng = RandomStream(seed=234)
-        rv_u = srng.uniform((2, 2))
-        x, y = matrices("xy")
-        out1 = x + rv_u
-        out2 = y + 3
-        out3 = 3 + rv_u
-        op3 = cls_ofg([x, y], [out1, out2, out3])
-
-        results = op3.connection_pattern(None)
-        expect_result = [
-            [True, False, False],
-            [False, True, False],
-            [True, False, True],
-        ]
-        assert results == expect_result
-
     def test_infer_shape(self):
         # test infer shape does not need to against inline case
         # since the Op is remove during optimization phase
@@ -518,62 +403,8 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         fg = FunctionGraph(outputs=[op_var[1]], clone=False)
         opt_res = rewrite_graph(fg, custom_rewrite=ShapeOptimizer())
 
-        assert opt_res.shape_feature.shape_of[x] is None
-        assert opt_res.shape_feature.shape_of[z][0].data == 2
-
-    @config.change_flags(compute_test_value="raise")
-    def test_compute_test_value(self):
-        x = scalar("x")
-        x.tag.test_value = np.array(1.0, dtype=config.floatX)
-        op = OpFromGraph([x], [x**3])
-        y = scalar("y")
-        y.tag.test_value = np.array(1.0, dtype=config.floatX)
-        f = op(y)
-        grad_f = grad(f, y)
-        assert grad_f.tag.test_value is not None
-
-    def test_make_node_shared(self):
-        """Make sure we can provide `OpFromGraph.make_node` new shared inputs and get a valid `OpFromGraph`."""
-
-        x = pt.scalar("x")
-        y = shared(1.0, name="y")
-
-        test_ofg = OpFromGraph([x], [x + y], on_unused_input="ignore")
-        assert test_ofg.shared_inputs == [y]
-
-        out = test_ofg(x)
-
-        y_clone = y.clone()
-        assert y_clone != y
-        y_clone.name = "y_clone"
-
-        out_new = test_ofg.make_node(*(out.owner.inputs[:1] + [y_clone])).outputs[0]
-
-        assert "on_unused_input" in out_new.owner.op.kwargs
-        assert out_new.owner.op.shared_inputs == [y_clone]
-
-        out_fn = function([x], out_new)
-        assert np.array_equal(out_fn(1.0), 2.0)
-
-        y_clone.set_value(2.0)
-        assert np.array_equal(out_fn(1.0), 3.0)
-
-        # This should also work, because the containers are the same:
-        # y.set_value(1.0)
-        # assert np.array_equal(out_fn(1.0), 2.0)
-
-    def test_shared_with_constant_input(self):
-        """Make sure that a constant input can be given to an `OpFromGraph` instance."""
-        x = pt.scalar("x")
-        y = shared(1.0, name="y")
-
-        test_ofg = OpFromGraph([x], [x + y])
-        assert test_ofg.shared_inputs == [y]
-
-        out = test_ofg(pt.as_tensor(1.0, dtype=config.floatX))
-
-        out_fn = function([], out)
-        assert np.array_equal(out_fn(), 2.0)
+        assert opt_res.shape_feature.shape_tuple(x) is None
+        assert opt_res.shape_feature.shape_tuple(z)[0].data == 2
 
     def test_missing_input(self):
         x = pt.lscalar("x")
@@ -581,44 +412,36 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         with pytest.raises(MissingInputError):
             OpFromGraph([], [x])
 
-    def test_shared_to_nonshared_input(self):
-        """Make sure that shared variables can be replaced with non-shared variables."""
-        x = pt.scalar("x")
-        y = shared(1.0, name="y")
-
-        test_ofg = OpFromGraph([], [y])
-        assert test_ofg.shared_inputs == [y]
-
-        out_1_fn = function([], test_ofg())
-        res_1 = out_1_fn()
-
-        assert np.array_equal(res_1, 1.0)
-
-        test_ofg_new = test_ofg.make_node(x)
-        assert test_ofg_new.op.shared_inputs == []
-
-        out_2_fn = function([x], test_ofg_new.outputs[0])
-        res_2 = out_2_fn(np.array(1.0, dtype=config.floatX))
-
-        assert np.array_equal(res_2, 1.0)
-
     def test_outputs_consistency(self):
-        """Make sure that `OpFromGraph.fn` doesn't change the value of `OpFromGraph.inner_outputs`."""
+        """Compiling the inner function must not mutate `OpFromGraph.inner_outputs`."""
 
         x = scalar("x")
-        op = OpFromGraph([x], [x**2 / x], mode="FAST_RUN")
+        op = OpFromGraph([x], [x**2 / x])
 
         # Confirm that the inner-graph is as expected
         assert equal_computations(op.inner_outputs, [x**2 / x], op.inner_inputs, [x])
 
-        # These outputs of the compiled `op.fgraph` should differ from the
-        # original, uncompiled `op.fgraph` outputs
-        fn = op.fn
+        # Optimizing a copy of the inner graph (here FAST_RUN, which rewrites
+        # ``x**2 / x`` to ``x``) must not leak back into the canonical, frozen
+        # inner graph. The canonical graph is immutable and is never handed to
+        # ``function`` directly; compile an ``unfreeze()``d mutable copy instead.
+        unfrozen = op.fgraph.unfreeze()
+        fn = function(
+            unfrozen.inputs,
+            unfrozen.outputs,
+            mode="FAST_RUN",
+            on_unused_input="ignore",
+            accept_inplace=True,
+        )
         new_inputs = fn.maker.fgraph.inputs
         new_outputs = fn.maker.fgraph.outputs
         assert not equal_computations(new_outputs, [x**2 / x], new_inputs, [x])
 
         # The original `op.fgraph` outputs should stay the same, though
+        assert equal_computations(op.inner_outputs, [x**2 / x], op.inner_inputs, [x])
+
+        # `op.fn` (compiled under the active mode) must likewise leave it intact.
+        op.fn
         assert equal_computations(op.inner_outputs, [x**2 / x], op.inner_inputs, [x])
 
     def test_explicit_input_from_constant(self):
@@ -636,13 +459,14 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         x = pt.dscalar("x")
         y = shared(1.0, name="y")
 
+        # A shared variable may only be used if passed explicitly as an input.
         with pytest.raises(
-            ValueError,
-            match=r"The inner-graph implicitly depends on the following shared variables \[y\]",
+            MissingInputError,
+            match=r"implicitly depends on shared variable y",
         ):
-            OpFromGraph([x], [x + y], strict=True)
+            OpFromGraph([x], [x + y])
 
-        test_ofg = OpFromGraph([x, y], [x + y], strict=True)
+        test_ofg = OpFromGraph([x, y], [x + y])
 
         out = test_ofg(x, y)
         assert out.eval({x: 5}) == 6
@@ -652,7 +476,8 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         out = test_ofg(y, y)
         assert out.eval() == 4
 
-    def test_L_op_disconnected_output_grad(self):
+    @pytest.mark.parametrize("use_custom_pullback", [False, True])
+    def test_pullback_disconnected_output_grad(self, use_custom_pullback):
         x, y = dscalars("x", "y")
         rng = np.random.default_rng(594)
         point = list(rng.normal(size=(2,)))
@@ -660,7 +485,29 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         out1 = x + y
         out2 = x * y
         out3 = out1 * out2  # Create dependency between outputs
-        op = OpFromGraph([x, y], [out1, out2, out3])
+
+        if use_custom_pullback:
+            # Regression test for https://github.com/pymc-devs/pytensor/issues/2064
+            def pullback_3out(inputs, outputs, output_grads):
+                x_, y_ = inputs
+                dout1, dout2, dout3 = output_grads
+                dx = pt.zeros_like(x_)
+                dy = pt.zeros_like(y_)
+                if not isinstance(dout1.type, DisconnectedType):
+                    dx = dx + dout1
+                    dy = dy + dout1
+                if not isinstance(dout2.type, DisconnectedType):
+                    dx = dx + dout2 * y_
+                    dy = dy + dout2 * x_
+                if not isinstance(dout3.type, DisconnectedType):
+                    dx = dx + dout3 * (2 * x_ * y_ + y_**2)
+                    dy = dy + dout3 * (x_**2 + 2 * x_ * y_)
+                return [dx, dy]
+
+            op = OpFromGraph([x, y], [out1, out2, out3], pullback=pullback_3out)
+        else:
+            op = OpFromGraph([x, y], [out1, out2, out3])
+
         verify_grad(lambda x, y: pt.add(*op(x, y)), point, rng=rng)
         verify_grad(lambda x, y: pt.add(*op(x, y)[:-1]), point, rng=rng)
         verify_grad(lambda x, y: pt.add(*op(x, y)[1:]), point, rng=rng)
@@ -669,16 +516,55 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         verify_grad(lambda x, y: op(x, y)[1], point, rng=rng)
         verify_grad(lambda x, y: op(x, y)[2], point, rng=rng)
 
-        # Test disconnected graphs are handled correctly
-        op = OpFromGraph([x, y], [x**2, y**3])
+        # Two fully-independent outputs: x**2 only depends on x, y**3 only on y.
+        # Each (output, wrt) combination exercises a distinct disconnection pattern.
+        if use_custom_pullback:
+
+            def pullback_2out(inputs, outputs, output_grads):
+                x_, y_ = inputs
+                dout0, dout1 = output_grads
+                dx = (
+                    disconnected_type()
+                    if isinstance(dout0.type, DisconnectedType)
+                    else dout0 * 2 * x_
+                )
+                dy = (
+                    disconnected_type()
+                    if isinstance(dout1.type, DisconnectedType)
+                    else dout1 * 3 * y_**2
+                )
+                return [dx, dy]
+
+            op = OpFromGraph([x, y], [x**2, y**3], pullback=pullback_2out)
+        else:
+            op = OpFromGraph([x, y], [x**2, y**3])
+
+        # Cross terms are disconnected and must resolve to DisconnectedType with a warning.
         with pytest.warns(UserWarning):
-            grad_x_wrt_y = grad(
+            grad_out0_wrt_y = grad(
                 op(x, y)[0],
                 wrt=y,
                 return_disconnected="disconnected",
                 disconnected_inputs="warn",
             )
-            assert isinstance(grad_x_wrt_y.type, DisconnectedType)
+            assert isinstance(grad_out0_wrt_y.type, DisconnectedType)
+
+        with pytest.warns(UserWarning):
+            grad_out1_wrt_x = grad(
+                op(x, y)[1],
+                wrt=x,
+                return_disconnected="disconnected",
+                disconnected_inputs="warn",
+            )
+            assert isinstance(grad_out1_wrt_x.type, DisconnectedType)
+
+        # Related terms stay connected and must return the correct numerical gradient
+        # even though the sibling output is entirely disconnected from the cost.
+        fn_dx = function([x, y], grad(op(x, y)[0], wrt=x))
+        np.testing.assert_allclose(fn_dx(3.0, 2.0), 6.0)  # d/dx x**2 = 2x
+
+        fn_dy = function([x, y], grad(op(x, y)[1], wrt=y))
+        np.testing.assert_allclose(fn_dy(3.0, 2.0), 12.0)  # d/dy y**3 = 3y**2
 
     def test_repeated_inputs(self):
         x = pt.dscalar("x")
@@ -695,6 +581,196 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         g = OpFromGraph([x, x, y], [x + y], on_unused_input="ignore")
         f = g(x, x, y)
         assert f.eval({x: 5, y: 5}) == 10
+
+    def test_equality_and_hashing(self):
+        x, y = dscalars("x", "y")
+        e = x + y * x
+
+        op1 = OpFromGraph([x, y], [e])
+        op2 = OpFromGraph([x, y], [e])
+
+        # Same output with same inputs are equal with consistent hash
+        assert op1 == op2
+        assert hash(op1) == hash(op2)
+        assert {op1: "v"}[op2] == "v"
+
+        # Distinct variables with the same graph structure are equal
+        a, b = dscalars("a", "b")
+        op3 = OpFromGraph([a, b], [a + b * a])
+        assert op1 == op3
+        assert hash(op1) == hash(op3)
+
+        # Different graphs are not equal
+        op_different = OpFromGraph([x, y], [x * y + x])
+        assert op1 != op_different
+
+        # inline flag participates in equality
+        op_inline = OpFromGraph([x, y], [e], inline=True)
+        assert op1 != op_inline
+
+        # destroy_map participates in equality
+        op_destroy = OpFromGraph([x, y], [e], destroy_map={0: (0,)})
+        assert op1 != op_destroy
+
+        # Multi-output OFGs are also hashed and compared based on their inner graph structure
+        op_multi1 = OpFromGraph([x, y], [x + y, x * y])
+        op_multi2 = OpFromGraph([a, b], [a + b, a * b])
+        assert op_multi1 == op_multi2
+
+        # OFG is hashable, and different OFGs have different hashes
+        assert hash(op1) != hash(op_inline)
+
+    def test_equality_callable_overrides(self):
+        x, y = dscalars("x", "y")
+        e = x + y
+
+        op_plain = OpFromGraph([x, y], [e])
+
+        # lop override present vs absent
+        op_with_lop = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [grads[0], grads[0]],
+        )
+        assert op_plain != op_with_lop
+
+        # Structurally identical callable overrides are equal
+        op_with_lop2 = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [grads[0], grads[0]],
+        )
+        assert op_with_lop == op_with_lop2
+
+        # Structurally different callable override are not equal
+        op_with_lop3 = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [grads[0] * 2, grads[0]],
+        )
+        assert op_with_lop != op_with_lop3
+
+        # Overrides returning disconnected_type for different inputs are not equal
+        op_disc_y = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [grads[0], disconnected_type()],
+        )
+        op_disc_x = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [disconnected_type(), grads[0]],
+        )
+        assert op_disc_y != op_disc_x
+
+        # Same disconnected pattern is equal
+        op_disc_y2 = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [grads[0], disconnected_type()],
+        )
+        assert op_disc_y == op_disc_y2
+
+        # All disconnected is still an override — not equal to no override
+        op_all_disc = OpFromGraph(
+            [x, y],
+            [e],
+            pullback=lambda inps, outs, grads: [
+                disconnected_type(),
+                disconnected_type(),
+            ],
+        )
+        assert op_all_disc != op_plain
+        assert op_all_disc != op_disc_y
+
+        # rop override follows the same logic
+        op_with_rop = OpFromGraph(
+            [x, y],
+            [e],
+            pushforward=lambda inps, epts: [epts[0] + epts[1]],
+        )
+        op_with_rop2 = OpFromGraph(
+            [x, y],
+            [e],
+            pushforward=lambda inps, epts: [epts[0] + epts[1]],
+        )
+        assert op_with_rop == op_with_rop2
+        assert op_with_rop != op_plain
+
+    def test_equality_list_overrides(self):
+        x, y = dscalars("x", "y")
+        e = x + y
+
+        def scale_grad(inps, outs, grads):
+            return grads[0] * 2
+
+        op1 = OpFromGraph([x, y], [e], pullback=[scale_grad, None])
+        op2 = OpFromGraph([x, y], [e], pullback=[scale_grad, None])
+        assert op1 == op2
+
+        def scale_grad_3x(inps, outs, grads):
+            return grads[0] * 3
+
+        op3 = OpFromGraph([x, y], [e], pullback=[scale_grad_3x, None])
+        assert op1 != op3
+
+        # Position of None vs callable matters
+        op4 = OpFromGraph([x, y], [e], pullback=[None, scale_grad])
+        assert op1 != op4
+
+    def test_merge_identical_ofgs(self):
+        x, y = dscalars("x", "y")
+        e = x + y * x
+
+        op1 = OpFromGraph([x, y], [e])
+        op2 = OpFromGraph([x, y], [e])
+
+        a, b = dscalars("a", "b")
+
+        # Two OFG with the same inputs are collapsed to one node by MergeOptimizer
+        fg = FunctionGraph([a, b], [op1(a, b), op2(a, b)])
+        MergeOptimizer().rewrite(fg)
+        ofg_nodes = [n for n in fg.toposort() if isinstance(n.op, OpFromGraph)]
+        assert len(ofg_nodes) == 1
+
+        # Different inputs are different graphs, so both nodes survive
+        c, d = dscalars("c", "d")
+        fg = FunctionGraph([a, b, c, d], [op1(a, b), op2(c, d)])
+        MergeOptimizer().rewrite(fg)
+        ofg_nodes = [n for n in fg.toposort() if isinstance(n.op, OpFromGraph)]
+        assert len(ofg_nodes) == 2
+
+        # Check numerics to make sure the merged OFG is correct
+        fn = function(
+            [a, b, c, d],
+            [op1(a, b), op2(c, d)],
+            mode=Mode(optimizer="merge", linker="py"),
+        )
+        r1, r2 = fn(2.0, 3.0, 4.0, 5.0)
+        np.testing.assert_allclose(r1, 2.0 + 3.0 * 2.0)
+        np.testing.assert_allclose(r2, 4.0 + 5.0 * 4.0)
+
+
+@pytest.mark.parametrize("linker", ["cvm", "py"])
+def test_view_output_copied_at_boundary(linker):
+    # Regression test: an OpFromGraph output that aliases an input must be copied
+    # at the op boundary (OpFromGraph declares no view_map, so the outer graph
+    # cannot see the alias). Without the copy, a downstream op destroying the
+    # input in place corrupts the already-computed output.
+    x = pt.dvector("x")
+    op = OpFromGraph([x], [x[::-1]])
+
+    xin = pt.dvector("xin")
+    x2 = xin * 2
+    view_out = op(x2)
+    destroyed = pt.inc_subtensor(x2[0], 100.0)
+
+    fn = function(
+        [xin], [view_out, destroyed], mode=Mode(linker=linker, optimizer="fast_run")
+    )
+    res_view, res_destroyed = fn(np.arange(1.0, 4.0))
+    np.testing.assert_allclose(res_view, [6.0, 4.0, 2.0])
+    np.testing.assert_allclose(res_destroyed, [102.0, 4.0, 6.0])
 
 
 @config.change_flags(floatX="float64")
@@ -716,11 +792,67 @@ Inner graphs:
 
 OpFromGraph{inline=False} [id A]
  ← Add [id E]
-    ├─ *0-<Matrix(float64, shape=(?, ?))> [id F]
+    ├─ i0 [id F]
     └─ Mul [id G]
-       ├─ *1-<Matrix(float64, shape=(?, ?))> [id H]
-       └─ *2-<Matrix(float64, shape=(?, ?))> [id I]
+       ├─ i1 [id H]
+       └─ i2 [id I]
 """
 
     for truth, out in zip(exp_res.split("\n"), lines, strict=True):
         assert truth.strip() == out.strip()
+
+
+@config.change_flags(mode="NUMBA")
+def test_inner_fn_never_uses_jit_default_mode():
+    # The lazily-linked inner fn stays in the py/c backend family regardless of
+    # the config default mode (NUMBA here): ``perform`` only ever runs under that
+    # family -- JIT backends funcify ``op.fgraph`` directly -- and the inner graph
+    # was baked for py/c, not for the JIT backend.
+    x = vector("x")
+
+    # Direct access links with the python VM (no C compilation)
+    op = OpFromGraph([x], [x + 1])
+    linker = op.fn.maker.mode.linker
+    assert isinstance(linker, VMLinker) and not linker.use_cloop
+
+    # Executed through an outer (cvm) function, the perform path still links a VM
+    fn = function([x], op(x), mode=Mode(linker="cvm", optimizer=None))
+    [node] = [n for n in fn.maker.fgraph.apply_nodes if isinstance(n.op, OpFromGraph)]
+    np.testing.assert_allclose(fn([1.0, 2.0]), [2.0, 3.0])
+    assert isinstance(node.op.fn.maker.mode.linker, VMLinker)
+
+    # The impl -> linker rule: an explicit C request uses cvm, everything else vm
+    assert op.link_mode("c").linker.use_cloop
+    assert not op.link_mode("py").linker.use_cloop
+    assert not op.link_mode(None).linker.use_cloop
+
+
+@config.change_flags(mode="NUMBA")
+def test_perform_with_inner_scan_rvs():
+    # A Scan inside the inner graph carries raw RandomVariables that only the
+    # JIT inner-graph rewrites could handle; ``perform``-based execution must
+    # therefore not compile the inner fn for a JIT default mode.
+    rng = random_generator_type("rng")
+    xs, _ = scan(
+        fn=lambda rng: normal(rng=rng, return_next_rng=True)[1],
+        non_sequences=[rng],
+        n_steps=2,
+    )
+    op = OpFromGraph([rng], [xs])
+    out = op(shared(np.random.default_rng(0)))
+    fn = function([], out, mode=Mode(linker="py", optimizer=None))
+    assert fn().shape == (2,)
+
+
+def test_inner_graph_keeps_symbolic_op_recognition():
+    # Wrapping an expression in an OpFromGraph must not destabilize it: the inner graph
+    # still needs the rewrite recognizing exp(x) / sum(exp(x)) as the stable Softmax.
+    x = pt.vector("x")
+    inner = pt.vector("inner")
+    e = exp(inner)
+    op = OpFromGraph([inner], [e / e.sum()])
+
+    test_val = np.array([1000.0, 1001.0])
+    np.testing.assert_allclose(
+        function([x], op(x))(test_val), scipy.special.softmax(test_val)
+    )

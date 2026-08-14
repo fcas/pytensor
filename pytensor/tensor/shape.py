@@ -1,30 +1,34 @@
 import warnings
+from collections.abc import Sequence
 from numbers import Number
 from textwrap import dedent
-from typing import cast
+from types import EllipsisType
+from typing import TYPE_CHECKING, Union, cast
+from typing import cast as typing_cast
 
 import numpy as np
-from numpy.core.numeric import normalize_axis_tuple  # type: ignore
+from numpy.lib.array_utils import normalize_axis_tuple
 
 import pytensor
-from pytensor.gradient import DisconnectedType
+from pytensor.gradient import DisconnectedType, disconnected_type
 from pytensor.graph import Op
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.replace import _vectorize_node
 from pytensor.graph.type import HasShape
 from pytensor.link.c.op import COp
 from pytensor.link.c.params_type import ParamsType
-from pytensor.scalar import int32
 from pytensor.tensor import _get_vector_length, as_tensor_variable, get_vector_length
 from pytensor.tensor import basic as ptb
-from pytensor.tensor.elemwise import get_normalized_batch_axes
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.type import DenseTensorType, TensorType, int_dtypes, tensor
-from pytensor.tensor.type_other import NoneConst
+from pytensor.tensor.type_other import NoneConst, NoneTypeT
 from pytensor.tensor.variable import TensorConstant, TensorVariable
 
 
-ShapeValueType = None | np.integer | int | Variable
+if TYPE_CHECKING:
+    from pytensor.tensor import TensorLike
+
+ShapeValueType = None | EllipsisType | np.integer | int | Variable
 
 
 def register_shape_c_code(type, code, version=()):
@@ -67,13 +71,8 @@ class Shape(COp):
     __props__ = ()
 
     def make_node(self, x):
-        if not isinstance(x, Variable):
-            x = ptb.as_tensor_variable(x)
-
-        if isinstance(x.type, TensorType):
-            out_var = TensorType("int64", (x.type.ndim,))()
-        else:
-            out_var = pytensor.tensor.type.lvector()
+        x = ptb.as_tensor_variable(x)
+        out_var = tensor(dtype="int64", shape=(x.type.ndim,))
 
         return Apply(self, [x], [out_var])
 
@@ -82,7 +81,7 @@ class Shape(COp):
         (out,) = out_
         out[0] = np.asarray(np.shape(x), dtype="int64")
 
-    def infer_shape(self, fgraph, node, in_shapes):
+    def infer_shape(self, node, in_shapes):
         return [[len(in_shapes[0])]]
 
     def connection_pattern(self, node):
@@ -93,16 +92,16 @@ class Shape(COp):
         # part of the graph
         return [[False]]
 
-    def grad(self, inp, grads):
+    def pullback(self, inputs, outputs, output_grads):
         # the grad returns the gradient with respect to the
         # elements of a tensor variable
         # the elements of the tensor variable do not participate
         # in the computation of the shape, so they are not really
         # part of the graph
-        return [pytensor.gradient.DisconnectedType()()]
+        return [disconnected_type()]
 
-    def R_op(self, inputs, eval_points):
-        return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        return [disconnected_type()]
 
     def c_code(self, node, name, inames, onames, sub):
         (iname,) = inames
@@ -298,7 +297,7 @@ class Shape_i(COp):
         # Else, no C code
         raise NotImplementedError()
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         return [()]
 
     def connection_pattern(self, node):
@@ -309,12 +308,12 @@ class Shape_i(COp):
         # part of the graph
         return [[False]]
 
-    def grad(self, inp, grads):
+    def pullback(self, inputs, outputs, output_grads):
         return [
             pytensor.gradient.grad_not_implemented(
                 op=self,
                 x_pos=0,
-                x=inp[0],
+                x=inputs[0],
                 comment="No gradient for the shape of a matrix is implemented.",
             )
         ]
@@ -340,21 +339,7 @@ def shape_i(var, i, fgraph=None):
 
     """
     if fgraph and hasattr(fgraph, "shape_feature"):
-        shape_feature = fgraph.shape_feature
-        shape_of = shape_feature.shape_of
-
-        def recur(node):
-            if node.outputs[0] not in shape_of:
-                for inp in node.inputs:
-                    if inp.owner:
-                        recur(inp.owner)
-                # If the output var isn't marked as being in the graph,
-                # we need to add it in the ShapeFeature.
-                shape_feature.on_import(fgraph, node, "graph.ops.shape_i")
-
-        if var not in shape_of:
-            recur(var.owner)
-        return shape_of[var][i]
+        return fgraph.shape_feature.get_shape(var, i)
 
     # If we are not able to use the shape feature, we should not put
     # Shape_i in the graph. Otherwise, the shape feature optimization
@@ -401,13 +386,13 @@ class SpecifyShape(COp):
     _output_type_depends_on_input_value = True
 
     def make_node(self, x, *shape):
-        from pytensor.tensor.basic import get_underlying_scalar_constant_value
-
         x = ptb.as_tensor_variable(x)
 
         shape = tuple(
             NoneConst
-            if (s is None or NoneConst.equals(s))
+            if (
+                s is None or (isinstance(s, Variable) and isinstance(s.type, NoneTypeT))
+            )
             else ptb.as_tensor_variable(s, ndim=0)
             for s in shape
         )
@@ -428,11 +413,9 @@ class SpecifyShape(COp):
         for i, (xts, s) in enumerate(zip(x.type.shape, shape, strict=True)):
             if xts is not None:
                 type_shape[i] = xts
-            else:
+            elif not isinstance(s.type, NoneTypeT):
                 try:
-                    type_s = get_underlying_scalar_constant_value(s)
-                    if type_s is not None:
-                        type_shape[i] = int(type_s)
+                    type_shape[i] = int(ptb.get_scalar_constant_value(s))
                 except NotScalarConstantError:
                     pass
 
@@ -448,49 +431,38 @@ class SpecifyShape(COp):
             raise AssertionError(
                 f"SpecifyShape: Got {x.ndim} dimensions (shape {x.shape}), expected {ndim} dimensions with shape {tuple(shape)}."
             )
-        # strict=False because we are in a hot loop
-        if not all(
-            xs == s for xs, s in zip(x.shape, shape, strict=False) if s is not None
-        ):
+        # zip strict not specified because we are in a hot loop
+        if not all(xs == s for xs, s in zip(x.shape, shape) if s is not None):
             raise AssertionError(
                 f"SpecifyShape: Got shape {x.shape}, expected {tuple(int(s) if s is not None else None for s in shape)}."
             )
         out[0] = x
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         xshape, *_ = shapes
         shape = node.inputs[1:]
-        new_shape = []
-        for dim in range(node.inputs[0].type.ndim):
-            s = shape[dim]
-            try:
-                s = ptb.get_underlying_scalar_constant_value(s)
-                # We assume that `None` shapes are always retrieved by
-                # `get_underlying_scalar_constant_value`, and only in that case do we default to
-                # the shape of the input variable
-                if s is None:
-                    s = xshape[dim]
-            except NotScalarConstantError:
-                pass
-            new_shape.append(ptb.as_tensor_variable(s))
-
-        assert len(new_shape) == len(xshape)
-        return [new_shape]
+        # Use x shape if specified dim is None, otherwise the specified shape
+        return [
+            [
+                xshape[i] if isinstance(dim.type, NoneTypeT) else dim
+                for i, dim in enumerate(shape)
+            ]
+        ]
 
     def connection_pattern(self, node):
         return [[True], *[[False]] * len(node.inputs[1:])]
 
-    def grad(self, inp, grads):
-        x, *shape = inp
-        (gz,) = grads
-        return [specify_shape(gz, shape)] + [
-            pytensor.gradient.DisconnectedType()() for _ in range(len(shape))
+    def pullback(self, inputs, outputs, output_grads):
+        _x, *shape = inputs
+        (gz,) = output_grads
+        return [
+            specify_shape(gz, shape),
+            *(disconnected_type() for _ in range(len(shape))),
         ]
 
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            # It means that this op sits on top of a non-differentiable path
-            return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return [disconnected_type()]
         return self.make_node(eval_points[0], *inputs[1:]).outputs
 
     def c_code(self, node, name, i_names, o_names, sub):
@@ -518,7 +490,7 @@ class SpecifyShape(COp):
         for i, (shp_name, shp) in enumerate(
             zip(shape_names, node.inputs[1:], strict=True)
         ):
-            if NoneConst.equals(shp):
+            if isinstance(shp.type, NoneTypeT):
                 continue
             code += dedent(
                 f"""
@@ -559,26 +531,37 @@ def specify_shape(
 
     If a dimension's shape value is ``None``, the size of that dimension is not
     considered fixed/static at runtime.
+
+    A single ``Ellipsis`` can be used to imply multiple ``None`` specified dimensions
     """
+    x = as_tensor_variable(x)  # type: ignore[arg-type]
 
     if not isinstance(shape, tuple | list):
         shape = (shape,)
 
     # If shape is a symbolic 1d vector of fixed length, we separate the items into a
     # tuple with one entry per shape dimension
-    if len(shape) == 1 and shape[0] is not None:
-        shape_vector = ptb.as_tensor_variable(shape[0])
+    if len(shape) == 1 and shape[0] not in (None, Ellipsis):
+        shape_vector = ptb.as_tensor_variable(shape[0])  # type: ignore[arg-type]
         if shape_vector.ndim == 1:
             try:
                 shape = tuple(shape_vector)
             except ValueError:
                 raise ValueError("Shape vector must have fixed dimensions")
 
+    if Ellipsis in shape:
+        ellipsis_pos = shape.index(Ellipsis)
+        implied_none = x.type.ndim - (len(shape) - 1)
+        shape = (
+            *shape[:ellipsis_pos],
+            *((None,) * implied_none),
+            *shape[ellipsis_pos + 1 :],
+        )
+        if Ellipsis in shape[ellipsis_pos + 1 :]:
+            raise ValueError("Multiple Ellipsis in specify_shape")
+
     # If the specified shape is already encoded in the input static shape, do nothing
     # This ignores PyTensor constants in shape
-    x = ptb.as_tensor_variable(x)  # type: ignore[arg-type,unused-ignore]
-    # The above is a type error in Python 3.9 but not 3.12.
-    # Thus we need to ignore unused-ignore on 3.12.
     new_shape_info = any(
         s != xts for (s, xts) in zip(shape, x.type.shape, strict=False) if s is not None
     )
@@ -593,7 +576,7 @@ def specify_shape(
 @_get_vector_length.register(SpecifyShape)  # type: ignore
 def _get_vector_length_SpecifyShape(op: Op, var: TensorVariable) -> int:
     try:
-        return int(ptb.get_underlying_scalar_constant_value(var.owner.inputs[1]).item())
+        return int(ptb.get_scalar_constant_value(var.owner.inputs[1]).item())
     except NotScalarConstantError:
         raise ValueError(f"Length of {var} cannot be determined")
 
@@ -606,7 +589,10 @@ def _vectorize_specify_shape(op, node, x, *shape):
     if any(
         as_tensor_variable(dim).type.ndim != 0
         for dim in shape
-        if not (NoneConst.equals(dim) or dim is None)
+        if not (
+            (isinstance(dim, Variable) and isinstance(dim.type, NoneTypeT))
+            or dim is None
+        )
     ):
         raise NotImplementedError(
             "It is not possible to vectorize the shape argument of SpecifyShape"
@@ -636,14 +622,11 @@ class Reshape(COp):
 
     check_input = False
     __props__ = ("ndim",)
-    params_type = ParamsType(ndim=int32)
-    # name does not participate because it doesn't affect computations
 
-    def __init__(self, ndim, name=None):
+    def __init__(self, ndim):
         self.ndim = int(ndim)
         if ndim < 0:
             raise ValueError("The output dimensions after reshape must be 0 or greater")
-        assert name is None, "name attribute for Reshape has been deprecated"
 
     def __str__(self):
         return f"{self.__class__.__name__}{{{self.ndim}}}"
@@ -652,6 +635,8 @@ class Reshape(COp):
         x = ptb.as_tensor_variable(x)
         shp_orig = shp
         shp = ptb.as_tensor_variable(shp, ndim=1)
+        if shp.type.shape == (None,):
+            shp = specify_shape(shp, self.ndim)
         if not (
             shp.dtype in int_dtypes
             or (isinstance(shp, TensorConstant) and shp.data.size == 0)
@@ -674,7 +659,7 @@ class Reshape(COp):
                 y = shp_list[index]
                 y = ptb.as_tensor_variable(y)
                 try:
-                    s_val = ptb.get_underlying_scalar_constant_value(y).item()
+                    s_val = ptb.get_scalar_constant_value(y).item()
                     if s_val >= 0:
                         out_shape[index] = s_val
                 except NotScalarConstantError:
@@ -718,17 +703,17 @@ class Reshape(COp):
     def connection_pattern(self, node):
         return [[True], [False]]
 
-    def grad(self, inp, grads):
-        x, shp = inp
-        (g_out,) = grads
-        return [reshape(g_out, shape(x), ndim=x.ndim), DisconnectedType()()]
+    def pullback(self, inputs, outputs, output_grads):
+        x, _shp = inputs
+        (g_out,) = output_grads
+        return [reshape(g_out, shape(x), ndim=x.ndim), disconnected_type()]
 
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            return [None]
+    def pushforward(self, inputs, outputs, eval_points):
+        if isinstance(eval_points[0].type, DisconnectedType):
+            return [disconnected_type()]
         return self(eval_points[0], *inputs[1:], return_list=True)
 
-    def infer_shape(self, fgraph, node, ishapes):
+    def infer_shape(self, node, ishapes):
         from pytensor.tensor.math import eq, maximum, mul
 
         # inputs[1] can contain at most one value of '-1', meaning the actual
@@ -801,32 +786,31 @@ class Reshape(COp):
             ]
 
     def c_code_cache_version(self):
-        return (9,)
+        return (10,)
 
     def c_code(self, node, name, inputs, outputs, sub):
         x, shp = inputs
+        shp_dtype = node.inputs[1].type.dtype_specs()[1]
         (z,) = outputs
         fail = sub["fail"]
-        params = sub["params"]
+        ndim = self.ndim
+
         return f"""
         assert (PyArray_NDIM({shp}) == 1);
 
+        // Unpack shape into new_dims
+        npy_intp new_dims[{ndim}];
+        for (int ii = 0; ii < {ndim}; ++ii)
+        {{
+            new_dims[ii] = (({shp_dtype}*)(PyArray_BYTES({shp}) + ii * PyArray_STRIDES({shp})[0]))[0];
+        }}
+
         PyArray_Dims newshape;
-
-        if (!PyArray_IntpConverter((PyObject *){shp}, &newshape)) {{
-            {fail};
-        }}
-
-        if ({params}->ndim != newshape.len) {{
-            PyErr_SetString(PyExc_ValueError, "Shape argument to Reshape has incorrect length");
-            PyDimMem_FREE(newshape.ptr);
-            {fail};
-        }}
+        newshape.len = {ndim};
+        newshape.ptr = new_dims;
 
         Py_XDECREF({z});
         {z} = (PyArrayObject *) PyArray_Newshape({x}, &newshape, NPY_CORDER);
-
-        PyDimMem_FREE(newshape.ptr);
 
         if (!{z}) {{
             //The error message should have been set by PyArray_Newshape
@@ -852,12 +836,17 @@ def _vectorize_reshape(op, node, x, shape):
     else:
         raise ValueError("Invalid shape length passed into vectorize node of Reshape")
 
-    return reshape(x, new_shape, ndim=len(new_shape)).owner
+    return reshape(x, new_shape, ndim=len(tuple(new_shape))).owner
 
 
-def reshape(x, newshape, ndim=None):
+def reshape(
+    x: "TensorLike",
+    newshape: Union["TensorLike", Sequence["TensorLike"]],
+    *,
+    ndim: int | None = None,
+) -> TensorVariable:
     if ndim is None:
-        newshape = ptb.as_tensor_variable(newshape)
+        newshape = ptb.as_tensor_variable(newshape)  # type: ignore
         if newshape.type.ndim != 1:
             raise TypeError(
                 "New shape in reshape must be a vector or a list/tuple of"
@@ -875,7 +864,7 @@ def reshape(x, newshape, ndim=None):
             )
     op = Reshape(ndim)
     rval = op(x, newshape)
-    return rval
+    return typing_cast(TensorVariable, rval)
 
 
 def shape_padleft(t, n_ones=1):
@@ -1014,118 +1003,3 @@ def specify_broadcastable(x, *axes):
     axes = normalize_axis_tuple(axes, x.type.ndim)
     shape_info = [1 if i in axes else s for i, s in enumerate(x.type.shape)]
     return specify_shape(x, shape_info)
-
-
-class Unbroadcast(COp):
-    """
-    Mask static broadcastable dimensions of input as `None`
-
-    See Also
-    --------
-    unbroadcast <pytensor.tensor.shape.unbroadcast>
-
-
-    Examples
-    --------
-    ``Unbroadcast((1,))(x)`` would make `x` second static dimension be `None`
-
-    """
-
-    view_map = {0: [0]}
-    _f16_ok = True
-    # Mapping from Type to C code (and version) to use.
-    # In the C code, the name of the input variable is %(iname)s,
-    # the output variable is %(oname)s.
-    c_code_and_version: dict = {}
-
-    check_input = False
-    __props__ = ("axes",)
-    _f16_ok = True
-
-    def __init__(self, *axis):
-        # Sort them to make sure we merge all possible case.
-        items = tuple(sorted(axis))
-        self.axes = items
-        for axis in self.axes:
-            if not isinstance(axis, np.integer | int):
-                raise TypeError(f"Unbroadcast needs integer axes. Got {axis}")
-
-    def __str__(self):
-        return f"{self.__class__.__name__}{{{','.join(str(i) for i in self.axes)}}}"
-
-    def make_node(self, x):
-        x = as_tensor_variable(x)
-        if x.type.ndim <= max(self.axes):
-            raise ValueError("Trying to unbroadcast of non-existent dimension")
-        shape = [
-            None if (sh == 1 and i in self.axes) else sh
-            for i, sh in enumerate(x.type.shape)
-        ]
-        return Apply(self, [x], [x.type.clone(shape=shape)()])
-
-    def perform(self, node, inp, out_):
-        (x,) = inp
-        (out,) = out_
-        out[0] = x
-
-    def grad(self, inp, grads):
-        (x,) = inp
-        (gz,) = grads
-        # restore the broadcasting pattern of the input
-        return [specify_shape(gz, x.type.shape)]
-
-    def infer_shape(self, fgraph, node, ishapes):
-        assert len(ishapes) == 1
-        return [tuple(ishapes[0])]
-
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            return [None]
-        return self(*eval_points, return_list=True)
-
-    def c_code(self, node, nodename, inp, out, sub):
-        (iname,) = inp
-        (oname,) = out
-
-        return f"""
-        Py_XDECREF({oname});
-        {oname} = {iname};
-        Py_XINCREF({oname});
-        """
-
-    def c_code_cache_version(self):
-        return (3,)
-
-
-def unbroadcast(x, *axes):
-    """
-    Mask static broadcastable dimensions of input as `None`
-
-    Parameters
-    ----------
-    x : tensor_like
-        Input pytensor tensor.
-    axis : an int or an iterable object such as list or tuple of int values
-        The broadcastable dimensions of x that should be unbroadcasted.
-
-    Returns
-    -------
-    tensor
-        A pytensor tensor, with static broadcastable dimensions masked as `None`
-
-    """
-    x = as_tensor_variable(x)
-    unbroadcasted_axes = [axis for axis in axes if x.type.shape[axis] == 1]
-    if not unbroadcasted_axes:
-        return x
-    return Unbroadcast(*unbroadcasted_axes)(x)
-
-
-@_vectorize_node.register(Unbroadcast)
-def _vectorize_unbroadcast(
-    op: Unbroadcast, node: Apply, batch_x: TensorVariable
-) -> Apply:
-    core_ndim = node.inputs[0].type.ndim
-    batch_ndim = batch_x.type.ndim - core_ndim
-    batch_axes = get_normalized_batch_axes(op.axes, core_ndim, batch_ndim)
-    return cast(Apply, unbroadcast(batch_x, *batch_axes).owner)

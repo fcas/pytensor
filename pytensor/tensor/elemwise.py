@@ -4,24 +4,22 @@ from textwrap import dedent
 from typing import Literal
 
 import numpy as np
-from numpy.core.numeric import normalize_axis_tuple
+from numpy.lib.array_utils import normalize_axis_tuple
 
 import pytensor.tensor.basic
 from pytensor.configdefaults import config
-from pytensor.gradient import DisconnectedType
+from pytensor.gradient import DisconnectedType, disconnected_type
 from pytensor.graph.basic import Apply
 from pytensor.graph.null_type import NullType
 from pytensor.graph.replace import _vectorize_node, _vectorize_not_needed
 from pytensor.graph.utils import MethodNotDefined
 from pytensor.link.c.basic import failure_code
-from pytensor.link.c.op import COp, ExternalCOp, OpenMPOp
-from pytensor.link.c.params_type import ParamsType
+from pytensor.link.c.op import COp, OpenMPOp
 from pytensor.misc.frozendict import frozendict
 from pytensor.printing import Printer, pprint
 from pytensor.scalar import get_scalar_type
-from pytensor.scalar.basic import bool as scalar_bool
 from pytensor.scalar.basic import identity as scalar_identity
-from pytensor.scalar.basic import transfer_type, upcast
+from pytensor.scalar.basic import upcast
 from pytensor.tensor import elemwise_cgen as cgen
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.basic import _get_vector_length, as_tensor_variable
@@ -30,7 +28,6 @@ from pytensor.tensor.type import (
     continuous_dtypes,
     discrete_dtypes,
     float_dtypes,
-    lvector,
 )
 from pytensor.tensor.utils import (
     broadcast_static_dim_lengths,
@@ -38,13 +35,10 @@ from pytensor.tensor.utils import (
     normalize_reduce_axis,
 )
 from pytensor.tensor.variable import TensorVariable
-from pytensor.utils import uniq
+from pytensor.utils import uniq, unzip
 
 
-_numpy_ver = [int(n) for n in np.__version__.split(".")[:2]]
-
-
-class DimShuffle(ExternalCOp):
+class DimShuffle(COp):
     """
     Allows to reorder the dimensions of a tensor or insert or remove
     broadcastable dimensions.
@@ -117,28 +111,16 @@ class DimShuffle(ExternalCOp):
 
     _f16_ok = True
     check_input = False
-    __props__ = ("input_ndim", "new_order", "inplace")
-    c_func_file = "c_code/dimshuffle.c"
-    c_func_name = "APPLY_SPECIFIC(cpu_dimshuffle)"
-
-    @property
-    def params_type(self):
-        return ParamsType(
-            shuffle=lvector,
-            augment=lvector,
-            transposition=lvector,
-            inplace=scalar_bool,
-        )
+    __props__ = ("input_ndim", "new_order")
+    view_map = {0: [0]}
 
     def __init__(self, *, input_ndim: int, new_order: Sequence[int | Literal["x"]]):
-        super().__init__([self.c_func_file], self.c_func_name)
-
         if not isinstance(input_ndim, int):
             raise TypeError(f"input_ndim must be an integer, got {type(int)}")
 
         self.input_ndim = input_ndim
-        self.new_order = tuple(new_order)
-        self.inplace = True
+        self.new_order = new_order = tuple(new_order)
+        self._new_order = [(-1 if x == "x" else x) for x in self.new_order]
 
         for i, j in enumerate(new_order):
             if j != "x":
@@ -158,33 +140,120 @@ class DimShuffle(ExternalCOp):
                         f"twice in the list of output dimensions: {new_order}"
                     )
 
-        # List of input dimensions to drop
-        drop = [i for i in range(input_ndim) if i not in new_order]
-
-        # This is the list of the original dimensions that we keep
-        self.shuffle = [x for x in new_order if x != "x"]
-        self.transposition = self.shuffle + drop
-        # List of dimensions of the output that are broadcastable and were not
-        # in the original input
-        self.augment = sorted(i for i, x in enumerate(new_order) if x == "x")
-        self.drop = drop
-
-        self.is_left_expand_dims = self.augment and (
-            input_ndim == 0 or new_order[-input_ndim:] == list(range(input_ndim))
+        # Tuple of the original dimensions that we keep
+        self.shuffle = tuple(x for x in new_order if x != "x")
+        # Tuple of input dimensions to drop
+        self.drop = drop = tuple(i for i in range(input_ndim) if i not in new_order)
+        # tuple of dimensions of the output that are broadcastable and were not in the original input
+        self.augment = augment = tuple(
+            sorted(i for i, x in enumerate(new_order) if x == "x")
         )
-        self.is_right_expand_dims = self.augment and new_order[:input_ndim] == list(
+        n_augment = len(self.augment)
+
+        # Used by perform
+        self._transposition = self.shuffle + drop
+
+        # Classify the type of dimshuffle for rewrite purposes
+        dims_are_shuffled = tuple(sorted(self.shuffle)) != self.shuffle
+        self.is_squeeze = drop and not augment and not dims_are_shuffled
+        self.is_expand_dims = is_expand_dims = (
+            not drop and augment and not dims_are_shuffled
+        )
+        self.is_left_expand_dims = is_expand_dims and new_order[n_augment:] == tuple(
             range(input_ndim)
         )
-
-        if self.inplace:
-            self.view_map = {0: [0]}
+        self.is_right_expand_dims = is_expand_dims and new_order[:input_ndim] == tuple(
+            range(input_ndim)
+        )
+        self.is_transpose = not drop and not augment and dims_are_shuffled
+        self.is_left_expanded_matrix_transpose = is_left_expanded_matrix_transpose = (
+            dims_are_shuffled
+            and new_order[n_augment:]
+            == (*range(input_ndim - 2), input_ndim - 1, input_ndim - 2)
+        )
+        self.is_matrix_transpose = not augment and is_left_expanded_matrix_transpose
 
     def __setstate__(self, state):
+        # Old pickles carry ExternalCOp attributes (func_files, ...); drop them,
+        # the C code is now emitted inline by `c_code`.
+        for key in ("func_files", "func_codes", "func_name", "code_sections"):
+            state.pop(key, None)
         self.__dict__.update(state)
-        if not hasattr(self, "func_files"):
-            # Perhaps we are loading an old `Op` version of DimShuffle.
-            # Let's just build the ExternalCOp.
-            super().__init__([self.c_func_file], self.c_func_name)
+
+    def c_code_cache_version(self):
+        return (2,)
+
+    def c_code(self, node, name, inputs, outputs, sub):
+        """Emit a straight-line view construction specialized on the static
+        permutation; dropped axes are guarded by runtime squeeze checks."""
+        (inp,) = inputs
+        (out,) = outputs
+        fail = sub["fail"]
+        new_order = self._new_order
+        nd_out = len(new_order)
+
+        guards = "\n".join(
+            f"""
+            if (PyArray_DIMS({inp})[{d}] != 1) {{
+                PyErr_SetString(PyExc_ValueError,
+                    "DimShuffle: cannot drop axis {d} with length not equal to one.");
+                {fail}
+            }}"""
+            for d in self.drop
+        )
+
+        assigns = []
+        for i, j in enumerate(new_order):
+            if j == -1:
+                # An augmented (broadcast) axis. The length-1 stride is set to the
+                # itemsize rather than zero: the value is never dereferenced, but
+                # some BLAS implementations mishandle a zero stride.
+                assigns.append(f"dimensions[{i}] = 1;")
+                assigns.append(f"strides[{i}] = itemsize;")
+            else:
+                assigns.append(f"dimensions[{i}] = PyArray_DIMS({inp})[{j}];")
+                # Normalize length-1 strides to the itemsize for the same reason.
+                assigns.append(
+                    f"strides[{i}] = PyArray_DIMS({inp})[{j}] == 1 ? "
+                    f"itemsize : PyArray_STRIDES({inp})[{j}];"
+                )
+
+        if nd_out:
+            shape_block = (
+                f"npy_intp dimensions[{nd_out}];\n"
+                f"npy_intp strides[{nd_out}];\n" + "\n".join(assigns)
+            )
+            dims_ptr = "dimensions"
+            strides_ptr = "strides"
+        else:
+            shape_block = ""
+            dims_ptr = "NULL"
+            strides_ptr = "NULL"
+
+        return f"""
+        {{
+            npy_intp itemsize = PyArray_ITEMSIZE({inp});
+            {guards}
+            {shape_block}
+
+            Py_XDECREF({out});
+            // Borrow only the writable flag from the input; NPY_OWNDATA stays 0.
+            {out} = (PyArrayObject*)PyArray_New(
+                &PyArray_Type, {nd_out}, {dims_ptr},
+                PyArray_TYPE({inp}), {strides_ptr},
+                PyArray_DATA({inp}), itemsize,
+                (NPY_ARRAY_WRITEABLE * PyArray_ISWRITEABLE({inp})),
+                NULL);
+            if ({out} == NULL) {{
+                {fail}
+            }}
+
+            // Declare the result a view of the input and recompute its flags.
+            Py_INCREF((PyObject*){inp});
+            PyArray_SetBaseObject({out}, (PyObject*){inp});
+            PyArray_UpdateFlags({out}, NPY_ARRAY_UPDATE_ALL);
+        }}
+        """
 
     def make_node(self, inp):
         input = as_tensor_variable(inp)
@@ -215,41 +284,42 @@ class DimShuffle(ExternalCOp):
         return Apply(self, [input], [output])
 
     def __str__(self):
-        shuffle = sorted(self.shuffle) != self.shuffle
-        if self.augment and not (shuffle or self.drop):
+        if self.is_matrix_transpose:
+            return "MatrixTranspose"
+        if self.is_expand_dims:
             if len(self.augment) == 1:
                 return f"ExpandDims{{axis={self.augment[0]}}}"
             return f"ExpandDims{{axes={self.augment}}}"
-        if self.drop and not (self.augment or shuffle):
+        if self.is_squeeze:
             if len(self.drop) == 1:
-                return f"DropDims{{axis={self.drop[0]}}}"
-            return f"DropDims{{axes={self.drop}}}"
-        if shuffle and not (self.augment or self.drop):
+                return f"Squeeze{{axis={self.drop[0]}}}"
+            return f"Squeeze{{axes={self.drop}}}"
+        if self.is_transpose:
             return f"Transpose{{axes={self.shuffle}}}"
         return f"DimShuffle{{order=[{','.join(map(str, self.new_order))}]}}"
 
     def perform(self, node, inp, out):
         (res,) = inp
-        (storage,) = out
 
-        if not isinstance(res, np.ndarray | np.memmap):
-            raise TypeError(res)
+        # This C-like impl is very slow in Python compared to transpose+reshape
+        # new_order = self._new_order
+        # old_shape = inp.shape
+        # old_strides = inp.strides
+        # res = as_strided(
+        #     shape = [1 if i == -1 else old_shape[i] for i in new_order],
+        #     strides=[0 if i == -1 else old_strides[i] for i in new_order],
+        # )
 
         # Put dropped axis at end
-        res = res.transpose(self.transposition)
+        res = res.transpose(self._transposition)
 
         # Define new shape without dropped axis and including new ones
         new_shape = list(res.shape[: len(self.shuffle)])
         for augm in self.augment:
             new_shape.insert(augm, 1)
-        res = res.reshape(new_shape)
+        out[0][0] = res.reshape(new_shape)
 
-        if not self.inplace:
-            res = np.copy(res)
-
-        storage[0] = np.asarray(res)
-
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         (ishp,) = shapes
         # transpose
         rval = [ishp[i] for i in self.shuffle]
@@ -259,12 +329,12 @@ class DimShuffle(ExternalCOp):
             rval.insert(augm, 1)
         return [rval]
 
-    def R_op(self, inputs, eval_points):
-        if None in eval_points:
-            return [None]
-        return self(*eval_points, return_list=True)
+    def pushforward(self, inputs, outputs, tangents):
+        if any(isinstance(t.type, DisconnectedType) for t in tangents):
+            return [disconnected_type()]
+        return self(*tangents, return_list=True)
 
-    def grad(self, inp, grads):
+    def pullback(self, inp, outputs, grads):
         (x,) = inp
         (gz,) = grads
         grad_order = ["x"] * x.type.ndim
@@ -334,6 +404,8 @@ class Elemwise(OpenMPOp):
     """
 
     __props__ = ("scalar_op", "inplace_pattern")
+    # Allow pattern matching on scalar_op positionally
+    __match_args__ = ("scalar_op",)
 
     def __init__(
         self, scalar_op, inplace_pattern=None, name=None, nfunc_spec=None, openmp=None
@@ -372,6 +444,19 @@ class Elemwise(OpenMPOp):
         self.__setstate__(self.__dict__)
         super().__init__(openmp=openmp)
 
+    def __eq__(self, other):
+        # Hot in rewriting. Identity accepts the singleton-op common case, and
+        # the scalar_op type check rejects mismatches without paying for the
+        # props tuples the generated __eq__ would build.
+        if self is other:
+            return True
+        return (
+            type(self) is type(other)
+            and type(self.scalar_op) is type(other.scalar_op)
+            and self.scalar_op == other.scalar_op
+            and self.inplace_pattern == other.inplace_pattern
+        )
+
     def __getstate__(self):
         d = copy(self.__dict__)
         d.pop("ufunc")
@@ -385,14 +470,22 @@ class Elemwise(OpenMPOp):
         self.nfunc = None
         self.inplace_pattern = frozendict(self.inplace_pattern)
 
+    def make_scalar_node(self, *inputs):
+        """Create a scalar Apply node matching the dtypes of tensor inputs.
+
+        Used by get_output_info, grad, and backend dispatchers to obtain
+        the scalar-level graph corresponding to this Elemwise operation.
+        """
+        return self.scalar_op.make_node(
+            *[get_scalar_type(dtype=i.type.dtype).make_variable() for i in inputs]
+        )
+
     def get_output_info(self, *inputs):
         """Return the outputs dtype and broadcastable pattern and the
         dimshuffled inputs.
 
         """
-        shadow = self.scalar_op.make_node(
-            *[get_scalar_type(dtype=i.type.dtype).make_variable() for i in inputs]
-        )
+        shadow = self.make_scalar_node(*inputs)
 
         target_length = max(input.type.ndim for input in inputs)
 
@@ -471,9 +564,9 @@ class Elemwise(OpenMPOp):
             return self.name
         return str(self.scalar_op).capitalize()
 
-    def R_op(self, inputs, eval_points):
+    def pushforward(self, inputs, outputs, tangents):
         outs = self(*inputs, return_list=True)
-        rval = [None for x in outs]
+        rval = [disconnected_type() for x in outs]
         # For each output
         for idx, out in enumerate(outs):
             # make such that _bgrads computes only the gradients of the
@@ -484,9 +577,7 @@ class Elemwise(OpenMPOp):
             bgrads = self._bgrad(inputs, outs, ograds)
             rop_out = None
 
-            for jdx, (inp, eval_point) in enumerate(
-                zip(inputs, eval_points, strict=True)
-            ):
+            for jdx, (inp, eval_point) in enumerate(zip(inputs, tangents, strict=True)):
                 # if None, then we can just ignore this branch ..
                 # what we do is to assume that for any non-differentiable
                 # branch, the gradient is actually 0, which I think is not
@@ -497,13 +588,13 @@ class Elemwise(OpenMPOp):
                     bgrads[jdx].type, DisconnectedType
                 ):
                     pass
-                elif eval_point is not None:
+                elif not isinstance(eval_point.type, DisconnectedType):
                     if rop_out is None:
                         rop_out = bgrads[jdx] * eval_point
                     else:
                         rop_out = rop_out + bgrads[jdx] * eval_point
 
-            rval[idx] = rop_out
+            rval[idx] = disconnected_type() if rop_out is None else rop_out
 
         return rval
 
@@ -513,32 +604,11 @@ class Elemwise(OpenMPOp):
 
         return [[True for output in node.outputs] for ipt in node.inputs]
 
-    def L_op(self, inputs, outs, ograds):
+    def pullback(self, inputs, outs, ograds):
         from pytensor.tensor.math import sum as pt_sum
 
         # Compute grad with respect to broadcasted input
         rval = self._bgrad(inputs, outs, ograds)
-
-        # TODO: make sure that zeros are clearly identifiable
-        # to the gradient.grad method when the outputs have
-        # some integer and some floating point outputs
-        if any(out.type.dtype not in continuous_dtypes for out in outs):
-            # For integer output, return value may only be zero or undefined
-            # We don't bother with trying to check that the scalar ops
-            # correctly returned something that evaluates to 0, we just make
-            # the return value obviously zero so that gradient.grad can tell
-            # this op did the right thing.
-            new_rval = []
-            for elem, ipt in zip(rval, inputs, strict=True):
-                if isinstance(elem.type, NullType | DisconnectedType):
-                    new_rval.append(elem)
-                else:
-                    elem = ipt.zeros_like()
-                    if str(elem.type.dtype) not in continuous_dtypes:
-                        elem = elem.astype(config.floatX)
-                    assert str(elem.type.dtype) not in discrete_dtypes
-                    new_rval.append(elem)
-            return new_rval
 
         # sum out the broadcasted dimensions
         for i, ipt in enumerate(inputs):
@@ -563,23 +633,21 @@ class Elemwise(OpenMPOp):
     def _bgrad(self, inputs, outputs, ograds):
         # returns grad, with respect to broadcasted versions of inputs
 
-        with config.change_flags(compute_test_value="off"):
+        def as_scalar(t):
+            if isinstance(t.type, NullType | DisconnectedType):
+                return t
+            return get_scalar_type(t.type.dtype)()
 
-            def as_scalar(t):
-                if isinstance(t.type, NullType | DisconnectedType):
-                    return t
-                return get_scalar_type(t.type.dtype)()
-
-            scalar_inputs = list(map(as_scalar, inputs))
-            scalar_ograds = list(map(as_scalar, ograds))
-            scalar_outputs = self.scalar_op.make_node(
-                *[get_scalar_type(dtype=i.type.dtype).make_variable() for i in inputs]
-            ).outputs
-            scalar_igrads = self.scalar_op.L_op(
-                scalar_inputs, scalar_outputs, scalar_ograds
-            )
-            for igrad in scalar_igrads:
-                assert igrad is not None, self.scalar_op
+        scalar_inputs = list(map(as_scalar, inputs))
+        scalar_ograds = list(map(as_scalar, ograds))
+        scalar_outputs = self.scalar_op.make_node(
+            *[get_scalar_type(dtype=i.type.dtype).make_variable() for i in inputs]
+        ).outputs
+        scalar_igrads = self.scalar_op.pullback(
+            scalar_inputs, scalar_outputs, scalar_ograds
+        )
+        for igrad in scalar_igrads:
+            assert igrad is not None, self.scalar_op
 
         if not isinstance(scalar_igrads, list | tuple):
             raise TypeError(
@@ -667,7 +735,7 @@ class Elemwise(OpenMPOp):
             and isinstance(self.nfunc, np.ufunc)
             and node.inputs[0].dtype in discrete_dtypes
         ):
-            char = np.sctype2char(out_dtype)
+            char = np.dtype(out_dtype).char
             sig = char * node.nin + "->" + char * node.nout
             node.tag.sig = sig
         node.tag.fake_node = Apply(
@@ -686,12 +754,13 @@ class Elemwise(OpenMPOp):
 
     def perform(self, node, inputs, output_storage):
         if (len(node.inputs) + len(node.outputs)) > 32:
-            # Some versions of NumPy will segfault, other will raise a
-            # ValueError, if the number of operands in an ufunc is more than 32.
-            # In that case, the C version should be used, or Elemwise fusion
-            # should be disabled.
-            # FIXME: This no longer calls the C implementation!
-            super().perform(node, inputs, output_storage)
+            # Some versions of NumPy will segfault, others will raise a
+            # ValueError, if the number of operands in a ufunc is more than 32,
+            # so the Python implementation cannot handle this case.
+            raise NotImplementedError(
+                "Elemwise.perform (Python mode) does not support more than 32 "
+                "operands. Use the C backend or disable Elemwise fusion."
+            )
 
         self._check_runtime_broadcast(node, inputs)
 
@@ -732,14 +801,15 @@ class Elemwise(OpenMPOp):
 
             nout = ufunc.nout
 
-        variables = ufunc(*ufunc_args, **ufunc_kwargs)
+        with np.errstate(all="ignore"):
+            variables = ufunc(*ufunc_args, **ufunc_kwargs)
 
         if nout == 1:
             variables = [variables]
 
-        # strict=False because we are in a hot loop
+        # zip strict not specified because we are in a hot loop
         for i, (variable, storage, nout) in enumerate(
-            zip(variables, output_storage, node.outputs, strict=False)
+            zip(variables, output_storage, node.outputs)
         ):
             storage[0] = variable = np.asarray(variable, dtype=nout.dtype)
 
@@ -754,11 +824,11 @@ class Elemwise(OpenMPOp):
 
     @staticmethod
     def _check_runtime_broadcast(node, inputs):
-        # strict=False because we are in a hot loop
+        # zip strict not specified because we are in a hot loop
         for dims_and_bcast in zip(
             *[
-                zip(input.shape, sinput.type.broadcastable, strict=False)
-                for input, sinput in zip(inputs, node.inputs, strict=False)
+                zip(input.shape, sinput.type.broadcastable)
+                for input, sinput in zip(inputs, node.inputs)
             ],
             strict=False,
         ):
@@ -769,7 +839,7 @@ class Elemwise(OpenMPOp):
                     "If broadcasting was intended, use `specify_broadcastable` on the relevant input."
                 )
 
-    def infer_shape(self, fgraph, node, i_shapes) -> list[tuple[TensorVariable, ...]]:
+    def infer_shape(self, node, i_shapes) -> list[tuple[TensorVariable, ...]]:
         from pytensor.tensor.extra_ops import broadcast_shape
 
         out_shape = broadcast_shape(*i_shapes, arrays_are_shapes=True)
@@ -789,8 +859,8 @@ class Elemwise(OpenMPOp):
         # assert that inames and inputs order stay consistent.
         # This is to protect again futur change of uniq.
         assert len(inames) == len(inputs)
-        ii, iii = list(
-            zip(*uniq(list(zip(_inames, node.inputs, strict=True))), strict=True)
+        ii, iii = unzip(
+            uniq(list(zip(_inames, node.inputs, strict=True))), n=2, strict=True
         )
         assert all(x == y for x, y in zip(ii, inames, strict=True))
         assert all(x == y for x, y in zip(iii, inputs, strict=True))
@@ -846,7 +916,7 @@ class Elemwise(OpenMPOp):
         # for each input:
         # same as range(ndim), but with 'x' at all broadcastable positions
         orders = [
-            [s == 1 and "x" or i for i, s in enumerate(input.type.shape)]
+            [(s == 1 and "x") or i for i, s in enumerate(input.type.shape)]
             for input in inputs
         ]
 
@@ -1123,7 +1193,7 @@ class Elemwise(OpenMPOp):
         return support_code
 
     def c_code_cache_version_apply(self, node):
-        version = [15]  # the version corresponding to the c code in this Op
+        version = [17]  # the version corresponding to the c code in this Op
 
         # now we insert versions for the ops on which we depend...
         scalar_node = Apply(
@@ -1259,8 +1329,8 @@ class CAReduce(COp):
             else:
                 self.axis = tuple(axis)
 
-        self.dtype = dtype
-        self.acc_dtype = acc_dtype
+        self.dtype = dtype if dtype is None else np.dtype(dtype).name
+        self.acc_dtype = acc_dtype if acc_dtype is None else np.dtype(acc_dtype).name
         self.upcast_discrete_output = upcast_discrete_output
 
     @property
@@ -1415,7 +1485,10 @@ class CAReduce(COp):
             return f"axes={list(axis)}"
 
     def __str__(self):
-        return f"{type(self).__name__}{{{self.scalar_op}, {self._axis_str()}}}"
+        if self.acc_dtype != self.dtype:
+            return f"{type(self).__name__}{{{self.scalar_op}, {self._axis_str()}, acc={self.acc_dtype}}}"
+        else:
+            return f"{type(self).__name__}{{{self.scalar_op}, {self._axis_str()}}}"
 
     def perform(self, node, inp, out):
         (input,) = inp
@@ -1437,7 +1510,7 @@ class CAReduce(COp):
 
         output[0] = np.asarray(out, dtype=out_dtype)
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         (ishape,) = shapes
         axis = self.axis
         if axis is None:
@@ -1614,7 +1687,7 @@ class CAReduce(COp):
 
     def c_code_cache_version_apply(self, node):
         # the version corresponding to the c code in this Op
-        version = [10]
+        version = [11]
 
         # now we insert versions for the ops on which we depend...
         scalar_node = Apply(
@@ -1658,20 +1731,15 @@ def scalar_elemwise(*symbol, nfunc=None, nin=None, nout=None, symbolname=None):
         symbolname = symbolname or symbol.__name__
 
         if symbolname.endswith("_inplace"):
-            base_symbol_name = symbolname[: -len("_inplace")]
-            scalar_op = getattr(scalar, base_symbol_name)
-            inplace_scalar_op = scalar_op.__class__(transfer_type(0))
-            rval = Elemwise(
-                inplace_scalar_op,
-                {0: 0},
-                nfunc_spec=(nfunc and (nfunc, nin, nout)),
+            raise ValueError(
+                "Creation of automatic inplace elemwise operations deprecated"
             )
-        else:
-            scalar_op = getattr(scalar, symbolname)
-            rval = Elemwise(scalar_op, nfunc_spec=(nfunc and (nfunc, nin, nout)))
+
+        scalar_op = getattr(scalar, symbolname)
+        rval = Elemwise(scalar_op, nfunc_spec=(nfunc and (nfunc, nin, nout)))
 
         if getattr(symbol, "__doc__"):
-            rval.__doc__ = symbol.__doc__ + "\n\n    " + rval.__doc__
+            rval.__doc__ = symbol.__doc__
 
         # for the meaning of this see the ./epydoc script
         # it makes epydoc display rval as if it were a function, not an object

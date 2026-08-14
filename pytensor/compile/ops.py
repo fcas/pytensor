@@ -1,6 +1,6 @@
 """
 This file contains auxiliary Ops, used during the compilation phase and Ops
-building class (:class:`FromFunctionOp`) and decorator (:func:`as_op`) that
+building class (:class:`FromFunctionOp`) and decorator (:func:`wrap_py`) that
 help make new Ops more rapidly.
 
 """
@@ -33,11 +33,8 @@ def register_view_op_c_code(type, code, version=()):
     ViewOp.c_code_and_version[type] = (code, version)
 
 
-class ViewOp(COp):
-    """
-    Returns an inplace view of the input. Used internally by PyTensor.
-
-    """
+class TypeCastingOp(COp):
+    """Op that performs a graph-level type cast operation, but has no effect computation-wise (identity function)."""
 
     view_map = {0: [0]}
     # Mapping from Type to C code (and version) to use.
@@ -47,13 +44,8 @@ class ViewOp(COp):
     __props__: tuple = ()
     _f16_ok: bool = True
 
-    def make_node(self, x):
-        return Apply(self, [x], [x.type()])
-
-    def perform(self, node, inp, out):
-        (x,) = inp
-        (z,) = out
-        z[0] = x
+    def perform(self, node, inputs, outputs_storage):
+        outputs_storage[0][0] = inputs[0]
 
     def __str__(self):
         return f"{self.__class__.__name__}"
@@ -64,9 +56,10 @@ class ViewOp(COp):
         fail = sub["fail"]
 
         itype = node.inputs[0].type.__class__
-        if itype in self.c_code_and_version:
-            code, version = self.c_code_and_version[itype]
-            return code % locals()
+        for cls in itype.__mro__:
+            if cls in self.c_code_and_version:
+                code, version = self.c_code_and_version[cls]
+                return code % locals()
 
         # Else, no C code
         raise NotImplementedError()
@@ -90,41 +83,21 @@ class ViewOp(COp):
 
         return tuple(version)
 
-    def infer_shape(self, fgraph, node, input_shapes):
+
+class ViewOp(TypeCastingOp):
+    """Returns an inplace view of the input. Used internally by PyTensor."""
+
+    def make_node(self, x):
+        return Apply(self, [x], [x.type()])
+
+    def infer_shape(self, node, input_shapes):
         return input_shapes
 
-    def grad(self, args, g_outs):
+    def pullback(self, args, outputs, g_outs):
         return g_outs
 
 
 view_op = ViewOp()
-
-
-class OutputGuard(ViewOp):
-    """
-    This op is used only internally by PyTensor.
-
-    Only the AddDestroyHandler optimizer tries to insert them in the graph.
-
-    This Op is declared as destructive while it is not destroying anything.
-    It returns a view. This is used to prevent destruction of the output
-    variables of an PyTensor function.
-
-    There is a mechanism in PyTensor that should prevent this, but the use
-    of OutputGuard adds a safeguard: it may be possible for some optimization
-    run before the add_destroy_handler phase to bypass this mechanism, by
-    making in-place optimizations.
-
-    TODO: find a current full explanation.
-
-    """
-
-    destroy_map = {0: [0]}
-
-    check_input = False
-
-
-_output_guard = OutputGuard()
 
 
 def register_deep_copy_op_c_code(typ, code, version=()):
@@ -206,7 +179,7 @@ class DeepCopyOp(COp):
         # Else, no C code
         raise NotImplementedError()
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         return input_shapes
 
 
@@ -269,20 +242,32 @@ class FromFunctionOp(Op):
             obj = load_back(mod, name)
         except (ImportError, KeyError, AttributeError):
             raise pickle.PicklingError(
-                f"Can't pickle as_op(), not found as {mod}.{name}"
+                f"Can't pickle wrap_py(), not found as {mod}.{name}"
             )
         else:
             if obj is not self:
                 raise pickle.PicklingError(
-                    f"Can't pickle as_op(), not the object at {mod}.{name}"
+                    f"Can't pickle wrap_py(), not the object at {mod}.{name}"
                 )
         return load_back, (mod, name)
 
-    def _infer_shape(self, fgraph, node, input_shapes):
-        return self.__infer_shape(fgraph, node, input_shapes)
+    def _infer_shape(self, node, input_shapes):
+        return self.__infer_shape(node, input_shapes)
 
 
 def as_op(itypes, otypes, infer_shape=None):
+    import warnings
+
+    warnings.warn(
+        "pytensor.as_op is deprecated and will be removed in a future release. "
+        "Please use pytensor.wrap_py instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return wrap_py(itypes, otypes, infer_shape)
+
+
+def wrap_py(itypes, otypes, infer_shape=None):
     """
     Decorator that converts a function into a basic PyTensor op that will call
     the supplied function as its implementation.
@@ -290,7 +275,7 @@ def as_op(itypes, otypes, infer_shape=None):
     It takes an optional infer_shape parameter that should be a callable with
     this signature:
 
-        def infer_shape(fgraph, node, input_shapes):
+        def infer_shape(node, input_shapes):
             ...
             return output_shapes
 
@@ -302,8 +287,8 @@ def as_op(itypes, otypes, infer_shape=None):
 
     Examples
     --------
-    @as_op(itypes=[pytensor.tensor.fmatrix, pytensor.tensor.fmatrix],
-           otypes=[pytensor.tensor.fmatrix])
+    @wrap_py(itypes=[pytensor.tensor.fmatrix, pytensor.tensor.fmatrix],
+             otypes=[pytensor.tensor.fmatrix])
     def numpy_dot(a, b):
         return numpy.dot(a, b)
 

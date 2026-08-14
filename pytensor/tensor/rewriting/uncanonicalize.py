@@ -38,7 +38,7 @@ from pytensor.tensor.elemwise import CAReduce, DimShuffle
 from pytensor.tensor.math import Min, neg
 from pytensor.tensor.rewriting.basic import register_uncanonicalize
 from pytensor.tensor.shape import Reshape, reshape
-from pytensor.tensor.subtensor import Subtensor
+from pytensor.tensor.subtensor import Subtensor, indices_from_subtensor
 
 
 @register_uncanonicalize
@@ -60,7 +60,7 @@ def local_max_to_min(fgraph, node):
         if (
             max.owner
             and isinstance(max.owner.op, CAReduce)
-            and max.owner.op.scalar_op == ps.scalar_maximum
+            and max.owner.op.scalar_op == ps.maximum
         ):
             neg_node = max.owner.inputs[0]
             if neg_node.owner and neg_node.owner.op == neg:
@@ -79,17 +79,16 @@ def local_alloc_dimshuffle(fgraph, node):
 
     Alloc(DimShuffle(x), ...) - > Alloc(x, ...)
     """
-    if isinstance(node.op, Alloc):
-        input_ = node.inputs[0]
-        if input_.owner and isinstance(input_.owner.op, DimShuffle):
-            # check if it only adds dimension to the left
-            new_order = input_.owner.op.new_order
-            expected_new_order = ("x",) * (
-                input_.ndim - input_.owner.inputs[0].ndim
-            ) + tuple(range(input_.owner.inputs[0].ndim))
-            if new_order != expected_new_order:
-                return False
-            return [alloc(input_.owner.inputs[0], *node.inputs[1:])]
+    input_ = node.inputs[0]
+    if input_.owner and isinstance(input_.owner.op, DimShuffle):
+        # check if it only adds dimension to the left
+        new_order = input_.owner.op.new_order
+        expected_new_order = ("x",) * (
+            input_.ndim - input_.owner.inputs[0].ndim
+        ) + tuple(range(input_.owner.inputs[0].ndim))
+        if new_order != expected_new_order:
+            return False
+        return [alloc(input_.owner.inputs[0], *node.inputs[1:])]
     return False
 
 
@@ -102,23 +101,20 @@ def local_reshape_dimshuffle(fgraph, node):
 
     Reshape(Dimshuffle(x), shp) -> Reshape(x, shp)
     """
-    if isinstance(node.op, Reshape):
-        input_ = node.inputs[0]
-        if input_.owner and isinstance(input_.owner.op, DimShuffle):
-            new_order = input_.owner.op.new_order
-            offset = 0
-            for dim in new_order:
-                if dim == "x":
-                    continue
-                elif dim != offset:
-                    return False
-                else:
-                    offset += 1
-            return [
-                reshape(
-                    input_.owner.inputs[0], node.inputs[1], ndim=node.outputs[0].ndim
-                )
-            ]
+    input_ = node.inputs[0]
+    if input_.owner and isinstance(input_.owner.op, DimShuffle):
+        new_order = input_.owner.op.new_order
+        offset = 0
+        for dim in new_order:
+            if dim == "x":
+                continue
+            elif dim != offset:
+                return False
+            else:
+                offset += 1
+        return [
+            reshape(input_.owner.inputs[0], node.inputs[1], ndim=node.outputs[0].ndim)
+        ]
     return False
 
 
@@ -131,22 +127,23 @@ def local_dimshuffle_alloc(fgraph, node):
 
     dimshuffle{x, 0, 1}(alloc([3 4], 3, 2) => alloc([3 4], 1, 3, 2)
     """
-    if isinstance(node.op, DimShuffle) and node.inputs[0].owner:
-        input_ = node.inputs[0]
-        if isinstance(input_.owner.op, Alloc):
-            # check if it only adds dimension to the left
-            new_order = node.op.new_order
-            expected_new_order = ("x",) * (len(new_order) - input_.ndim) + tuple(
-                range(input_.ndim)
-            )
-            if new_order != expected_new_order:
-                return False
+    if not node.inputs[0].owner:
+        return False
+    input_ = node.inputs[0]
+    if isinstance(input_.owner.op, Alloc):
+        # check if it only adds dimension to the left
+        new_order = node.op.new_order
+        expected_new_order = ("x",) * (len(new_order) - input_.ndim) + tuple(
+            range(input_.ndim)
+        )
+        if new_order != expected_new_order:
+            return False
 
-            # count numbers of 'x'
-            nb_new_dims = len(new_order) - input_.ndim
-            new_shape_input = (1,) * nb_new_dims + tuple(input_.owner.inputs[1:])
+        # count numbers of 'x'
+        nb_new_dims = len(new_order) - input_.ndim
+        new_shape_input = (1,) * nb_new_dims + tuple(input_.owner.inputs[1:])
 
-            return [alloc(input_.owner.inputs[0], *new_shape_input)]
+        return [alloc(input_.owner.inputs[0], *new_shape_input)]
     return False
 
 
@@ -165,88 +162,69 @@ def local_dimshuffle_subtensor(fgraph, node):
     x[i:j, :l, :].dimshuffle(0, 2) => x[i:j, 0, :]
 
     """
-    if isinstance(node.op, DimShuffle) and node.inputs[0].owner:
-        # the dimshuffle can only drop dimensions (cannot reshape nor add 'x')
-        if "x" in node.op.new_order:
-            return False
-        new_order = node.op.new_order
-        # new order could be empty
-        # Verif that we don't change dimensions order.
-        if len(new_order) > 1:
-            past_dim = new_order[0]
-            for dim in new_order[1:]:
-                if not dim > past_dim:
-                    return False
-                else:
-                    past_dim = dim
-
-        input_ = node.inputs[0]
-        if isinstance(input_.owner.op, Subtensor):
-            # the arguments missing from the dimshuffles must be dims
-            # that are broadcastable
-            broadcastable = input_.broadcastable
-
-            missing_dims = list(range(input_.ndim))
-            for dim in new_order:
-                missing_dims.remove(dim)
-
-            if not all(broadcastable[i] for i in missing_dims):
+    if not node.inputs[0].owner:
+        return False
+    # the dimshuffle can only drop dimensions (cannot reshape nor add 'x')
+    if "x" in node.op.new_order:
+        return False
+    new_order = node.op.new_order
+    # new order could be empty
+    # Verif that we don't change dimensions order.
+    if len(new_order) > 1:
+        past_dim = new_order[0]
+        for dim in new_order[1:]:
+            if not dim > past_dim:
                 return False
+            else:
+                past_dim = dim
 
-            # create a new idx_list for a new Subtensor object
-            # have to loop on idx_list and inputs
-            # inputs has the length of sum of non None elements of idx_list
-            # (check in slice!).
-            # len(missing_dims) can be < len(idx_list), this happens if
-            # tensor was indexed such as x[scalar, :, :], check that as well
-            new_idx_list = list(input_.owner.op.idx_list)
-            new_inputs = [input_.owner.inputs[0]]
-            zero = constant(0)
-            j = 0
-            slice_i = -1
-            subtensor_removed_dims = 0
-            for i, idx in enumerate(input_.owner.op.idx_list):
-                if isinstance(idx, slice):
-                    slice_i += 1
-                    if slice_i in missing_dims:
-                        # Missing dim is a slice(None), remove by indexing by 0
-                        if idx == slice(None):
-                            new_idx_list[i] = zero
-                            new_inputs += [zero]
-                        # Missing dim is an ordinary slice with known output dim length of 1
-                        # Remove by indexing by start
-                        else:
-                            if idx.start is None:
-                                start = zero
-                            else:
-                                start = input_.owner.inputs[1 + j]
-                                j += 1
-                            new_idx_list[i] = start
-                            new_inputs += [start]
+    input_ = node.inputs[0]
+    if isinstance(input_.owner.op, Subtensor):
+        # the arguments missing from the dimshuffles must be dims
+        # that are broadcastable
+        broadcastable = input_.broadcastable
 
-                            # Ignore useless stop and step input if there is one
-                            for slice_attr in ("stop", "step"):
-                                if getattr(idx, slice_attr) is not None:
-                                    j += 1
+        missing_dims = list(range(input_.ndim))
+        for dim in new_order:
+            missing_dims.remove(dim)
 
-                    # Keep non-dropped slice inputs
+        if not all(broadcastable[i] for i in missing_dims):
+            return False
+
+        # create a new index tuple for a new Subtensor
+        # Reconstruct the full indices from the subtensor node, then replace
+        # dimensions that are being dropped by dimshuffle with scalar index 0
+        x = input_.owner.inputs[0]
+        indices = list(
+            indices_from_subtensor(input_.owner.inputs[1:], input_.owner.op.idx_list)
+        )
+        zero = constant(0)
+
+        # Track which output dimension each index corresponds to
+        # Scalar indices remove dimensions, slices keep them
+        output_dim = 0
+        for i, idx in enumerate(indices):
+            if isinstance(idx, slice):
+                # This slice produces an output dimension
+                if output_dim in missing_dims:
+                    # This output dimension is being dropped, so replace slice with scalar
+                    if idx == slice(None):
+                        indices[i] = zero
                     else:
-                        for slice_attr in ("start", "stop", "step"):
-                            if getattr(idx, slice_attr) is not None:
-                                new_inputs += [input_.owner.inputs[1 + j]]
-                                j += 1
-                # Keep non-dropped non-slice inputs
-                else:
-                    new_inputs += [input_.owner.inputs[1 + j]]
-                    j += 1
-                    subtensor_removed_dims += 1
-            # Verify the trailing dimensions the subtensor didn't look at.
-            for idx in range(len(input_.owner.op.idx_list), new_inputs[0].ndim):
-                if (idx - subtensor_removed_dims) in missing_dims:
-                    while len(new_idx_list) < idx:
-                        new_idx_list.append(slice(None))
+                        # Use the start of the slice (or 0 if None)
+                        indices[i] = idx.start if idx.start is not None else zero
+                output_dim += 1
+            # Scalar indices don't contribute to output dimensions
 
-                    new_idx_list.append(zero)
-                    new_inputs.append(zero)
-            return [Subtensor(new_idx_list)(*new_inputs)]
+        # Handle trailing dimensions that weren't explicitly indexed
+        for input_dim in range(len(indices), x.ndim):
+            if output_dim in missing_dims:
+                # This unindexed dimension is being dropped, index with 0
+                indices.append(zero)
+            else:
+                # This unindexed dimension is kept, index with slice(None)
+                indices.append(slice(None))
+            output_dim += 1
+
+        return [x[tuple(indices)]]
     return False

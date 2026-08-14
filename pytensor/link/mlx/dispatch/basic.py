@@ -1,0 +1,242 @@
+import warnings
+from copy import deepcopy
+from functools import singledispatch
+from types import NoneType
+
+import mlx.core as mx
+import numpy as np
+
+from pytensor.compile.builders import OpFromGraph
+from pytensor.compile.ops import DeepCopyOp, TypeCastingOp
+from pytensor.graph import Constant
+from pytensor.graph.fg import AbstractFunctionGraph
+from pytensor.ifelse import IfElse
+from pytensor.link.utils import fgraph_to_python
+from pytensor.raise_op import Assert, CheckAndRaise
+
+
+def float64_supported():
+    """Return whether the current default device can operate on float64.
+
+    MLX implements float64 on the CPU only; the Metal backend rejects it outright.
+    """
+    return mx.default_device() == mx.cpu
+
+
+def convert_dtype_to_mlx(dtype_str, auto_cast_unsupported=True):
+    """Convert PyTensor dtype strings to MLX dtype objects.
+
+    MLX expects dtype objects rather than string literals for type conversion.
+    This function maps common dtype strings to their MLX equivalents.
+
+    float64 survives when the default device supports it and is narrowed to float32
+    otherwise. complex128 is always narrowed, MLX having no wider complex type.
+
+    Parameters
+    ----------
+    dtype_str : str or MLX dtype
+        The dtype to convert
+    auto_cast_unsupported : bool, optional
+        If True, narrow dtypes the current device cannot handle, warning as it does so.
+        If False, return the requested dtype and let any later failure surface. Default
+        True.
+
+    Returns
+    -------
+    MLX dtype object
+    """
+    if isinstance(dtype_str, str):
+        if dtype_str == "bool":
+            return mx.bool_
+        elif dtype_str == "int8":
+            return mx.int8
+        elif dtype_str == "int16":
+            return mx.int16
+        elif dtype_str == "int32":
+            return mx.int32
+        elif dtype_str == "int64":
+            return mx.int64
+        elif dtype_str == "uint8":
+            return mx.uint8
+        elif dtype_str == "uint16":
+            return mx.uint16
+        elif dtype_str == "uint32":
+            return mx.uint32
+        elif dtype_str == "uint64":
+            return mx.uint64
+        elif dtype_str == "float16":
+            return mx.float16
+        elif dtype_str == "float32":
+            return mx.float32
+        elif dtype_str == "float64":
+            if auto_cast_unsupported and not float64_supported():
+                warnings.warn(
+                    "MLX does not support float64 on GPU. Automatically casting to float32. "
+                    "This may result in reduced precision. To keep float64, run on the CPU "
+                    "device with mx.set_default_device(mx.cpu); to avoid this warning, use "
+                    "float32 or set floatX='float32' in PyTensor config.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return mx.float32
+            else:
+                return mx.float64
+        elif dtype_str == "bfloat16":
+            return mx.bfloat16
+        elif dtype_str == "complex64":
+            return mx.complex64
+        elif dtype_str == "complex128":
+            if auto_cast_unsupported:
+                warnings.warn(
+                    "MLX does not support complex128. Automatically casting to complex64. "
+                    "This may result in reduced precision. To avoid this warning, "
+                    "explicitly use complex64 in your code.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return mx.complex64
+            else:
+                # Return the original even though it might fail
+                # This allows users to opt out of auto-casting if needed
+                return mx.complex64  # MLX doesn't have complex128, so fallback
+    # Return as is if it's already an MLX dtype or not a recognized string
+    return dtype_str
+
+
+def _nan_safe_constant(data, dtype=None):
+    """Convert ``data`` to an ``mx.array``, materializing NaN scalars through an op.
+
+    ``mx.compile`` inlines *size-1* constants directly into the generated Metal
+    source, but Metal has no ``nan`` literal (it does accept ``inf``), so such a
+    constant aborts kernel compilation. Computing it (``0 / 0``) makes MLX emit a
+    valid expression instead of the bare ``nan`` token. Larger constants are
+    passed as buffers (never inlined), so they are left as-is. This is the class
+    of constant the ``local_sqrt_sqr`` rewrite produces on normalization
+    input-gradients.
+    """
+    arr = mx.array(data, dtype=dtype)
+    if data.size != 1 or data.dtype.kind != "f" or not np.isnan(data).any():
+        return arr
+    nan = mx.array(0.0, dtype=arr.dtype) / mx.array(0.0, dtype=arr.dtype)
+    return nan.reshape(data.shape)
+
+
+@singledispatch
+def mlx_typify(data, **kwargs):
+    raise NotImplementedError(f"mlx_typify is not implemented for {type(data)}")
+
+
+@mlx_typify.register(np.ndarray)
+def mlx_typify_tensor(data, dtype=None, **kwargs):
+    # mx.array narrows float64 input to float32 unless the dtype is named explicitly,
+    # and it does so on the CPU too, where float64 is perfectly usable
+    if dtype is None and data.dtype == np.float64 and float64_supported():
+        dtype = mx.float64
+    return _nan_safe_constant(data, dtype=dtype)
+
+
+@mlx_typify.register(slice)
+@mlx_typify.register(NoneType)
+@mlx_typify.register(mx.array)
+def mlx_typify_no_conversion_needed(data, **kwargs):
+    return data
+
+
+@mlx_typify.register(int)
+@mlx_typify.register(float)
+def mlx_typify_python_scalar(data, **kwargs):
+    return _nan_safe_constant(np.asarray(data))
+
+
+@mlx_typify.register(bool)
+@mlx_typify.register(np.bool_)
+def mlx_typify_bool(data, **kwargs):
+    return bool(data)
+
+
+@mlx_typify.register(np.integer)
+@mlx_typify.register(np.floating)
+@mlx_typify.register(np.complexfloating)
+def mlx_typify_numpy_scalar(data, **kwargs):
+    return _nan_safe_constant(np.asarray(data))
+
+
+@singledispatch
+def mlx_funcify(op, node=None, storage_map=None, **kwargs):
+    """Create a MLX compatible function from an PyTensor `Op`."""
+    raise NotImplementedError(
+        f"No MLX conversion for the given `Op`: {op}.\nCheck out `https://github.com/pymc-devs/pytensor/issues/1350` for progress or to request we prioritize this operation"
+    )
+
+
+@mlx_funcify.register(AbstractFunctionGraph)
+def mlx_funcify_FunctionGraph(
+    fgraph,
+    node=None,
+    fgraph_name="mlx_funcified_fgraph",
+    conversion_func=mlx_funcify,
+    **kwargs,
+):
+    built_kwargs = {"conversion_func": conversion_func, **kwargs}
+    return fgraph_to_python(
+        fgraph,
+        conversion_func,
+        type_conversion_fn=mlx_typify,
+        fgraph_name=fgraph_name,
+        **built_kwargs,
+    )
+
+
+@mlx_funcify.register(DeepCopyOp)
+def mlx_funcify_DeepCopyOp(op, **kwargs):
+    def deepcopyop(x):
+        return deepcopy(x)
+
+    return deepcopyop
+
+
+@mlx_funcify.register(TypeCastingOp)
+def mlx_funcify_TypeCastingOp(op, **kwargs):
+    def type_cast(x):
+        return x
+
+    return type_cast
+
+
+@mlx_funcify.register(IfElse)
+def mlx_funcify_IfElse(op, **kwargs):
+    n_outs = op.n_outs
+
+    def ifelse(cond, *args, n_outs=n_outs):
+        # MLX has no conditional Op, the best we can do is mx.where to select between branches elementwise.
+        res = tuple(mx.where(cond, args[i], args[n_outs + i]) for i in range(n_outs))
+        return res if n_outs > 1 else res[0]
+
+    return ifelse
+
+
+@mlx_funcify.register(Assert)
+@mlx_funcify.register(CheckAndRaise)
+def mlx_funcify_CheckAndRaise(op, node, **kwargs):
+    conds = node.inputs[1:]
+    if any(isinstance(cond, Constant) and not bool(cond.data) for cond in conds):
+        raise op.exc_type(op.msg)
+
+    warnings.warn(
+        f"""Skipping `{type(op).__name__}` Op (assertion: {op.msg}) as MLX tracing would remove it.""",
+        stacklevel=2,
+    )
+
+    def assert_fn(x, *inputs):
+        return x
+
+    return assert_fn
+
+
+@mlx_funcify.register(OpFromGraph)
+def mlx_funcify_OpFromGraph(ofg: OpFromGraph, node=None, **kwargs):
+    _ = kwargs.pop("storage_map", None)
+
+    fgraph_fn = mlx_funcify(ofg.fgraph, squeeze_output=True, **kwargs)
+
+    return fgraph_fn

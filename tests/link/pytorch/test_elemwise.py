@@ -5,10 +5,9 @@ import pytensor
 import pytensor.tensor as pt
 import pytensor.tensor.math as ptm
 from pytensor.configdefaults import config
-from pytensor.graph.fg import FunctionGraph
 from pytensor.scalar.basic import ScalarOp, get_scalar_type
 from pytensor.tensor.elemwise import Elemwise
-from pytensor.tensor.special import SoftmaxGrad, log_softmax, softmax
+from pytensor.tensor.special import log_softmax, softmax
 from pytensor.tensor.type import matrix, tensor, tensor3, vector
 from tests.link.pytorch.test_basic import compare_pytorch_and_py
 
@@ -20,17 +19,23 @@ def test_pytorch_Dimshuffle():
     a_pt = matrix("a")
 
     x = a_pt.T
-    x_fg = FunctionGraph([a_pt], [x])
-    compare_pytorch_and_py(x_fg, [np.c_[[1.0, 2.0], [3.0, 4.0]].astype(config.floatX)])
+
+    compare_pytorch_and_py(
+        [a_pt], [x], [np.c_[[1.0, 2.0], [3.0, 4.0]].astype(config.floatX)]
+    )
 
     x = a_pt.dimshuffle([0, 1, "x"])
-    x_fg = FunctionGraph([a_pt], [x])
-    compare_pytorch_and_py(x_fg, [np.c_[[1.0, 2.0], [3.0, 4.0]].astype(config.floatX)])
+
+    compare_pytorch_and_py(
+        [a_pt], [x], [np.c_[[1.0, 2.0], [3.0, 4.0]].astype(config.floatX)]
+    )
 
     a_pt = tensor(dtype=config.floatX, shape=(None, 1))
     x = a_pt.dimshuffle((0,))
-    x_fg = FunctionGraph([a_pt], [x])
-    compare_pytorch_and_py(x_fg, [np.c_[[1.0, 2.0, 3.0, 4.0]].astype(config.floatX)])
+
+    compare_pytorch_and_py(
+        [a_pt], [x], [np.c_[[1.0, 2.0, 3.0, 4.0]].astype(config.floatX)]
+    )
 
 
 def test_multiple_input_output():
@@ -38,24 +43,21 @@ def test_multiple_input_output():
     y = vector("y")
     out = pt.mul(x, y)
 
-    fg = FunctionGraph(outputs=[out], clone=False)
-    compare_pytorch_and_py(fg, [[1.5], [2.5]])
+    compare_pytorch_and_py([x, y], [out], [[1.5], [2.5]])
 
     x = vector("x")
     y = vector("y")
     div = pt.int_div(x, y)
     pt_sum = pt.add(y, x)
 
-    fg = FunctionGraph(outputs=[div, pt_sum], clone=False)
-    compare_pytorch_and_py(fg, [[1.5], [2.5]])
+    compare_pytorch_and_py([x, y], [div, pt_sum], [[1.5], [2.5]])
 
 
 def test_pytorch_elemwise():
     x = pt.vector("x")
     out = pt.log(1 - x)
 
-    fg = FunctionGraph([x], [out])
-    compare_pytorch_and_py(fg, [[0.9, 0.9]])
+    compare_pytorch_and_py([x], [out], [[0.9, 0.9]])
 
 
 @pytest.mark.parametrize("fn", [ptm.sum, ptm.prod, ptm.max, ptm.min])
@@ -81,9 +83,8 @@ def test_pytorch_careduce(fn, axis):
     ).astype(config.floatX)
 
     x = fn(a_pt, axis=axis)
-    x_fg = FunctionGraph([a_pt], [x])
 
-    compare_pytorch_and_py(x_fg, [test_value])
+    compare_pytorch_and_py([a_pt], [x], [test_value])
 
 
 @pytest.mark.parametrize("fn", [ptm.any, ptm.all])
@@ -93,9 +94,8 @@ def test_pytorch_any_all(fn, axis):
     test_value = np.array([[True, False, True], [False, True, True]])
 
     x = fn(a_pt, axis=axis)
-    x_fg = FunctionGraph([a_pt], [x])
 
-    compare_pytorch_and_py(x_fg, [test_value])
+    compare_pytorch_and_py([a_pt], [x], [test_value])
 
 
 @pytest.mark.parametrize("dtype", ["float64", "int64"])
@@ -103,17 +103,16 @@ def test_pytorch_any_all(fn, axis):
 def test_softmax(axis, dtype):
     x = matrix("x", dtype=dtype)
     out = softmax(x, axis=axis)
-    fgraph = FunctionGraph([x], [out])
     test_input = np.arange(6, dtype=config.floatX).reshape(2, 3)
 
     if dtype == "int64":
         with pytest.raises(
             NotImplementedError,
-            match="Pytorch Softmax is not currently implemented for non-float types.",
+            match="Pytorch Softmax is not currently implemented for non-float types\\.",
         ):
-            compare_pytorch_and_py(fgraph, [test_input])
+            compare_pytorch_and_py([x], [out], [test_input])
     else:
-        compare_pytorch_and_py(fgraph, [test_input])
+        compare_pytorch_and_py([x], [out], [test_input])
 
 
 @pytest.mark.parametrize("dtype", ["float64", "int64"])
@@ -121,38 +120,38 @@ def test_softmax(axis, dtype):
 def test_logsoftmax(axis, dtype):
     x = matrix("x", dtype=dtype)
     out = log_softmax(x, axis=axis)
-    fgraph = FunctionGraph([x], [out])
     test_input = np.arange(6, dtype=config.floatX).reshape(2, 3)
 
     if dtype == "int64":
         with pytest.raises(
             NotImplementedError,
-            match="Pytorch LogSoftmax is not currently implemented for non-float types.",
+            match="Pytorch LogSoftmax is not currently implemented for non-float types\\.",
         ):
-            compare_pytorch_and_py(fgraph, [test_input])
+            compare_pytorch_and_py([x], [out], [test_input])
     else:
-        compare_pytorch_and_py(fgraph, [test_input])
-
-
-@pytest.mark.parametrize("axis", [None, 0, 1])
-def test_softmax_grad(axis):
-    dy = matrix("dy")
-    dy_value = np.array([[1, 1, 1], [0, 0, 0]], dtype=config.floatX)
-    sm = matrix("sm")
-    sm_value = np.arange(6, dtype=config.floatX).reshape(2, 3)
-    out = SoftmaxGrad(axis=axis)(dy, sm)
-    fgraph = FunctionGraph([dy, sm], [out])
-    compare_pytorch_and_py(fgraph, [dy_value, sm_value])
+        compare_pytorch_and_py([x], [out], [test_input])
 
 
 def test_cast():
     x = matrix("x", dtype="float32")
     out = pt.cast(x, "int32")
-    fgraph = FunctionGraph([x], [out])
     _, [res] = compare_pytorch_and_py(
-        fgraph, [np.arange(6, dtype="float32").reshape(2, 3)]
+        [x], [out], [np.arange(6, dtype="float32").reshape(2, 3)]
     )
     assert res.dtype == np.int32
+
+
+@pytest.mark.parametrize(
+    "x_val, min_val, max_val",
+    [
+        (np.array([5.0], dtype=config.floatX), 0.0, 10.0),
+        (np.array([-5.0], dtype=config.floatX), 0.0, 10.0),
+    ],
+)
+def test_clip(x_val, min_val, max_val):
+    x = pt.tensor("x", shape=x_val.shape, dtype=config.floatX)
+    out = pt.clip(x, min_val, max_val)
+    compare_pytorch_and_py([x], [out], [x_val])
 
 
 def test_vmap_elemwise():
@@ -183,3 +182,38 @@ def test_vmap_elemwise():
     vals = torch.zeros(2, 3).normal_()
     np.testing.assert_allclose(f(vals), torch.relu(vals))
     assert op.call_shapes == [torch.Size([])], op.call_shapes
+
+
+@pytest.mark.parametrize("op", [pt.add, pt.mul], ids=["add", "mul"])
+def test_pytorch_variadic_broadcast(op):
+    x = tensor("x", shape=(3, 4))
+    y = tensor("y", shape=(1, 4))
+    z = tensor("z", shape=(3, 1))
+    out = op(x, y, z)
+    assert len(out.owner.inputs) == 3
+
+    rng = np.random.default_rng(0)
+    test_inputs = [
+        rng.normal(size=s).astype(config.floatX) for s in [(3, 4), (1, 4), (3, 1)]
+    ]
+    compare_pytorch_and_py([x, y, z], [out], test_inputs)
+
+
+@pytest.mark.parametrize("dtype", ["bool", "int8"], ids=["bool", "int8"])
+def test_pytorch_variadic_add_dtype(dtype):
+    # Folding the binary op preserves dtype; stack + torch.sum upcast bool/int.
+    x = tensor("x", shape=(3,), dtype=dtype)
+    y = tensor("y", shape=(3,), dtype=dtype)
+    z = tensor("z", shape=(3,), dtype=dtype)
+    out = pt.add(x, y, z)
+
+    def assert_fn(torch_res, py_res):
+        np.testing.assert_allclose(torch_res, py_res)
+        assert np.asarray(torch_res).dtype == np.asarray(py_res).dtype
+
+    vals = (
+        np.array([True, False, True])
+        if dtype == "bool"
+        else np.array([1, 2, 3], dtype=dtype)
+    )
+    compare_pytorch_and_py([x, y, z], [out], [vals, vals, vals], assert_fn=assert_fn)

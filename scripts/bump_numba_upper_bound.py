@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+"""Bump the numba upper bound in pyproject.toml when a new numba release is out.
+
+Queries conda-forge for the latest stable numba release and compares it against
+the current ``<=`` cap pinned in pyproject.toml. CI installs numba from
+conda-forge, so gating on conda-forge (rather than PyPI, which it typically
+leads by days) means the PR only opens once the version is actually installable
+in CI. The pin is rewritten to the canonical ``"numba>=X.Y,<=A.B.C"`` form
+whenever:
+
+* the latest release is newer than the cap; or
+* the existing pin is in a non-canonical shape (``<`` instead of ``<=``, or
+  no upper bound at all). Form drift triggers a PR so the inconsistency is
+  surfaced for review rather than silently smoothed over.
+
+Exit code:
+    0  - no bump needed (pin is canonical and at the latest release)
+    0  - bump written (emits GITHUB_OUTPUT for the workflow)
+    1  - unexpected state (no pin found, inconsistent pins, etc.)
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+from packaging.version import Version
+
+
+PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+# Match any quoted numba spec: the bare name, or numba followed by a version
+# operator. The spec body (group "spec") is what we re-parse and rewrite.
+PIN_RE = re.compile(r'"numba(?P<spec>(?:[<>=!~][^"]*)?)"')
+LOWER_RE = re.compile(r">=\d+\.\d+(?:\.\d+)?")
+UPPER_RE = re.compile(r"<(=?)(\d+\.\d+(?:\.\d+)?)")
+DEFAULT_LOWER = ">=0.58"
+CONDA_FORGE_URL = "https://api.anaconda.org/package/conda-forge/numba"
+
+
+def fetch_latest_numba() -> Version:
+    with urllib.request.urlopen(CONDA_FORGE_URL, timeout=30) as resp:
+        data = json.load(resp)
+    candidates: list[Version] = []
+    for raw in data["versions"]:
+        v = Version(raw)
+        if v.is_prerelease or v.is_devrelease:
+            continue
+        candidates.append(v)
+    if not candidates:
+        raise RuntimeError("no stable numba release found on conda-forge")
+    return max(candidates)
+
+
+def emit_output(key: str, value: str) -> None:
+    out = os.environ.get("GITHUB_OUTPUT")
+    if not out:
+        return
+    with Path(out).open("a") as f:
+        f.write(f"{key}={value}\n")
+
+
+def parse_spec(spec: str) -> tuple[str, str | None, Version | None]:
+    """Return ``(lower_clause, upper_op, upper_cap)`` for a numba pin body.
+
+    ``upper_op`` is ``"<"``, ``"<="``, or ``None`` when no upper bound is
+    present. A missing lower bound falls back to ``DEFAULT_LOWER`` so the
+    rewritten pin still constrains both sides.
+    """
+    lower_m = LOWER_RE.search(spec)
+    lower = lower_m.group(0) if lower_m else DEFAULT_LOWER
+    upper_m = UPPER_RE.search(spec)
+    if upper_m is None:
+        return lower, None, None
+    op = "<=" if upper_m.group(1) == "=" else "<"
+    return lower, op, Version(upper_m.group(2))
+
+
+def main() -> int:
+    lines = PYPROJECT.read_text().splitlines(keepends=True)
+    # Skip full-line TOML comments so a commented-out dep list doesn't get
+    # treated as a real pin (and doesn't get rewritten).
+    pin_hits = [
+        (i, m)
+        for i, line in enumerate(lines)
+        if not line.lstrip().startswith("#")
+        for m in PIN_RE.finditer(line)
+    ]
+    if not pin_hits:
+        print(f"no numba pin found in {PYPROJECT}", file=sys.stderr)
+        return 1
+
+    parsed = [parse_spec(m.group("spec")) for _, m in pin_hits]
+    lowers = {lower for lower, _, _ in parsed}
+    if len(lowers) != 1:
+        print(f"inconsistent numba lower bounds: {lowers}", file=sys.stderr)
+        return 1
+    lower = lowers.pop()
+    upper_ops = {op for _, op, _ in parsed}
+    caps = {cap for _, _, cap in parsed if cap is not None}
+
+    latest = fetch_latest_numba()
+    latest_str = f"{latest.major}.{latest.minor}.{latest.micro}"
+    print(f"current pin specs: {sorted({m.group('spec') for _, m in pin_hits})}")
+    print(f"latest numba release: {latest}")
+
+    if upper_ops == {"<="} and caps == {latest}:
+        print("no bump needed")
+        emit_output("bumped", "false")
+        return 0
+
+    new_spec = f"{lower},<={latest_str}"
+    for i, _ in pin_hits:
+        lines[i] = PIN_RE.sub(f'"numba{new_spec}"', lines[i])
+    PYPROJECT.write_text("".join(lines))
+
+    reasons = []
+    if None in upper_ops:
+        reasons.append("missing upper bound")
+    if "<" in upper_ops:
+        reasons.append("'<' cap")
+    if caps and caps != {latest}:
+        reasons.append(f"cap was {sorted(map(str, caps))}, latest is {latest}")
+    print(
+        f"rewrote pin ({'; '.join(reasons) or 'normalized'}); new spec: numba{new_spec}"
+    )
+    emit_output("bumped", "true")
+    emit_output("latest", str(latest))
+    emit_output("new_cap", latest_str)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

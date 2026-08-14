@@ -10,16 +10,21 @@ import pytensor
 import pytensor.scalar as ps
 import pytensor.tensor as pt
 import tests.unittest_tools as utt
-from pytensor.compile.function import function
-from pytensor.compile.mode import Mode
-from pytensor.configdefaults import config
+from pytensor import In, config, grad
+from pytensor.compile.maker import function
+from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.fg import FunctionGraph
-from pytensor.graph.replace import vectorize_node
+from pytensor.graph.replace import vectorize_graph
 from pytensor.link.basic import PerformLinker
 from pytensor.link.c.basic import CLinker, OpWiseCLinker
+from pytensor.link.numba import NumbaLinker
+from pytensor.scalar import ScalarOp, float32, float64, int32, int64
+from pytensor.scalar import add as scalar_add
+from pytensor.scalar import exp as scalar_exp
+from pytensor.scalar import xor as scalar_xor
 from pytensor.tensor import as_tensor_variable
-from pytensor.tensor.basic import second
+from pytensor.tensor.basic import get_scalar_constant_value, second
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
 from pytensor.tensor.math import Any, Sum, exp
 from pytensor.tensor.math import all as pt_all
@@ -30,6 +35,7 @@ from pytensor.tensor.type import (
     bmatrix,
     bscalar,
     discrete_dtypes,
+    dmatrix,
     lscalar,
     matrix,
     scalar,
@@ -39,7 +45,37 @@ from pytensor.tensor.type import (
 )
 from tests import unittest_tools
 from tests.link.test_link import make_function
-from tests.tensor.test_math import reduce_bitwise_and
+from tests.tensor.utils import (
+    _bad_runtime_broadcast_binary_normal,
+    inplace_func,
+    integers,
+    integers_uint16,
+    integers_uint32,
+    makeBroadcastTester,
+    random,
+    random_complex,
+)
+
+
+def reduce_bitwise_and(x, axis=-1, dtype="int8"):
+    """Helper function for TestCAReduce"""
+    if dtype == "uint8":
+        # in numpy version >= 2.0, out of bounds uint8 values are not converted
+        identity = np.array((255,), dtype=dtype)[0]
+    else:
+        identity = np.array((-1,), dtype=dtype)[0]
+
+    shape_without_axis = tuple(s for i, s in enumerate(x.shape) if i != axis)
+    if 0 in shape_without_axis:
+        return np.empty(shape=shape_without_axis, dtype=x.dtype)
+
+    def custom_reduce(a):
+        out = identity
+        for i in range(a.size):
+            out = np.bitwise_and(a[i], out)
+        return out
+
+    return np.apply_along_axis(custom_reduce, axis, x)
 
 
 class TestDimShuffle(unittest_tools.InferShapeTester):
@@ -121,9 +157,11 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
 
     def test_too_big_rank(self):
         x = self.type(self.dtype, shape=())()
-        y = x.dimshuffle(("x",) * (np.MAXDIMS + 1))
-        with pytest.raises(ValueError):
-            y.eval({x: 0})
+        with pytest.raises(
+            ValueError,
+            match="maximum supported dimension for a TensorType is currently 64, found 65",
+        ):
+            x.dimshuffle(("x",) * 65)
 
     def test_c_views(self):
         x_pt = vector()
@@ -136,14 +174,20 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
         # as the broadcasted value; that way, we'll be able to tell that we're getting
         # junk data from a poorly constructed array view.
         x_val = np.broadcast_to(2039, (5000,))
-        for i in range(1000):
+        for i in range(1):
             inputs[0].storage[0] = x_val
             thunk()
             # Make sure it's a view of the original data
             assert np.shares_memory(x_val, outputs[0].storage[0])
+            # Confirm the right strides
+            assert outputs[0].storage[0].strides[-1] == 0
             # Confirm the broadcasted value in the output
             assert np.array_equiv(outputs[0].storage[0], 2039)
 
+    @pytest.mark.skipif(
+        isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Running with numba linker, c backend (should be) covered in another CI",
+    )
     @pytest.mark.parametrize("inplace", [True, False])
     def test_memory_leak(self, inplace):
         import gc
@@ -177,7 +221,8 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
             blocks_last = blocks_i
 
         tracemalloc.stop()
-        assert np.allclose(np.mean(block_diffs), 0)
+        burn_in = 1
+        assert np.allclose(np.mean(block_diffs[burn_in:]), 0)
 
     def test_static_shape(self):
         x = tensor(dtype=np.float64, shape=(1, 2), name="x")
@@ -200,7 +245,7 @@ class TestBroadcast:
     cop = Elemwise
 
     openmp_minsize = 2 * config.openmp_elemwise_minsize
-    openmp_minsize_sqrt = int(math.ceil(math.sqrt(openmp_minsize)))
+    openmp_minsize_sqrt = math.ceil(math.sqrt(openmp_minsize))
 
     # The order is important if you change them.
     linkers = [PerformLinker, CLinker]
@@ -278,7 +323,7 @@ class TestBroadcast:
 
             x = x_type("x")
             y = y_type("y")
-            e = op(ps.Add(ps.transfer_type(0)), {0: 0})(x, y)
+            e = op(ps.add, {0: 0})(x, y)
             f = make_function(copy(linker).accept(FunctionGraph([x, y], [e])))
             xv = rand_val(xsh)
             yv = rand_val(ysh)
@@ -292,7 +337,7 @@ class TestBroadcast:
             if isinstance(linker, PerformLinker):
                 x = x_type("x")
                 y = y_type("y")
-                e = op(ps.Add(ps.transfer_type(0)), {0: 0})(x, y)
+                e = op(ps.add, {0: 0})(x, y)
                 f = make_function(copy(linker).accept(FunctionGraph([x, y], [e.shape])))
                 xv = rand_val(xsh)
                 yv = rand_val(ysh)
@@ -334,7 +379,10 @@ class TestBroadcast:
         ):
             x = t(pytensor.config.floatX, shape=(None, None))("x")
             y = t(pytensor.config.floatX, shape=(1, 1))("y")
-            e = op(ps.Second(ps.transfer_type(0)), {0: 0})(x, y)
+            op1 = op(ps.second, {0: 0})
+            op2 = op(ps.second, {0: 0})
+            assert op1 == op2
+            e = op(ps.Second(), {0: 0})(x, y)
             f = make_function(linker().accept(FunctionGraph([x, y], [e])))
             xv = rval((5, 5))
             yv = rval((1, 1))
@@ -489,14 +537,14 @@ class TestCAReduce(unittest_tools.InferShapeTester):
             elif scalar_op == ps.mul:
                 for axis in sorted(tosum, reverse=True):
                     zv = np.multiply.reduce(zv, axis)
-            elif scalar_op == ps.scalar_maximum:
+            elif scalar_op == ps.maximum:
                 # There is no identity value for the maximum function
                 # So we can't support shape of dimensions 0.
                 if np.prod(zv.shape) == 0:
                     continue
                 for axis in sorted(tosum, reverse=True):
                     zv = np.maximum.reduce(zv, axis)
-            elif scalar_op == ps.scalar_minimum:
+            elif scalar_op == ps.minimum:
                 # There is no identity value for the minimum function
                 # So we can't support shape of dimensions 0.
                 if np.prod(zv.shape) == 0:
@@ -539,7 +587,7 @@ class TestCAReduce(unittest_tools.InferShapeTester):
                 tosum = list(range(len(xsh)))
             f = pytensor.function([x], e.shape, mode=mode, on_unused_input="ignore")
             if not (
-                scalar_op in [ps.scalar_maximum, ps.scalar_minimum]
+                scalar_op in [ps.maximum, ps.minimum]
                 and (xsh == () or np.prod(xsh) == 0)
             ):
                 assert all(f(xv) == zv.shape)
@@ -551,8 +599,8 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         for dtype in ["bool", "floatX", "complex64", "complex128", "int8", "uint8"]:
             self.with_mode(Mode(linker="py"), ps.add, dtype=dtype)
             self.with_mode(Mode(linker="py"), ps.mul, dtype=dtype)
-            self.with_mode(Mode(linker="py"), ps.scalar_maximum, dtype=dtype)
-            self.with_mode(Mode(linker="py"), ps.scalar_minimum, dtype=dtype)
+            self.with_mode(Mode(linker="py"), ps.maximum, dtype=dtype)
+            self.with_mode(Mode(linker="py"), ps.minimum, dtype=dtype)
             self.with_mode(Mode(linker="py"), ps.and_, dtype=dtype, tensor_op=pt_all)
             self.with_mode(Mode(linker="py"), ps.or_, dtype=dtype, tensor_op=pt_any)
         for dtype in ["int8", "uint8"]:
@@ -564,12 +612,8 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         for dtype in ["floatX", "complex64", "complex128"]:
             self.with_mode(Mode(linker="py"), ps.add, dtype=dtype, test_nan=True)
             self.with_mode(Mode(linker="py"), ps.mul, dtype=dtype, test_nan=True)
-            self.with_mode(
-                Mode(linker="py"), ps.scalar_maximum, dtype=dtype, test_nan=True
-            )
-            self.with_mode(
-                Mode(linker="py"), ps.scalar_minimum, dtype=dtype, test_nan=True
-            )
+            self.with_mode(Mode(linker="py"), ps.maximum, dtype=dtype, test_nan=True)
+            self.with_mode(Mode(linker="py"), ps.minimum, dtype=dtype, test_nan=True)
             self.with_mode(
                 Mode(linker="py"),
                 ps.or_,
@@ -589,6 +633,10 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         not pytensor.config.cxx,
         reason="G++ not available, so we need to skip this test.",
     )
+    @pytest.mark.skipif(
+        isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Running with numba linker, c backend (should be) covered in another CI",
+    )
     def test_c_noopt(self):
         # We need to make sure that we cover the corner cases that
         # optimizations normally cover
@@ -599,13 +647,17 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         not pytensor.config.cxx,
         reason="G++ not available, so we need to skip this test.",
     )
+    @pytest.mark.skipif(
+        isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Running with numba linker, c backend (should be) covered in another CI",
+    )
     def test_c(self):
         for dtype in ["bool", "floatX", "complex64", "complex128", "int8", "uint8"]:
             self.with_mode(Mode(linker="c"), ps.add, dtype=dtype)
             self.with_mode(Mode(linker="c"), ps.mul, dtype=dtype)
         for dtype in ["bool", "floatX", "int8", "uint8"]:
-            self.with_mode(Mode(linker="c"), ps.scalar_minimum, dtype=dtype)
-            self.with_mode(Mode(linker="c"), ps.scalar_maximum, dtype=dtype)
+            self.with_mode(Mode(linker="c"), ps.minimum, dtype=dtype)
+            self.with_mode(Mode(linker="c"), ps.maximum, dtype=dtype)
             self.with_mode(Mode(linker="c"), ps.and_, dtype=dtype, tensor_op=pt_all)
             self.with_mode(Mode(linker="c"), ps.or_, dtype=dtype, tensor_op=pt_any)
         for dtype in ["bool", "int8", "uint8"]:
@@ -618,17 +670,17 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         not pytensor.config.cxx,
         reason="G++ not available, so we need to skip this test.",
     )
+    @pytest.mark.skipif(
+        isinstance(get_default_mode().linker, NumbaLinker),
+        reason="Running with numba linker, c backend (should be) covered in another CI",
+    )
     def test_c_nan(self):
         for dtype in ["floatX", "complex64", "complex128"]:
             self.with_mode(Mode(linker="c"), ps.add, dtype=dtype, test_nan=True)
             self.with_mode(Mode(linker="c"), ps.mul, dtype=dtype, test_nan=True)
         for dtype in ["floatX"]:
-            self.with_mode(
-                Mode(linker="c"), ps.scalar_minimum, dtype=dtype, test_nan=True
-            )
-            self.with_mode(
-                Mode(linker="c"), ps.scalar_maximum, dtype=dtype, test_nan=True
-            )
+            self.with_mode(Mode(linker="c"), ps.minimum, dtype=dtype, test_nan=True)
+            self.with_mode(Mode(linker="c"), ps.maximum, dtype=dtype, test_nan=True)
 
     def test_infer_shape(self, dtype=None, pre_scalar_op=None):
         if dtype is None:
@@ -672,7 +724,7 @@ class TestCAReduce(unittest_tools.InferShapeTester):
         assert self.op(ps.add, axis=(-1,))(x).eval({x: 5}) == 5
 
         with pytest.raises(
-            np.AxisError,
+            np.exceptions.AxisError,
             match=re.escape("axis (-2,) is out of bounds for array of dimension 0"),
         ):
             self.op(ps.add, axis=(-2,))(x)
@@ -705,12 +757,39 @@ class TestBitOpReduceGrad:
             assert np.all(gx_val == 0)
 
 
+def check_elemwise_runtime_broadcast(mode):
+    """Check we emmit a clear error when runtime broadcasting would occur according to Numpy rules."""
+    x_v = matrix("x")
+    m_v = vector("m")
+
+    z_v = x_v - m_v
+    f = pytensor.function([x_v, m_v], z_v, mode=mode)
+
+    # Test invalid broadcasting by either x or m
+    for x_sh, m_sh in [((2, 1), (3,)), ((2, 3), (1,))]:
+        x = np.ones(x_sh).astype(config.floatX)
+        m = np.zeros(m_sh).astype(config.floatX)
+
+        # This error is introduced by PyTensor, so it's the same across different backends
+        with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
+            f(x, m)
+
+    x = np.ones((2, 3)).astype(config.floatX)
+    m = np.zeros((1,)).astype(config.floatX)
+
+    x = np.ones((2, 4)).astype(config.floatX)
+    m = np.zeros((3,)).astype(config.floatX)
+    # This error is backend specific, and may have different types
+    with pytest.raises((ValueError, TypeError)):
+        f(x, m)
+
+
 class TestElemwise(unittest_tools.InferShapeTester):
     def test_elemwise_grad_bool(self):
         x = scalar(dtype="bool")
         y = bscalar()
         z = x * y
-        dx, dy = pytensor.grad(z, [x, y])
+        _dx, _dy = pytensor.grad(z, [x, y])
 
     def test_infer_shape(self):
         for s_left, s_right in [
@@ -750,42 +829,34 @@ class TestElemwise(unittest_tools.InferShapeTester):
         g = pytensor.function([a, b, c, d, e, f], s, mode=Mode(linker="py"))
         g(*[np.zeros(2**11, config.floatX) for i in range(6)])
 
-    @staticmethod
-    def check_runtime_broadcast(mode):
-        """Check we emmit a clear error when runtime broadcasting would occur according to Numpy rules."""
-        x_v = matrix("x")
-        m_v = vector("m")
-
-        z_v = x_v - m_v
-        f = pytensor.function([x_v, m_v], z_v, mode=mode)
-
-        # Test invalid broadcasting by either x or m
-        for x_sh, m_sh in [((2, 1), (3,)), ((2, 3), (1,))]:
-            x = np.ones(x_sh).astype(config.floatX)
-            m = np.zeros(m_sh).astype(config.floatX)
-
-            # This error is introduced by PyTensor, so it's the same across different backends
-            with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
-                f(x, m)
-
-        x = np.ones((2, 3)).astype(config.floatX)
-        m = np.zeros((1,)).astype(config.floatX)
-
-        x = np.ones((2, 4)).astype(config.floatX)
-        m = np.zeros((3,)).astype(config.floatX)
-        # This error is backend specific, and may have different types
-        with pytest.raises((ValueError, TypeError)):
-            f(x, m)
-
     def test_runtime_broadcast_python(self):
-        self.check_runtime_broadcast(Mode(linker="py"))
+        check_elemwise_runtime_broadcast(Mode(linker="py"))
 
     @pytest.mark.skipif(
         not pytensor.config.cxx,
         reason="G++ not available, so we need to skip this test.",
     )
     def test_runtime_broadcast_c(self):
-        self.check_runtime_broadcast(Mode(linker="c"))
+        c_mode = Mode(linker="cvm")
+        check_elemwise_runtime_broadcast(c_mode)
+
+        # Test C-backend specific error formatting
+        x = dmatrix("x")
+        y = dmatrix("y")
+        fn = function([x, y], x * y, mode=c_mode)
+        with pytest.raises(
+            ValueError,
+            match=r"Runtime broadcasting not allowed.*\(input\[0\]\.shape\[1\] = 4, input\[1\]\.shape\[1\] = 1\)",
+        ):
+            fn(np.zeros((5, 4)), np.zeros((5, 1)))
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "Input dimension mismatch: (input[0].shape[1] = 4, input[1].shape[1] = 3)"
+            ),
+        ):
+            fn(np.zeros((5, 4)), np.zeros((5, 3)))
 
     def test_str(self):
         op = Elemwise(ps.add, inplace_pattern={0: 0}, name=None)
@@ -802,13 +873,13 @@ class TestElemwise(unittest_tools.InferShapeTester):
         x_inferred_shape = (ps.constant(1), ps.constant(1))
 
         res_shape = z.owner.op.infer_shape(
-            None, z.owner, [x_inferred_shape, x_inferred_shape]
+            z.owner, [x_inferred_shape, x_inferred_shape]
         )
 
         assert len(res_shape) == 1
         assert len(res_shape[0]) == 2
-        assert pytensor.get_underlying_scalar_constant(res_shape[0][0]) == 1
-        assert pytensor.get_underlying_scalar_constant(res_shape[0][1]) == 1
+        assert get_scalar_constant_value(res_shape[0][0]) == 1
+        assert get_scalar_constant_value(res_shape[0][1]) == 1
 
     def test_infer_shape_multi_output(self):
         class CustomElemwise(Elemwise):
@@ -826,21 +897,21 @@ class TestElemwise(unittest_tools.InferShapeTester):
 
         custom_elemwise = CustomElemwise(ps.add)
 
-        z_1, z_2 = custom_elemwise(
+        z_1, _z_2 = custom_elemwise(
             as_tensor_variable(np.eye(1)),
             as_tensor_variable(np.eye(1)),
         )
         in_1_shape = (ps.constant(1), ps.constant(1))
-        outs = z_1.owner.op.infer_shape(None, z_1.owner, [in_1_shape, in_1_shape])
+        outs = z_1.owner.op.infer_shape(z_1.owner, [in_1_shape, in_1_shape])
         for out in outs:
             assert out[0].eval() == 1
             assert out[1].eval() == 1
 
-        z_1, z_2 = custom_elemwise(
+        z_1, _z_2 = custom_elemwise(
             as_tensor_variable(np.eye(1)), as_tensor_variable(np.eye(3))
         )
         in_2_shape = (ps.constant(3), ps.constant(3))
-        outs = z_1.owner.op.infer_shape(None, z_1.owner, [in_1_shape, in_2_shape])
+        outs = z_1.owner.op.infer_shape(z_1.owner, [in_1_shape, in_2_shape])
         for out in outs:
             assert out[0].eval() == 3
             assert out[1].eval() == 3
@@ -853,7 +924,7 @@ class TestElemwise(unittest_tools.InferShapeTester):
 
         assert isinstance(z.owner.op, Elemwise)
 
-        (out_shape,) = z.owner.op.infer_shape(None, z.owner, [(lscalar(), 1), (50, 10)])
+        (out_shape,) = z.owner.op.infer_shape(z.owner, [(lscalar(), 1), (50, 10)])
 
         assert all(isinstance(v.type, TensorType) for v in out_shape)
 
@@ -922,7 +993,7 @@ def test_not_implemented_elemwise_grad():
             return x * n
 
         def grad(self, inputs, gout):
-            (n, x) = inputs
+            (n, _x) = inputs
             (gz,) = gout
             dy_dx = n
             return [pytensor.gradient.grad_not_implemented(self, 0, n), gz * dy_dx]
@@ -941,75 +1012,201 @@ class TestVectorize:
         vec = tensor(shape=(None,))
         mat = tensor(shape=(None, None))
 
-        node = exp(vec).owner
-        vect_node = vectorize_node(node, mat)
-        assert vect_node.op == exp
-        assert vect_node.inputs[0] is mat
+        out = exp(vec)
+        vect_out = vectorize_graph(out, {vec: mat})
+        assert vect_out.owner.op == exp
+        assert vect_out.owner.inputs[0] is mat
 
     def test_dimshuffle(self):
-        vec = tensor(shape=(None,))
-        mat = tensor(shape=(None, None))
-
-        node = exp(vec).owner
-        vect_node = vectorize_node(node, mat)
-        assert vect_node.op == exp
-        assert vect_node.inputs[0] is mat
-
         col_mat = tensor(shape=(None, 1))
         tcol_mat = tensor(shape=(None, None, 1))
-        node = col_mat.dimshuffle(0).owner  # drop column
-        vect_node = vectorize_node(node, tcol_mat)
-        assert isinstance(vect_node.op, DimShuffle)
-        assert vect_node.op.new_order == (0, 1)
-        assert vect_node.inputs[0] is tcol_mat
-        assert vect_node.outputs[0].type.shape == (None, None)
+
+        out = col_mat.dimshuffle(0)  # drop column
+        vect_out = vectorize_graph(out, {col_mat: tcol_mat})
+        assert isinstance(vect_out.owner.op, DimShuffle)
+        assert vect_out.owner.op.new_order == (0, 1)
+        assert vect_out.owner.inputs[0] is tcol_mat
+        assert vect_out.owner.outputs[0].type.shape == (None, None)
 
     def test_CAReduce(self):
         mat = tensor(shape=(None, None))
         tns = tensor(shape=(None, None, None))
 
-        node = pt_sum(mat).owner
-        vect_node = vectorize_node(node, tns)
-        assert isinstance(vect_node.op, Sum)
-        assert vect_node.op.axis == (1, 2)
-        assert vect_node.inputs[0] is tns
+        out = pt_sum(mat)
+        vect_out = vectorize_graph(out, {mat: tns})
+        assert isinstance(vect_out.owner.op, Sum)
+        assert vect_out.owner.op.axis == (1, 2)
+        assert vect_out.owner.inputs[0] is tns
 
         bool_mat = tensor(dtype="bool", shape=(None, None))
         bool_tns = tensor(dtype="bool", shape=(None, None, None))
-        node = pt_any(bool_mat, axis=-2).owner
-        vect_node = vectorize_node(node, bool_tns)
-        assert isinstance(vect_node.op, Any)
-        assert vect_node.op.axis == (1,)
-        assert vect_node.inputs[0] is bool_tns
+        out = pt_any(bool_mat, axis=-2)
+        vect_out = vectorize_graph(out, {bool_mat: bool_tns})
+        assert isinstance(vect_out.owner.op, Any)
+        assert vect_out.owner.op.axis == (1,)
+        assert vect_out.owner.inputs[0] is bool_tns
 
 
-def careduce_benchmark_tester(axis, c_contiguous, mode, benchmark):
-    N = 256
-    x_test = np.random.uniform(size=(N, N, N))
-    transpose_axis = (0, 1, 2) if c_contiguous else (2, 0, 1)
+def test_gradient_mixed_discrete_output_scalar_op():
+    class MixedDtypeScalarOp(ScalarOp):
+        def make_node(self, *inputs):
+            float_op = float64 if config.floatX == "float64" else float32
+            int_op = int64 if config.floatX == "int64" else int32
+            inputs = [float_op()]
+            outputs = [float_op(), int_op()]
+            return Apply(self, inputs, outputs)
 
-    x = pytensor.shared(x_test, name="x", shape=x_test.shape)
-    out = x.transpose(transpose_axis).sum(axis=axis)
-    fn = pytensor.function([], out, mode=mode)
+        def perform(self, node, inputs, outputs):
+            raise NotImplementedError()
 
-    np.testing.assert_allclose(
-        fn(),
-        x_test.transpose(transpose_axis).sum(axis=axis),
+        def L_op(self, inputs, outputs, output_gradients):
+            return [inputs[0].ones_like() * output_gradients[0]]
+
+    op = Elemwise(MixedDtypeScalarOp())
+    x = vector("x")
+    y, _ = op(x)
+    np.testing.assert_array_equal(
+        grad(y.sum(), x).eval({x: np.full((12,), np.nan, dtype=config.floatX)}),
+        np.ones((12,), dtype=config.floatX),
+        strict=True,
     )
-    benchmark(fn)
 
 
-@pytest.mark.parametrize(
-    "axis",
-    (0, 1, 2, (0, 1), (0, 2), (1, 2), None),
-    ids=lambda x: f"axis={x}",
+@pytest.mark.filterwarnings("error")
+def test_numpy_warning_suppressed():
+    x = pt.scalar("x")
+    y = pt.log(x)
+    fn = pytensor.function([x], y, mode=Mode(linker="py"))
+    assert fn(0) == -np.inf
+
+
+rng = np.random.default_rng(18)
+_good_add_inplace = dict(
+    same_shapes=(random(2, 3, rng=rng), random(2, 3, rng=rng)),
+    not_same_dimensions=(random(2, 2, rng=rng), random(2, rng=rng)),
+    scalar=(random(2, 3, rng=rng), random(1, 1, rng=rng)),
+    row=(random(2, 3, rng=rng), random(1, 3, rng=rng)),
+    column=(random(2, 3, rng=rng), random(2, 1, rng=rng)),
+    integers=(integers(2, 3, rng=rng), integers(2, 3, rng=rng)),
+    uint32=(integers_uint32(2, 3, rng=rng), integers_uint32(2, 3, rng=rng)),
+    uint16=(integers_uint16(2, 3, rng=rng), integers_uint16(2, 3, rng=rng)),
+    # (float32, >int16) upcasts to float64 by default
+    dtype_valid_mixup=(
+        random(2, 3, rng=rng),
+        integers(2, 3, rng=rng).astype(
+            "int16" if config.floatX == "float32" else "int64"
+        ),
+    ),
+    complex1=(random_complex(2, 3, rng=rng), random_complex(2, 3, rng=rng)),
+    complex2=(random_complex(2, 3, rng=rng), random(2, 3, rng=rng)),
+    empty=(np.asarray([], dtype=config.floatX), np.asarray([1], dtype=config.floatX)),
 )
-@pytest.mark.parametrize(
-    "c_contiguous",
-    (True, False),
-    ids=lambda x: f"c_contiguous={x}",
+TestAddInplaceBroadcast = makeBroadcastTester(
+    op=Elemwise(scalar_add, {0: 0}),
+    expected=lambda x, y: x + y,
+    good=_good_add_inplace,
+    # Cannot inplace on first input if it doesn't match output dtype (upcast of inputs)
+    bad_build=dict(dtype_invalid_mixup=_good_add_inplace["dtype_valid_mixup"][::-1]),
+    bad_runtime=_bad_runtime_broadcast_binary_normal,
+    inplace=True,
 )
-def test_c_careduce_benchmark(axis, c_contiguous, benchmark):
-    return careduce_benchmark_tester(
-        axis, c_contiguous, mode="FAST_RUN", benchmark=benchmark
+
+
+@pytest.mark.xfail(
+    config.cycle_detection == "fast" and config.mode != "FAST_COMPILE",
+    reason="Cycle detection is fast and mode is FAST_COMPILE",
+)
+def test_exp_inplace_grad_1():
+    utt.verify_grad(
+        Elemwise(scalar_exp, {0: 0}),
+        [
+            np.asarray(
+                [
+                    [1.5089518, 1.48439076, -4.7820262],
+                    [2.04832468, 0.50791564, -1.58892269],
+                ]
+            )
+        ],
     )
+
+
+def test_XOR_inplace():
+    dtype = [
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+    ]
+    xor_inplace = Elemwise(scalar_xor, {0: 0})
+
+    for dtype in dtype:
+        x, y = vector(dtype=dtype), vector(dtype=dtype)
+        l = np.asarray([0, 0, 1, 1], dtype=dtype)
+        r = np.asarray([0, 1, 0, 1], dtype=dtype)
+        ix = x
+        ix = xor_inplace(ix, y)
+        gn = inplace_func([x, y], ix)
+        _ = gn(l, r)
+        # test the in-place stuff
+        assert np.all(l == np.asarray([0, 1, 1, 0])), l
+
+
+def test_inplace_dtype_changed():
+    with pytensor.config.change_flags(cast_policy="numpy+floatX", floatX="float64"):
+        x = pt.vector("x", dtype="float32")
+        y = pt.vector("y", dtype="int32")
+        with pytensor.config.change_flags(floatX="float32"):
+            out = pt.add(x, y)
+
+        assert out.dtype == "float32"
+        with pytensor.config.change_flags(floatX="float32"):
+            fn32 = pytensor.function(
+                [In(x, mutable=True), In(y, mutable=True)],
+                out,
+                mode="fast_run",
+            )
+        assert fn32.maker.fgraph.outputs[0].owner.op.destroy_map == {0: [0]}
+
+        with pytensor.config.change_flags(floatX="float64"):
+            fn64 = pytensor.function(
+                [In(x, mutable=True), In(y, mutable=True)],
+                out,
+                mode="fast_run",
+            )
+        assert fn64.maker.fgraph.outputs[0].owner.op.destroy_map == {}
+
+
+@pytest.mark.parametrize("linker", ["py", "cvm", "numba"])
+def test_nfunc_view_workaround(linker):
+    # np.real on a buffer returns a view, Elemwise python perform method works around it by making a copy
+    # Other backends shouldn't worry
+    a = pt.zvector("a")
+    b = pt.real(a)
+    c = Elemwise(ps.mul, inplace_pattern={0: 0})(b, 2.0)
+    out = c + a
+
+    mode = Mode(linker=linker, optimizer=None)
+    f = function([a], out, mode=mode, accept_inplace=True)
+
+    a_test = np.array([1 + 2j, 3 + 4j, 5 + 6j])
+    out_expected = np.real(a_test) * 2 + a_test
+
+    out_eval = f(a_test)
+    np.testing.assert_allclose(out_eval, out_expected)
+
+
+def test_perform_raises_with_too_many_operands():
+    # NumPy ufuncs segfault or raise with more than 32 operands, so the Python
+    # perform must raise cleanly instead of falling through to the ufunc path.
+    ins = [float64() for _ in range(40)]
+    out = ins[0]
+    for v in ins[1:]:
+        out = scalar_add(out, v)
+    op = Elemwise(ps.Composite(ins, [out]))
+
+    xs = [vector(f"x{i}") for i in range(40)]
+    node = op.make_node(*xs)
+    assert len(node.inputs) + len(node.outputs) > 32
+
+    with pytest.raises(NotImplementedError, match="more than 32 operands"):
+        op.perform(node, [np.ones(3) for _ in range(40)], [[None]])

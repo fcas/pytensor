@@ -9,17 +9,14 @@ from numpy.testing import assert_array_almost_equal
 import pytensor
 import pytensor.scalar as ps
 import pytensor.tensor as pt
-import pytensor.tensor.blas_scipy
-from pytensor.compile.function import function
 from pytensor.compile.io import In
-from pytensor.compile.mode import Mode
+from pytensor.compile.maker import function
+from pytensor.compile.mode import Mode, get_mode
 from pytensor.compile.sharedvalue import shared
 from pytensor.configdefaults import config
 from pytensor.gradient import grad
-from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import in2out
 from pytensor.graph.utils import InconsistencyError
-from pytensor.tensor import inplace
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.blas import (
     BatchedDot,
@@ -28,14 +25,9 @@ from pytensor.tensor.blas import (
     Gemm,
     Gemv,
     Ger,
-    _as_scalar,
+    _batched_dot,
     _dot22,
     _dot22scalar,
-    _factor_canonicalized,
-    _gemm_canonicalize,
-    _is_real_matrix,
-    batched_dot,
-    batched_tensordot,
     gemm,
     gemm_inplace,
     gemm_no_inplace,
@@ -44,19 +36,16 @@ from pytensor.tensor.blas import (
     gemv_no_inplace,
     ger,
     ger_destructive,
-    res_is_a,
 )
 from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import Dot, dot, mean, mul, neg, outer, sigmoid, sqrt
+from pytensor.tensor.math import Dot, dot, mean, mul, outer, sigmoid
 from pytensor.tensor.rewriting.blas import local_dot22_to_dot22scalar, local_gemm_to_ger
 from pytensor.tensor.type import (
     cmatrix,
-    col,
     cscalar,
     dmatrix,
     drow,
     dscalar,
-    dvector,
     fmatrix,
     fscalar,
     imatrix,
@@ -65,12 +54,10 @@ from pytensor.tensor.type import (
     ivector,
     matrices,
     matrix,
-    row,
     scalar,
     scalars,
     tensor,
     tensor3,
-    tensor4,
     vector,
     vectors,
     zmatrix,
@@ -81,15 +68,7 @@ from tests import unittest_tools as utt
 from tests.tensor.utils import inplace_func, makeTester, random
 
 
-if config.mode == "FAST_COMPILE":
-    mode_not_fast_compile = "FAST_RUN"
-else:
-    mode_not_fast_compile = config.mode
-
-mode_blas_opt = pytensor.compile.get_default_mode().including(
-    "BlasOpt", "specialize", "InplaceBlasOpt"
-)
-mode_blas_opt = mode_blas_opt.excluding("c_blas")
+mode_blas_opt = get_mode("CVM").excluding("c_blas")
 
 
 def test_dot_eq():
@@ -224,7 +203,7 @@ class TestGemm:
         f = function(
             [a, b],
             updates=[(s, lr1 * dot(a, b) + l2_reg * lr2 * s)],
-            mode=mode_not_fast_compile,
+            mode="CVM",
         ).maker.fgraph.toposort()
         # [Gemm{inplace}(<TensorType(float64, matrix)>, 0.01,
         # <TensorType(float64, matrix)>, <TensorType(float64, matrix)>,
@@ -236,7 +215,7 @@ class TestGemm:
         f = function(
             [a, b],
             updates=[(s, lr1 * (dot(a, b) - l2_reg * s))],
-            mode=mode_not_fast_compile,
+            mode="CVM",
         ).maker.fgraph.toposort()
         # [Gemm{inplace}(<TensorType(float64, matrix)>, 0.01,
         # <TensorType(float64, matrix)>, <TensorType(float64, matrix)>,
@@ -248,7 +227,7 @@ class TestGemm:
         f = function(
             [a, b],
             updates=[(s, s - lr1 * (s * 0.0002 + dot(a, b)))],
-            mode=mode_not_fast_compile,
+            mode="CVM",
         ).maker.fgraph.toposort()
         # [Gemm{inplace}(<TensorType(float64, matrix)>, -0.01,
         # <TensorType(float64, matrix)>, <TensorType(float64, matrix)>,
@@ -268,16 +247,20 @@ class TestGemm:
         rng = np.random.default_rng(seed=utt.fetch_seed())
         Z = as_tensor_variable(rng.random((2, 2)))
         A = as_tensor_variable(rng.random((2, 2)))
+        Zt = Z.transpose()
+        assert isinstance(Zt.owner.op, DimShuffle) and Zt.owner.op.view_map == {0: [0]}
         with pytest.raises(InconsistencyError, match=Gemm.E_z_uniq):
-            gemm_inplace(Z, 1.0, A, inplace.transpose_inplace(Z), 1.0)
+            gemm_inplace(Z, 1.0, A, Zt, 1.0)
 
     def test_destroy_map2(self):
         # test that only first input can be overwritten.
         rng = np.random.default_rng(seed=utt.fetch_seed())
         Z = as_tensor_variable(rng.random((2, 2)))
         A = as_tensor_variable(rng.random((2, 2)))
+        Zt = Z.transpose()
+        assert isinstance(Zt.owner.op, DimShuffle) and Zt.owner.op.view_map == {0: [0]}
         with pytest.raises(InconsistencyError, match=Gemm.E_z_uniq):
-            gemm_inplace(Z, 1.0, inplace.transpose_inplace(Z), A, 1.0)
+            gemm_inplace(Z, 1.0, Zt, A, 1.0)
 
     def test_destroy_map3(self):
         # test that only first input can be overwritten
@@ -454,7 +437,11 @@ class TestGemmNoFlags:
         B1 = self.get_variable(B, transpose_B, slice_B)
         C1 = self.get_variable(C, transpose_C, slice_C)
 
-        return function([alpha, A, B, beta, C], self.gemm(C1, alpha, A1, B1, beta))
+        return function(
+            [alpha, A, B, beta, C],
+            self.gemm(C1, alpha, A1, B1, beta),
+            mode=mode_blas_opt,
+        )
 
     def generate_value(self, dtype, width, height, to_transpose, to_slice, rng):
         if to_slice:
@@ -572,67 +559,6 @@ class TestGemmNoFlags:
             self.run_gemm(dtype, alpha, beta, tA, tB, tC, sA, sB, sC, rng)
 
 
-def test_res_is_a():
-    X, Y, Z, a, b = XYZab()
-
-    assert not res_is_a(None, a, sqrt)
-    assert not res_is_a(None, a + a, sqrt)
-    assert res_is_a(None, sqrt(a + a), sqrt)
-
-    sqrt_term = sqrt(a + a)
-    fg = FunctionGraph([a], [2 * sqrt_term], clone=False)
-    assert res_is_a(fg, sqrt_term, sqrt, 2)
-    assert not res_is_a(fg, sqrt_term, sqrt, 0)
-
-
-class TestAsScalar:
-    def test_basic(self):
-        # Test that it works on scalar constants
-        a = pt.constant(2.5)
-        b = pt.constant(np.asarray([[[0.5]]]))
-        b2 = b.dimshuffle()
-        assert b2.ndim == 0
-        d_a = DimShuffle(input_ndim=0, new_order=[])(a)
-        d_b = DimShuffle(input_ndim=3, new_order=[0, 2, 1])(b)
-        d_a2 = DimShuffle(input_ndim=0, new_order=["x", "x", "x"])(a)
-
-        assert _as_scalar(a) == a
-        assert _as_scalar(b) != b
-        assert _as_scalar(d_a) != d_a
-        assert _as_scalar(d_b) != d_b
-        assert _as_scalar(d_a2) != d_a2
-
-    def test_basic_1(self):
-        # Test that it fails on nonscalar constants
-        a = pt.constant(np.ones(5))
-        assert _as_scalar(a) is None
-        assert _as_scalar(DimShuffle(input_ndim=1, new_order=[0, "x"])(a)) is None
-
-    def test_basic_2(self):
-        # Test that it works on scalar variables
-        a = dscalar()
-        d_a = DimShuffle(input_ndim=0, new_order=[])(a)
-        d_a2 = DimShuffle(input_ndim=0, new_order=["x", "x"])(a)
-
-        assert _as_scalar(a) is a
-        assert _as_scalar(d_a) is a
-        assert _as_scalar(d_a2) is a
-
-    def test_basic_3(self):
-        # Test that it fails on nonscalar variables
-        a = matrix()
-        assert _as_scalar(a) is None
-        assert _as_scalar(DimShuffle(input_ndim=2, new_order=[0, "x", 1])(a)) is None
-
-
-class TestRealMatrix:
-    def test_basic(self):
-        assert _is_real_matrix(DimShuffle(input_ndim=2, new_order=[1, 0])(matrix()))
-        assert not _is_real_matrix(
-            DimShuffle(input_ndim=1, new_order=["x", 0])(dvector())
-        )
-
-
 """
 This test suite ensures that Gemm is inserted where it belongs, and
 that the resulting functions compute the same things as the originals.
@@ -650,14 +576,14 @@ def just_gemm(i, o, ishapes=None, max_graphlen=0, expected_nb_gemm=1):
     f = inplace_func(
         [In(ii, mutable=True, allow_downcast=True) for ii in i],
         o,
-        mode="FAST_RUN",
+        mode=mode_blas_opt,
         on_unused_input="ignore",
     )
     nb_gemm = 0
     for node in f.maker.fgraph.apply_nodes:
-        assert not isinstance(
-            node.op, Dot
-        ), "_dot22 not changed to gemm_inplace in graph"
+        assert not isinstance(node.op, Dot), (
+            "_dot22 not changed to gemm_inplace in graph"
+        )
         assert node.op != _dot22
         if node.op == gemm_inplace:
             nb_gemm += 1
@@ -673,9 +599,9 @@ def just_gemm(i, o, ishapes=None, max_graphlen=0, expected_nb_gemm=1):
         assert node.op != gemm_inplace, "gemm_inplace in original graph"
 
     graphlen = len(f.maker.fgraph.toposort())
-    assert not (
-        max_graphlen and (graphlen <= max_graphlen)
-    ), f"graphlen={graphlen}>{max_graphlen}"
+    assert not (max_graphlen and (graphlen <= max_graphlen)), (
+        f"graphlen={graphlen}>{max_graphlen}"
+    )
 
     rng = np.random.default_rng(unittest_tools.fetch_seed(234))
     r0 = f(*[np.asarray(rng.standard_normal(sh), config.floatX) for sh in ishapes])
@@ -747,7 +673,7 @@ def test_gemm_opt_double_gemm():
     f = inplace_func(
         [In(ii, mutable=True) for ii in i],
         o,
-        mode="FAST_RUN",
+        mode=mode_blas_opt,
         on_unused_input="ignore",
     )
     for node in f.maker.fgraph.apply_nodes:
@@ -772,78 +698,6 @@ def test_gemm_opt_double_gemm():
     if config.floatX == "float32":
         eps = 2.0e-6
     assert max_abs_err <= eps, "GEMM is computing the wrong output. max_rel_err ="
-
-
-def test_gemm_canonicalize():
-    X, Y, Z, a, b = (
-        matrix("X"),
-        matrix("Y"),
-        matrix("Z"),
-        scalar("a"),
-        scalar("b"),
-    )
-    c, d = scalar("c"), scalar("d")
-    u = row("u")
-    v = vector("v")
-    w = col("w")
-
-    can = []
-    fg = FunctionGraph([X, Y, Z], [X + Y + Z], clone=False)
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    assert can == [(1.0, X), (1.0, Y), (1.0, Z)]
-
-    can = []
-    fg = FunctionGraph([X, Y, u], [X + Y + u], clone=False)
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    assert can == [(1.0, X), (1.0, Y), (1.0, u)], can
-
-    can = []
-    fg = FunctionGraph([X, Y, v], [X + Y + v], clone=False)
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    # [(1.0, X), (1.0, Y), (1.0, InplaceDimShuffle{x,0}(v))]
-    assert can[:2] == [(1.0, X), (1.0, Y)]
-    assert isinstance(can[2], tuple)
-    assert len(can[2]) == 2
-    assert can[2][0] == 1.0
-    assert can[2][1].owner
-    assert isinstance(can[2][1].owner.op, DimShuffle)
-    assert can[2][1].owner.inputs == [v]
-
-    can = []
-    fg = FunctionGraph([X, Y, w], [X + Y + w], clone=False)
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    assert can == [(1.0, X), (1.0, Y), (1.0, w)], can
-
-    can = []
-    fg = FunctionGraph([a, X, Y, b, Z, c], [a * X + Y - b * Z * c], clone=False)
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    assert can[0] == (a, X)
-    assert can[1] == (1.0, Y)
-    assert can[2][0].owner.op == mul
-    assert can[2][0].owner.inputs[0].owner.op == neg
-    assert can[2][0].owner.inputs[0].owner.inputs[0] == c
-    assert can[2][0].owner.inputs[1] == b
-
-    can = []
-    fg = FunctionGraph(
-        [a, X, Y, b, Z, c, d], [(-d) * X - (a * X + Y - b * Z * c)], clone=False
-    )
-    _gemm_canonicalize(fg, fg.outputs[0], 1.0, can, 0)
-    assert can[0][0].owner.op == neg
-    assert can[0][0].owner.inputs[0] == d
-    assert can[0][1] == X
-    assert can[1][0].owner.op == neg
-    assert can[1][0].owner.inputs[0] == a
-    assert can[2] == (-1.0, Y)
-    assert can[3][0].owner.op == mul
-    assert can[3][0].owner.inputs == [c, b]
-
-
-def test_gemm_factor():
-    X, Y = matrix("X"), matrix("Y")
-
-    assert [(1.0, X), (1.0, Y)] == _factor_canonicalized([(1.0, X), (1.0, Y)])
-    assert [(2.0, X)] == _factor_canonicalized([(1.0, X), (1.0, X)])
 
 
 def test_upcasting_scalar_nogemm():
@@ -957,10 +811,10 @@ def test_gemm_opt_vector_stuff():
     X, Y, a = matrix(), matrix(), scalar()
     u, v = vector(), vector()
 
-    f = inplace_func([a, u, v], a + dot(u, v), mode="FAST_RUN")
+    f = inplace_func([a, u, v], a + dot(u, v), mode=mode_blas_opt)
     assert gemm_inplace not in [n.op for n in f.maker.fgraph.apply_nodes]
 
-    f = inplace_func([a, u, X, Y], a * u + dot(X, Y), mode="FAST_RUN")
+    f = inplace_func([a, u, X, Y], a * u + dot(X, Y), mode=mode_blas_opt)
     assert gemm_inplace not in [n.op for n in f.maker.fgraph.apply_nodes]
 
 
@@ -1025,7 +879,7 @@ def test_inplace0():
     )
     R, S, c = matrix("R"), matrix("S"), scalar("c")
 
-    f = inplace_func([Z, b, R, S], [Z * (Z + b * dot(R, S).T)], mode="FAST_RUN")
+    f = inplace_func([Z, b, R, S], [Z * (Z + b * dot(R, S).T)], mode=mode_blas_opt)
     assert gemm_inplace not in [n.op for n in f.maker.fgraph.apply_nodes]
     assert gemm_no_inplace in [n.op for n in f.maker.fgraph.apply_nodes]
 
@@ -1033,15 +887,15 @@ def test_inplace0():
     f = inplace_func(
         [X, Y, Z, a, b, R, S, c],
         [Z * (c * Z + a * dot(X, Y) + b * dot(R, S).T)],
-        mode="FAST_RUN",
+        mode=mode_blas_opt,
     )
     assert gemm_inplace in [n.op for n in f.maker.fgraph.apply_nodes]
 
 
 def test_inplace1():
-    X, Y, Z, a, b = XYZab()
+    X, Y, Z, _a, _b = XYZab()
     # with > 2 terms in the overall addition
-    f = inplace_func([X, Y, Z], [Z + Z + dot(X, Y)], mode="FAST_RUN")
+    f = inplace_func([X, Y, Z], [Z + Z + dot(X, Y)], mode=mode_blas_opt)
     # pytensor.printing.debugprint(f)
     # it doesn't work inplace because we didn't mark Z as mutable input
     assert [n.op for n in f.maker.fgraph.apply_nodes] == [gemm_no_inplace]
@@ -1080,6 +934,16 @@ def test_gemm_broadcasting(inplace, linker):
         np.testing.assert_allclose(
             f(z_v, x_v, y_v, 1, 1), z_v_np + np.dot(x_v, y_v), atol=2e-6
         )
+
+
+def test_gemm_static_shape():
+    # `z` broadcasts up to `dot(x, y)`, so a broadcastable `z` must not leak
+    # its size-1 static shape into the output.
+    a, b = scalars("a", "b")
+    z = matrix("z", shape=(1, 1))
+    x = matrix("x", shape=(5, 4))
+    y = matrix("y", shape=(4, 3))
+    assert gemm_no_inplace(z, a, x, y, b).type.shape == (5, 3)
 
 
 def test_dot22():
@@ -1258,7 +1122,7 @@ def test_dot22scalar_cast():
 def test_local_dot22_to_dot22scalar():
     # This test that the bug in gh-1507 is really fixed
     A = dmatrix()
-    mode = pytensor.compile.mode.get_default_mode()
+    mode = get_mode("CVM")
     opt = in2out(local_dot22_to_dot22scalar)
     mode = mode.__class__(optimizer=opt)
 
@@ -1498,7 +1362,7 @@ class TestGemv(unittest_tools.OptimizationTestMixin):
         beta = shared(np.asarray(1.0, dtype=config.floatX), name="beta")
 
         z = beta * y + alpha * dot(A, x)
-        f = function([A, x, y], z)
+        f = function([A, x, y], z, mode=mode_blas_opt)
 
         # Matrix value
         A_val = np.ones((5, 3), dtype=config.floatX)
@@ -1581,7 +1445,7 @@ class BaseGemv:
 
     def test_default_beta_y(self):
         vs = self.get_data()
-        alpha_v, beta_v, a_v, x_v, y_v = vs
+        _alpha_v, _beta_v, a_v, x_v, _y_v = vs
         a = shared(a_v)
         x = shared(x_v)
 
@@ -1725,7 +1589,7 @@ class BaseGemv:
         # an incorrect dtype, and forces upcasting of the result
         # We put this test in this class to test it on the gpu too.
         vs = self.get_data()
-        alpha_v, beta_v, a_v, x_v, y_v = vs
+        alpha_v, _beta_v, a_v, x_v, y_v = vs
         alpha_v = alpha_v.astype("float64")
         a_v = a_v.astype("float32")
         x_v = x_v.astype("float32")
@@ -1865,8 +1729,7 @@ class TestGer(unittest_tools.OptimizationTestMixin):
     shared = staticmethod(shared)
 
     def setup_method(self):
-        self.mode = pytensor.compile.get_default_mode().including("fast_run")
-        self.mode = self.mode.excluding("c_blas", "scipy_blas")
+        self.mode = get_mode("cvm").excluding("c_blas", "scipy_blas")
         dtype = self.dtype = "float64"  # optimization isn't dtype-dependent
         self.A = tensor(dtype=dtype, shape=(None, None))
         self.a = tensor(dtype=dtype, shape=())
@@ -2045,17 +1908,9 @@ class TestGer(unittest_tools.OptimizationTestMixin):
     def test_f64_4_5(self):
         return self.given_dtype("float64", 4, 5, destructive=False)
 
-    @pytest.mark.xfail(
-        condition=config.floatX == "float32",
-        reason="GER from complex64 is not introduced in float32 mode",
-    )
     def test_c64_7_1(self):
         return self.given_dtype("complex64", 7, 1)
 
-    @pytest.mark.xfail(
-        raises=AssertionError,
-        reason="Unclear how this test was supposed to work with complex128",
-    )
     def test_c128_1_9(self):
         return self.given_dtype("complex128", 1, 9)
 
@@ -2087,8 +1942,7 @@ class TestGer(unittest_tools.OptimizationTestMixin):
 
 class TestBlasStrides:
     dtype = "float64"
-    mode = pytensor.compile.get_default_mode()
-    mode = mode.including("fast_run").excluding("gpu", "c_blas", "scipy_blas")
+    mode = get_mode("cvm").excluding("c_blas", "scipy_blas")
 
     def random(self, *shape, rng=None):
         return np.asarray(rng.random(shape), dtype=self.dtype)
@@ -2368,8 +2222,10 @@ class TestBlasStrides:
 
                 a.set_value(a_dev.copy()[::a_step], borrow=True)
                 b.set_value(b_dev.copy()[::b_step1, ::b_step2], borrow=True)
+                # Copy as C so that it becomes F after the transpose in the graph
                 b_t.set_value(
-                    np.transpose(b_dev.copy())[::b_step2, ::b_step1], borrow=True
+                    np.transpose(b_dev).copy(order="C")[::b_step2, ::b_step1],
+                    borrow=True,
                 )
                 c.set_value(c_dev.copy()[::c_step], borrow=True)
 
@@ -2386,6 +2242,7 @@ class TestBlasStrides:
         self.cmp_gemv(3, (3, 5), 5, rng)
         self.cmp_gemv(1, (1, 5), 5, rng)
         self.cmp_gemv(3, (3, 1), 1, rng)
+        self.cmp_gemv(1, (1, 1), 1, rng)
         self.cmp_gemv(0, (0, 5), 5, rng)
         self.cmp_gemv(3, (3, 0), 0, rng)
         self.cmp_gemv(0, (0, 1), 1, rng)
@@ -2443,6 +2300,7 @@ class TestBlasStrides:
         self.cmp_ger((3, 5), 3, 5, rng)
         self.cmp_ger((1, 5), 1, 5, rng)
         self.cmp_ger((3, 1), 3, 1, rng)
+        self.cmp_ger((1, 1), 1, 1, rng)
         self.cmp_ger((0, 5), 0, 5, rng)
         self.cmp_ger((3, 0), 3, 0, rng)
         self.cmp_ger((0, 1), 0, 1, rng)
@@ -2469,6 +2327,8 @@ class TestBlasStrides:
 
 
 class TestInferShape(unittest_tools.InferShapeTester):
+    mode = mode_blas_opt
+
     def test_dot22(self):
         rng = np.random.default_rng(unittest_tools.fetch_seed())
         x, y = matrices("xy")
@@ -2589,7 +2449,7 @@ class TestInferShape(unittest_tools.InferShapeTester):
 rng = np.random.default_rng(unittest_tools.fetch_seed())
 TestBatchedDot = makeTester(
     name="BatchedDotTester",
-    op=batched_dot,
+    op=_batched_dot,
     expected=(
         lambda xs, ys: np.asarray(
             [
@@ -2603,34 +2463,10 @@ TestBatchedDot = makeTester(
     grad=dict(
         correct1=(random(3, 5, 7, rng=rng), random(3, 7, 5, rng=rng)),
         correct2=(random(3, 5, 7, rng=rng), random(3, 7, 9, rng=rng)),
-        correct3=(random(3, 5, 7, rng=rng), random(3, 7, rng=rng)),
-        correct4=(random(3, 5), random(3, 5, 7, rng=rng)),
-        correct5=(random(3, rng=rng), random(3, 5, 7, rng=rng)),
-        correct6=(random(3, 5, rng=rng), random(3, rng=rng)),
-        correct7=(random(3, 5, rng=rng), random(3, 5, rng=rng)),
-        correct8=(random(3, rng=rng), random(3, rng=rng)),
-        correct9=(random(3, 5, 7, 11, rng=rng), random(3, rng=rng)),
-        correct10=(random(3, 2, 6, 5, rng=rng), random(3, 5, rng=rng)),
-        correct11=(random(3, 2, 6, 5, rng=rng), random(3, 5, 7, rng=rng)),
-        correct12=(random(3, 2, 6, 5, rng=rng), random(3, 7, 5, 8, rng=rng)),
-        mixed1=(random(3, 5, rng=rng).astype("float32"), random(3, 5, 7, rng=rng)),
-        mixed2=(random(3, 5, rng=rng).astype("float64"), random(3, 5, 7, rng=rng)),
     ),
     good=dict(
         correct1=(random(3, 5, 7, rng=rng), random(3, 7, 5, rng=rng)),
         correct2=(random(3, 5, 7, rng=rng), random(3, 7, 9, rng=rng)),
-        correct3=(random(3, 5, 7, rng=rng), random(3, 7, rng=rng)),
-        correct4=(random(3, 5, rng=rng), random(3, 5, 7, rng=rng)),
-        correct5=(random(3, rng=rng), random(3, 5, 7, rng=rng)),
-        correct6=(random(3, 5, rng=rng), random(3, rng=rng)),
-        correct7=(random(3, 5, rng=rng), random(3, 5, rng=rng)),
-        correct8=(random(3, rng=rng), random(3, rng=rng)),
-        correct9=(random(3, 5, 7, 11, rng=rng), random(3, rng=rng)),
-        correct10=(random(3, 7, 11, 5, rng=rng), random(3, 5, rng=rng)),
-        correct11=(random(3, 7, 11, 5, rng=rng), random(3, 5, 13, rng=rng)),
-        correct12=(random(3, 7, 11, 5, rng=rng), random(3, 13, 5, 17, rng=rng)),
-        mixed1=(random(3, 5, rng=rng).astype("float32"), random(3, 5, 7, rng=rng)),
-        mixed2=(random(3, 5, rng=rng).astype("float64"), random(3, 5, 7, rng=rng)),
     ),
     bad_build=dict(
         no_batch_axis2=(random(rng=rng), random(3, 5, rng=rng)),
@@ -2639,39 +2475,11 @@ TestBatchedDot = makeTester(
     bad_runtime=dict(
         batch_dim_mismatch1=(random(2, 5, 7, rng=rng), random(3, 7, 9, rng=rng)),
         batch_dim_mismatch2=(random(3, 5, 7, rng=rng), random(2, 7, 9, rng=rng)),
-        batch_dim_mismatch3=(random(3, rng=rng), random(5, rng=rng)),
         bad_dim1=(random(3, 5, 7, rng=rng), random(3, 5, 7, rng=rng)),
         bad_dim2=(random(3, 5, 7, rng=rng), random(3, 8, 3, rng=rng)),
-        bad_dim3=(random(3, 5, rng=rng), random(3, 7, rng=rng)),
-        bad_dim4=(random(3, 5, 7, 11, rng=rng), random(3, 5, rng=rng)),
-        bad_dim5=(random(3, 5, 7, 11, rng=rng), random(3, 5, 13, rng=rng)),
-        bad_dim6=(random(3, 5, 7, 11, rng=rng), random(3, 13, 5, 17, rng=rng)),
     ),
+    mode=mode_blas_opt,
 )
-
-
-def test_batched_dot():
-    rng = np.random.default_rng(unittest_tools.fetch_seed())
-    first = tensor3("first")
-    second = tensor3("second")
-    output = batched_dot(first, second)
-    first_val = rng.random((10, 10, 20)).astype(config.floatX)
-    second_val = rng.random((10, 20, 5)).astype(config.floatX)
-    result_fn = function([first, second], output)
-    result = result_fn(first_val, second_val)
-    assert result.shape[0] == first_val.shape[0]
-    assert result.shape[1] == first_val.shape[1]
-    assert result.shape[2] == second_val.shape[2]
-
-    first_mat = dmatrix("first")
-    second_mat = dmatrix("second")
-    output = batched_dot(first_mat, second_mat)
-    first_mat_val = rng.random((10, 10)).astype(config.floatX)
-    second_mat_val = rng.random((10, 10)).astype(config.floatX)
-    result_fn = function([first_mat, second_mat], output)
-    result = result_fn(first_mat_val, second_mat_val)
-
-    assert result.shape[0] == first_mat_val.shape[0]
 
 
 def test_batched_dot_not_contiguous():
@@ -2683,7 +2491,7 @@ def test_batched_dot_not_contiguous():
 
     X = tensor3()
     W = tensor3()
-    Z = batched_dot(X, W)
+    Z = _batched_dot(X, W)
     f = function([X, W], Z)
 
     w = np_genarray(30, 10, 5)
@@ -2706,12 +2514,12 @@ def test_batched_dot_not_contiguous():
 
 def test_batched_dot_blas_flags():
     """Test that BatchedDot works regardless of presence of BLAS flags"""
-    mode = "FAST_RUN"
+    mode = mode_blas_opt
     rng = np.random.default_rng(2708)
 
     x = tensor("x", shape=(2, 5, 3))
     y = tensor("y", shape=(2, 3, 1))
-    out = batched_dot(x, y)
+    out = _batched_dot(x, y)
     assert isinstance(out.owner.op, BatchedDot)
     x_test = rng.normal(size=x.type.shape).astype(x.type.dtype)
     y_test = rng.normal(size=y.type.shape).astype(y.type.dtype)
@@ -2726,29 +2534,3 @@ def test_batched_dot_blas_flags():
     [batched_dot_thunk] = fn.vm.thunks
     assert not hasattr(batched_dot_thunk, "cthunk")
     np.testing.assert_allclose(fn(x_test, y_test), x_test @ y_test)
-
-
-def test_batched_tensordot():
-    rng = np.random.default_rng(unittest_tools.fetch_seed())
-    first = tensor4("first")
-    second = tensor4("second")
-    axes = [[1, 2], [3, 1]]
-    output = batched_tensordot(first, second, axes)
-    first_val = rng.random((8, 10, 20, 3)).astype(config.floatX)
-    second_val = rng.random((8, 20, 5, 10)).astype(config.floatX)
-    result_fn = function([first, second], output)
-    result = result_fn(first_val, second_val)
-    assert result.shape[0] == first_val.shape[0]
-    assert result.shape[1] == first_val.shape[3]
-    assert result.shape[2] == second_val.shape[2]
-
-    first_mat = dmatrix("first")
-    second_mat = dmatrix("second")
-    axes = 1
-    output = batched_tensordot(first_mat, second_mat, axes)
-    first_mat_val = rng.random((10, 4)).astype(config.floatX)
-    second_mat_val = rng.random((10, 4)).astype(config.floatX)
-    result_fn = function([first_mat, second_mat], output)
-    result = result_fn(first_mat_val, second_mat_val)
-    assert result.shape[0] == first_mat_val.shape[0]
-    assert len(result.shape) == 1

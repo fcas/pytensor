@@ -8,27 +8,23 @@ from pytensor import Mode, function, grad
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Variable, equal_computations
-from pytensor.graph.replace import clone_replace, vectorize_node
-from pytensor.graph.type import Type
+from pytensor.graph.replace import clone_replace, vectorize_graph
 from pytensor.scalar.basic import ScalarConstant
 from pytensor.tensor import as_tensor_variable, broadcast_to, get_vector_length, row
-from pytensor.tensor.basic import MakeVector, constant, stack
+from pytensor.tensor.basic import MakeVector, arange, constant, stack
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.shape import (
     Reshape,
     Shape,
     Shape_i,
     SpecifyShape,
-    Unbroadcast,
     _specify_shape,
     reshape,
     shape,
     shape_tuple,
     specify_broadcastable,
     specify_shape,
-    unbroadcast,
 )
-from pytensor.tensor.subtensor import Subtensor
 from pytensor.tensor.type import (
     TensorType,
     dmatrix,
@@ -50,7 +46,7 @@ from pytensor.typed_list import make_list
 from tests import unittest_tools as utt
 from tests.graph.utils import MyType2
 from tests.tensor.utils import eval_outputs, random
-from tests.test_rop import RopLopChecker
+from tests.test_rop import PushforwardPullbackChecker
 
 
 def test_shape_basic():
@@ -62,16 +58,6 @@ def test_shape_basic():
 
     s = shape(lscalar())
     assert s.type.shape == (0,)
-
-    class MyType(Type):
-        def filter(self, *args, **kwargs):
-            raise NotImplementedError()
-
-        def __eq__(self, other):
-            return isinstance(other, MyType) and other.thingy == self.thingy
-
-    s = shape(Variable(MyType(), None))
-    assert s.type.shape == (None,)
 
     s = shape(np.array(1))
     assert np.array_equal(eval_outputs([s]), [])
@@ -98,6 +84,7 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
             Shape_i,
             DimShuffle,
             Elemwise,
+            SpecifyShape,
         )
         super().setup_method()
 
@@ -253,9 +240,7 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
             f(a_val, [7, 5])
         with pytest.raises(ValueError):
             f(a_val, [-1, -1])
-        with pytest.raises(
-            ValueError, match=".*Shape argument to Reshape has incorrect length.*"
-        ):
+        with pytest.raises(AssertionError):
             f(a_val, [3, 4, 1])
 
     def test_0(self):
@@ -374,6 +359,29 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
         ):
             reshape(x2, (6, 3, 99))
 
+    def test_shape_strides(self):
+        # Directly test the concern behind commit 223ee1548574b6bb8e73611ed605a97e29f13e7b
+        x = arange(8)
+        shape = vector("shape", dtype=int, shape=(3,))
+        fn = function([shape], x.reshape(shape))
+
+        # Empty strides
+        test_shape = np.broadcast_to(np.array(2), (3,))
+        assert test_shape.strides == (0,)
+        np.testing.assert_array_equal(
+            fn(test_shape),
+            np.arange(8).reshape(test_shape),
+        )
+
+        # Negative non-contiguous strides
+        test_shape = np.array([0, 4, 0, 2, 0, 1])[::-2]
+        assert np.all(test_shape == (1, 2, 4))
+        assert test_shape.strides == (-16,)
+        np.testing.assert_array_equal(
+            fn(test_shape),
+            np.arange(8).reshape(test_shape),
+        )
+
 
 def test_shape_i_hash():
     assert isinstance(Shape_i(np.int64(1)).__hash__(), int)
@@ -446,6 +454,33 @@ class TestSpecifyShape(utt.InferShapeTester):
         y = specify_shape(x, (None, 5))
         assert y.type.shape == (3, 5)
 
+    def test_ellipsis(self):
+        x = tensor("x", shape=(None, None, None, None))
+
+        y = specify_shape(x, ...)
+        assert y.type.shape == (None, None, None, None)
+
+        y = specify_shape(x, (...,))
+        assert y.type.shape == (None, None, None, None)
+
+        y = specify_shape(x, (..., 5))
+        assert y.type.shape == (None, None, None, 5)
+
+        y = specify_shape(x, (5, ...))
+        assert y.type.shape == (5, None, None, None)
+
+        y = specify_shape(x, (5, ..., 3))
+        assert y.type.shape == (5, None, None, 3)
+
+        y = specify_shape(x, (5, ..., 3, None))
+        assert y.type.shape == (5, None, 3, None)
+
+        y = specify_shape(x, (5, 1, ..., 3, None))
+        assert y.type.shape == (5, 1, 3, None)
+
+        with pytest.raises(ValueError, match="Multiple Ellipsis in specify_shape"):
+            specify_shape(x, (..., None, ...))
+
     def test_python_perform(self):
         """Test the Python `Op.perform` implementation."""
         x = scalar()
@@ -461,14 +496,14 @@ class TestSpecifyShape(utt.InferShapeTester):
         f = pytensor.function([x, shape], y, mode=Mode("py"))
         assert f([1], (1,)) == [1]
 
-        with pytest.raises(AssertionError, match="SpecifyShape:.*"):
+        with pytest.raises(AssertionError, match=r"SpecifyShape:.*"):
             assert f([1], (2,)) == [1]
 
         x = matrix()
         y = specify_shape(x, (None, 2))
         f = pytensor.function([x], y, mode=Mode("py"))
         assert f(np.zeros((3, 2), dtype=config.floatX)).shape == (3, 2)
-        with pytest.raises(AssertionError, match="SpecifyShape:.*"):
+        with pytest.raises(AssertionError, match=r"SpecifyShape:.*"):
             assert f(np.zeros((3, 3), dtype=config.floatX))
 
     def test_bad_shape(self):
@@ -482,7 +517,7 @@ class TestSpecifyShape(utt.InferShapeTester):
         assert np.array_equal(f(xval), xval)
 
         xval = np.random.random(3).astype(config.floatX)
-        with pytest.raises(AssertionError, match="SpecifyShape:.*"):
+        with pytest.raises(AssertionError, match=r"SpecifyShape:.*"):
             f(xval)
 
         assert isinstance(
@@ -506,14 +541,14 @@ class TestSpecifyShape(utt.InferShapeTester):
 
         for shape_ in [(4, 3), (2, 8)]:
             xval = np.random.random(shape_).astype(config.floatX)
-            with pytest.raises(AssertionError, match="SpecifyShape:.*"):
+            with pytest.raises(AssertionError, match=r"SpecifyShape:.*"):
                 f(xval)
 
         s = iscalar("s")
         f = pytensor.function([x, s], specify_shape(x, None, s), mode=self.mode)
         x_val = np.zeros((3, 2), dtype=config.floatX)
         assert f(x_val, 2).shape == (3, 2)
-        with pytest.raises(AssertionError, match="SpecifyShape:.*"):
+        with pytest.raises(AssertionError, match=r"SpecifyShape:.*"):
             f(xval, 3)
 
     def test_infer_shape(self):
@@ -549,6 +584,8 @@ class TestSpecifyShape(utt.InferShapeTester):
 
         assert specify_shape(x, (1, 2, None)) is x
         assert specify_shape(x, (None, None, None)) is x
+        assert specify_shape(x, (...,)) is x
+        assert specify_shape(x, (..., None)) is x
 
         assert specify_shape(x, (1, 2, 3)) is not x
         assert specify_shape(x, (None, None, 3)) is not x
@@ -601,45 +638,39 @@ class TestSpecifyBroadcastable:
             specify_broadcastable(x, axis)
 
 
-class TestRopLop(RopLopChecker):
+class TestPushforwardPullback(PushforwardPullbackChecker):
     def test_shape(self):
-        self.check_nondiff_rop(self.x.shape[0])
+        self.check_nondiff_pushforward(self.x.shape[0], self.x, self.v)
 
     def test_specifyshape(self):
-        self.check_rop_lop(specify_shape(self.x, self.in_shape), self.in_shape)
+        self.check_pushforward_pullback(
+            specify_shape(self.x, self.in_shape), self.in_shape
+        )
 
     def test_reshape(self):
         new_shape = constant(
             np.asarray([self.mat_in_shape[0] * self.mat_in_shape[1]], dtype="int64")
         )
 
-        self.check_mat_rop_lop(
+        self.check_mat_pushforward_pullback(
             self.mx.reshape(new_shape), (self.mat_in_shape[0] * self.mat_in_shape[1],)
         )
 
 
-@config.change_flags(compute_test_value="raise")
-def test_nonstandard_shapes():
+def test_shape_rejects_non_tensor_type():
+    """Shape raises TypeError for non-TensorType inputs."""
+    with pytest.raises(TypeError, match="TensorType"):
+        shape(NoneConst)
+
+    unknown_type_var = Variable(MyType2(), None, None)
+    with pytest.raises(TypeError, match="TensorType"):
+        shape(unknown_type_var)
+
     a = tensor3(config.floatX)
-    a.tag.test_value = np.random.random((2, 3, 4)).astype(config.floatX)
     b = tensor3(config.floatX)
-    b.tag.test_value = np.random.random((2, 3, 4)).astype(config.floatX)
-
     tl = make_list([a, b])
-    tl_shape = shape(tl)
-    assert np.array_equal(tl_shape.get_test_value(), (2, 2, 3, 4))
-
-    # Test specific dim
-    tl_shape_i = shape(tl)[0]
-    assert isinstance(tl_shape_i.owner.op, Subtensor)
-    assert tl_shape_i.get_test_value() == 2
-
-    tl_shape_i = Shape_i(0)(tl)
-    assert not isinstance(tl_shape_i.owner.op, Subtensor)
-    assert tl_shape_i.get_test_value() == 2
-
-    none_shape = shape(NoneConst)
-    assert np.array_equal(none_shape.get_test_value(), [])
+    with pytest.raises(TypeError, match="TensorType"):
+        shape(tl)
 
 
 def test_shape_i_basics():
@@ -658,66 +689,6 @@ def test_get_vector_length():
     # Test `SpecifyShape`
     x = specify_shape(ivector(), (10,))
     assert get_vector_length(x) == 10
-
-
-class TestUnbroadcast:
-    def test_basic(self):
-        x = matrix()
-        assert unbroadcast(x, 0) is x
-        assert unbroadcast(x, 1) is x
-        assert unbroadcast(x, 1, 0) is x
-        assert unbroadcast(x, 0, 1) is x
-
-        x = row()
-        assert unbroadcast(x, 0) is not x
-        assert unbroadcast(x, 1) is x
-        assert unbroadcast(x, 1, 0) is not x
-        assert unbroadcast(x, 0, 1) is not x
-
-        assert unbroadcast(unbroadcast(x, 0), 0).owner.inputs[0] is x
-
-    def test_infer_shape(self):
-        x = matrix()
-        y = unbroadcast(x, 0)
-        f = pytensor.function([x], y.shape)
-        assert (f(np.zeros((2, 5), dtype=config.floatX)) == [2, 5]).all()
-        topo = f.maker.fgraph.toposort()
-        if config.mode != "FAST_COMPILE":
-            assert len(topo) == 3
-            assert isinstance(topo[0].op, Shape_i)
-            assert isinstance(topo[1].op, Shape_i)
-            assert isinstance(topo[2].op, MakeVector)
-
-        x = row()
-        y = unbroadcast(x, 0)
-        f = pytensor.function([x], y.shape)
-        assert (f(np.zeros((1, 5), dtype=config.floatX)) == [1, 5]).all()
-        topo = f.maker.fgraph.toposort()
-        if config.mode != "FAST_COMPILE":
-            assert len(topo) == 2
-            assert isinstance(topo[0].op, Shape_i)
-            assert isinstance(topo[1].op, MakeVector)
-
-    def test_error_checks(self):
-        with pytest.raises(TypeError, match="needs integer axes"):
-            Unbroadcast(0.0)
-
-        with pytest.raises(ValueError, match="^Trying to unbroadcast"):
-            Unbroadcast(1)(vector())
-
-
-class TestUnbroadcastInferShape(utt.InferShapeTester):
-    def test_basic(self):
-        rng = np.random.default_rng(3453)
-        adtens4 = tensor(dtype="float64", shape=(1, 1, 1, None))
-        adtens4_val = rng.random((1, 1, 1, 3)).astype(config.floatX)
-        self._compile_and_check(
-            [adtens4],
-            [Unbroadcast(0, 2)(adtens4)],
-            [adtens4_val],
-            Unbroadcast,
-            warn=False,
-        )
 
 
 def test_shape_tuple():
@@ -739,9 +710,9 @@ class TestVectorize:
     def test_shape(self):
         vec = tensor(shape=(None,), dtype="float64")
         mat = tensor(shape=(None, None), dtype="float64")
-        node = shape(vec).owner
+        out = shape(vec)
 
-        [vect_out] = vectorize_node(node, mat).outputs
+        vect_out = vectorize_graph(out, {vec: mat})
         assert equal_computations(
             [vect_out], [broadcast_to(mat.shape[1:], (*mat.shape[:1], 1))]
         )
@@ -755,8 +726,8 @@ class TestVectorize:
 
         mat = tensor(shape=(None, None), dtype="float64")
         tns = tensor(shape=(None, None, None, None), dtype="float64")
-        node = shape(mat).owner
-        [vect_out] = vectorize_node(node, tns).outputs
+        out = shape(mat)
+        vect_out = vectorize_graph(out, {mat: tns})
         assert equal_computations(
             [vect_out], [broadcast_to(tns.shape[2:], (*tns.shape[:2], 2))]
         )
@@ -776,11 +747,13 @@ class TestVectorize:
         vec = tensor(shape=(None,), dtype="float64")
         mat = tensor(shape=(None, None), dtype="float64")
 
-        shape = (-1, x)
-        node = reshape(vec, shape).owner
+        shape = as_tensor_variable([-1, x])
+        out = reshape(vec, shape)
 
-        [vect_out] = vectorize_node(node, mat, shape).outputs
-        assert equal_computations([vect_out], [reshape(mat, (*mat.shape[:1], -1, x))])
+        vect_out = vectorize_graph(out, {vec: mat})
+        utt.assert_equal_computations(
+            [vect_out], [reshape(mat, (*mat.shape[:1], *stack((-1, x))))]
+        )
 
         x_test_value = 2
         mat_test_value = np.ones((5, 6))
@@ -792,13 +765,12 @@ class TestVectorize:
             ref_fn(x_test_value, mat_test_value),
         )
 
-        new_shape = (5, -1, x)
-        [vect_out] = vectorize_node(node, mat, new_shape).outputs
-        assert equal_computations([vect_out], [reshape(mat, new_shape)])
+        new_shape = as_tensor_variable((5, -1, x))
+        vect_out = vectorize_graph(out, {vec: mat, shape: new_shape})
+        utt.assert_equal_computations([vect_out], [reshape(mat, new_shape)])
 
         new_shape = stack([[-1, x], [x - 1, -1]], axis=0)
-        print(new_shape.type)
-        [vect_out] = vectorize_node(node, vec, new_shape).outputs
+        vect_out = vectorize_graph(out, {shape: new_shape})
         vec_test_value = np.arange(6)
         np.testing.assert_allclose(
             vect_out.eval({x: 3, vec: vec_test_value}),
@@ -809,13 +781,13 @@ class TestVectorize:
             ValueError,
             match="Invalid shape length passed into vectorize node of Reshape",
         ):
-            vectorize_node(node, vec, (5, 2, x))
+            vectorize_graph(out, {shape: as_tensor_variable((5, 2, x))})
 
         with pytest.raises(
             ValueError,
             match="Invalid shape length passed into vectorize node of Reshape",
         ):
-            vectorize_node(node, mat, (5, 3, 2, x))
+            vectorize_graph(out, {vec: mat, shape: as_tensor_variable((5, 3, 2, x))})
 
     def test_specify_shape(self):
         x = scalar("x", dtype=int)
@@ -823,40 +795,9 @@ class TestVectorize:
         tns = tensor(shape=(None, None, None))
 
         shape = (x, None)
-        node = specify_shape(mat, shape).owner
-        vect_node = vectorize_node(node, tns, *shape)
-        assert equal_computations(
-            vect_node.outputs, [specify_shape(tns, (None, x, None))]
-        )
-
-        new_shape = (5, 2, x)
-        vect_node = vectorize_node(node, tns, *new_shape)
-        assert equal_computations(vect_node.outputs, [specify_shape(tns, (5, 2, x))])
+        out = specify_shape(mat, shape)
+        vect_out = vectorize_graph(out, {mat: tns})
+        assert equal_computations([vect_out], [specify_shape(tns, (None, x, None))])
 
         with pytest.raises(NotImplementedError):
-            vectorize_node(node, mat, *([x, x], None))
-
-        with pytest.raises(
-            ValueError,
-            match="Invalid number of shape arguments passed into vectorize node of SpecifyShape",
-        ):
-            vectorize_node(node, mat, *(5, 2, x))
-
-        with pytest.raises(
-            ValueError,
-            match="Invalid number of shape arguments passed into vectorize node of SpecifyShape",
-        ):
-            vectorize_node(node, tns, *(5, 3, 2, x))
-
-    def test_unbroadcast(self):
-        mat = tensor(
-            shape=(
-                1,
-                1,
-            )
-        )
-        tns = tensor(shape=(4, 1, 1, 1))
-
-        node = unbroadcast(mat, 0).owner
-        vect_node = vectorize_node(node, tns)
-        assert equal_computations(vect_node.outputs, [unbroadcast(tns, 2)])
+            vectorize_graph(out, {x: as_tensor_variable([x, x])})

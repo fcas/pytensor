@@ -1,6 +1,7 @@
 """Provide a simple user friendly API to PyTensor-managed memory."""
 
 import copy
+import warnings
 from contextlib import contextmanager
 from functools import singledispatch
 from typing import TYPE_CHECKING
@@ -9,6 +10,7 @@ from pytensor.graph.basic import Variable
 from pytensor.graph.utils import add_tag_trace
 from pytensor.link.basic import Container
 from pytensor.link.c.type import generic
+from pytensor.utils import add_lazy_dispatcher
 
 
 if TYPE_CHECKING:
@@ -133,9 +135,6 @@ class SharedVariable(Variable):
         else:
             self.container.value = copy.deepcopy(new_value)
 
-    def get_test_value(self):
-        return self.get_value(borrow=True, return_internal_type=True)
-
     def clone(self, **kwargs):
         name = kwargs.get("name", self.name)
         cp = self.__class__(
@@ -161,6 +160,9 @@ class SharedVariable(Variable):
 
     @default_update.setter
     def default_update(self, value):
+        warnings.warn(
+            "Setting default_update is deprecated.", DeprecationWarning, stacklevel=2
+        )
         if value is not None:
             self._default_update = self.type.filter_variable(value, allow_convert=True)
         else:
@@ -222,3 +224,6 @@ def shared_constructor(value, name=None, strict=False, allow_downcast=None, **kw
         allow_downcast=allow_downcast,
         name=name,
     )
+
+
+add_lazy_dispatcher(shared_constructor)

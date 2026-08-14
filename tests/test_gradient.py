@@ -4,6 +4,7 @@ from scipy.optimize import rosen_hess_prod
 
 import pytensor
 import pytensor.tensor.basic as ptb
+from pytensor import function
 from pytensor.configdefaults import config
 from pytensor.gradient import (
     DisconnectedInputError,
@@ -11,7 +12,6 @@ from pytensor.gradient import (
     GradClip,
     GradScale,
     NullTypeGradError,
-    Rop,
     UndefinedGrad,
     disconnected_grad,
     disconnected_grad_,
@@ -23,14 +23,19 @@ from pytensor.gradient import (
     hessian,
     hessian_vector_product,
     jacobian,
+    pullback,
+    pushforward,
     subgraph_grad,
     zero_grad,
     zero_grad_,
 )
-from pytensor.graph.basic import Apply, graph_inputs
+from pytensor.graph.basic import Apply
 from pytensor.graph.null_type import NullType
 from pytensor.graph.op import Op
-from pytensor.tensor.math import add, dot, exp, sigmoid, sqr, tanh
+from pytensor.graph.traversal import graph_inputs
+from pytensor.scalar import float64
+from pytensor.scan.op import Scan
+from pytensor.tensor.math import add, dot, exp, outer, sigmoid, sqr, tanh
 from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.random import RandomStream
 from pytensor.tensor.type import (
@@ -85,8 +90,8 @@ class TestGradSourcesInputs:
                 return Apply(self, inputs, outputs)
 
             def grad(self, inp, grads):
-                (x,) = inp
-                (gz,) = grads
+                (_x,) = inp
+                (_gz,) = grads
 
             def perform(self, *args, **kwargs):
                 raise NotImplementedError()
@@ -154,8 +159,8 @@ class TestGradSourcesInputs:
                 return Apply(self, inputs, outputs)
 
             def grad(self, inp, grads):
-                (x,) = inp
-                gz1, gz2 = grads
+                (_x,) = inp
+                _gz1, _gz2 = grads
                 return (gval,)
 
             def perform(self, *args, **kwargs):
@@ -179,8 +184,8 @@ class TestGradSourcesInputs:
                 return Apply(self, inputs, outputs)
 
             def grad(self, inp, grads):
-                x0, x1 = inp
-                (gz,) = grads
+                _x0, _x1 = inp
+                (_gz,) = grads
                 return (gval0, gval1)
 
             def perform(self, *args, **kwargs):
@@ -228,8 +233,8 @@ class TestGrad:
             return Apply(self, inputs, outputs)
 
         def grad(self, inp, grads):
-            x0, x1 = inp
-            gz0, gz1 = grads
+            _x0, _x1 = inp
+            _gz0, _gz1 = grads
             return self.gval0, self.gval1
 
         def perform(self, *args, **kwargs):
@@ -481,12 +486,12 @@ class TestGrad:
         int_type = imatrix().dtype
         float_type = "float64"
 
-        X = np.cast[int_type](rng.standard_normal((m, d)) * 127.0)
-        W = np.cast[W.dtype](rng.standard_normal((d, n)))
-        b = np.cast[b.dtype](rng.standard_normal(n))
+        X = np.asarray(rng.standard_normal((m, d)) * 127.0, dtype=int_type)
+        W = rng.standard_normal((d, n), dtype=W.dtype)
+        b = rng.standard_normal(n, dtype=b.dtype)
 
         int_result = int_func(X, W, b)
-        float_result = float_func(np.cast[float_type](X), W, b)
+        float_result = float_func(np.asarray(X, dtype=float_type), W, b)
 
         assert np.allclose(int_result, float_result), (int_result, float_result)
 
@@ -508,7 +513,7 @@ class TestGrad:
         # the output
         f = pytensor.function([x], g)
         rng = np.random.default_rng([2012, 9, 5])
-        x = np.cast[x.dtype](rng.standard_normal(3))
+        x = rng.standard_normal(3, dtype=x.dtype)
         g = f(x)
         assert np.allclose(g, np.ones(x.shape, dtype=x.dtype))
 
@@ -631,7 +636,8 @@ def test_known_grads():
     rng = np.random.default_rng([2012, 11, 15])
     values = [rng.standard_normal(10), rng.integers(10), rng.standard_normal()]
     values = [
-        np.cast[ipt.dtype](value) for ipt, value in zip(inputs, values, strict=True)
+        np.asarray(value, dtype=ipt.dtype)
+        for ipt, value in zip(inputs, values, strict=True)
     ]
 
     true_grads = grad(cost, inputs, disconnected_inputs="ignore")
@@ -679,7 +685,7 @@ def test_known_grads_integers():
     f = pytensor.function([g_expected], g_grad)
 
     x = -3
-    gv = np.cast[config.floatX](0.6)
+    gv = np.asarray(0.6, dtype=config.floatX)
 
     g_actual = f(gv)
 
@@ -746,7 +752,8 @@ def test_subgraph_grad():
     rng = np.random.default_rng([2012, 11, 15])
     values = [rng.standard_normal(2), rng.standard_normal(3)]
     values = [
-        np.cast[ipt.dtype](value) for ipt, value in zip(inputs, values, strict=True)
+        np.asarray(value, dtype=ipt.dtype)
+        for ipt, value in zip(inputs, values, strict=True)
     ]
 
     wrt = [w2, w1]
@@ -803,12 +810,12 @@ class TestZeroGrad:
 
             assert np.allclose(f(a), f2(a))
 
-    def test_rop(self):
+    def test_pushforward(self):
         x = vector()
         v = vector()
         y = zero_grad(x)
 
-        rop = Rop(y, x, v)
+        rop = pushforward(y, x, v)
         f = pytensor.function([x, v], rop, on_unused_input="ignore")
 
         a = np.asarray(self.rng.standard_normal(5), dtype=config.floatX)
@@ -915,7 +922,6 @@ def test_grad_scale():
     assert np.allclose(out, (8, 4))
 
 
-@config.change_flags(compute_test_value="off")
 def test_undefined_grad_opt():
     # Make sure that undefined grad get removed in optimized graph.
     random = RandomStream(np.random.default_rng().integers(1, 2147462579))
@@ -937,128 +943,198 @@ def test_undefined_grad_opt():
     )
 
 
-def test_jacobian_vector():
-    x = vector()
-    y = x * 2
-    rng = np.random.default_rng(seed=utt.fetch_seed())
+@pytest.mark.parametrize("vectorize", [False, True], ids=lambda x: f"vectorize={x}")
+class TestJacobian:
+    def test_jacobian_vector(self, vectorize):
+        x = vector()
+        y = x * 2
+        rng = np.random.default_rng(seed=utt.fetch_seed())
 
-    # test when the jacobian is called with a tensor as wrt
-    Jx = jacobian(y, x)
-    f = pytensor.function([x], Jx)
-    vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), np.eye(10) * 2)
+        # test when the jacobian is called with a tensor as wrt
+        Jx = jacobian(y, x, vectorize=vectorize)
+        f = function([x], Jx)
+        vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), np.eye(10) * 2)
 
-    # test when the jacobian is called with a tuple as wrt
-    Jx = jacobian(y, (x,))
-    assert isinstance(Jx, tuple)
-    f = pytensor.function([x], Jx[0])
-    vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), np.eye(10) * 2)
+        # test when the jacobian is called with a tuple as wrt
+        Jx = jacobian(y, (x,), vectorize=vectorize)
+        assert isinstance(Jx, tuple)
+        f = function([x], Jx[0])
+        vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), np.eye(10) * 2)
 
-    # test when the jacobian is called with a list as wrt
-    Jx = jacobian(y, [x])
-    assert isinstance(Jx, list)
-    f = pytensor.function([x], Jx[0])
-    vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), np.eye(10) * 2)
+        # test when the jacobian is called with a list as wrt
+        Jx = jacobian(y, [x], vectorize=vectorize)
+        assert isinstance(Jx, list)
+        f = function([x], Jx[0])
+        vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), np.eye(10) * 2)
 
-    # test when the jacobian is called with a list of two elements
-    z = vector()
-    y = x * z
-    Js = jacobian(y, [x, z])
-    f = pytensor.function([x, z], Js)
-    vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
-    vz = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
-    vJs = f(vx, vz)
-    evx = np.zeros((10, 10))
-    evz = np.zeros((10, 10))
-    np.fill_diagonal(evx, vx)
-    np.fill_diagonal(evz, vz)
-    assert np.allclose(vJs[0], evz)
-    assert np.allclose(vJs[1], evx)
+        # test when the jacobian is called with a list of two elements
+        z = vector()
+        y = x * z
+        Js = jacobian(y, [x, z], vectorize=vectorize)
+        f = function([x, z], Js)
+        vx = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
+        vz = rng.uniform(size=(10,)).astype(pytensor.config.floatX)
+        vJs = f(vx, vz)
+        evx = np.zeros((10, 10))
+        evz = np.zeros((10, 10))
+        np.fill_diagonal(evx, vx)
+        np.fill_diagonal(evz, vz)
+        assert np.allclose(vJs[0], evz)
+        assert np.allclose(vJs[1], evx)
 
+    def test_jacobian_matrix(self, vectorize):
+        x = matrix()
+        y = 2 * x.sum(axis=0)
+        rng = np.random.default_rng(seed=utt.fetch_seed())
+        ev = np.zeros((10, 10, 10))
+        for dx in range(10):
+            ev[dx, :, dx] = 2.0
 
-def test_jacobian_matrix():
-    x = matrix()
-    y = 2 * x.sum(axis=0)
-    rng = np.random.default_rng(seed=utt.fetch_seed())
-    ev = np.zeros((10, 10, 10))
-    for dx in range(10):
-        ev[dx, :, dx] = 2.0
+        # test when the jacobian is called with a tensor as wrt
+        Jx = jacobian(y, x, vectorize=vectorize)
+        f = function([x], Jx)
+        vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), ev)
 
-    # test when the jacobian is called with a tensor as wrt
-    Jx = jacobian(y, x)
-    f = pytensor.function([x], Jx)
-    vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), ev)
+        # test when the jacobian is called with a tuple as wrt
+        Jx = jacobian(y, (x,), vectorize=vectorize)
+        assert isinstance(Jx, tuple)
+        f = function([x], Jx[0])
+        vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), ev)
 
-    # test when the jacobian is called with a tuple as wrt
-    Jx = jacobian(y, (x,))
-    assert isinstance(Jx, tuple)
-    f = pytensor.function([x], Jx[0])
-    vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), ev)
+        # test when the jacobian is called with a list as wrt
+        Jx = jacobian(y, [x], vectorize=vectorize)
+        assert isinstance(Jx, list)
+        f = function([x], Jx[0])
+        vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
+        assert np.allclose(f(vx), ev)
 
-    # test when the jacobian is called with a list as wrt
-    Jx = jacobian(y, [x])
-    assert isinstance(Jx, list)
-    f = pytensor.function([x], Jx[0])
-    vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
-    assert np.allclose(f(vx), ev)
+        # test when the jacobian is called with a list of two elements
+        z = matrix()
+        y = (x * z).sum(axis=1)
+        Js = jacobian(y, [x, z], vectorize=vectorize)
+        f = function([x, z], Js)
+        vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
+        vz = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
+        vJs = f(vx, vz)
+        evx = np.zeros((10, 10, 10))
+        evz = np.zeros((10, 10, 10))
+        for dx in range(10):
+            evx[dx, dx, :] = vx[dx, :]
+            evz[dx, dx, :] = vz[dx, :]
+        assert np.allclose(vJs[0], evz)
+        assert np.allclose(vJs[1], evx)
 
-    # test when the jacobian is called with a list of two elements
-    z = matrix()
-    y = (x * z).sum(axis=1)
-    Js = jacobian(y, [x, z])
-    f = pytensor.function([x, z], Js)
-    vx = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
-    vz = rng.uniform(size=(10, 10)).astype(pytensor.config.floatX)
-    vJs = f(vx, vz)
-    evx = np.zeros((10, 10, 10))
-    evz = np.zeros((10, 10, 10))
-    for dx in range(10):
-        evx[dx, dx, :] = vx[dx, :]
-        evz[dx, dx, :] = vz[dx, :]
-    assert np.allclose(vJs[0], evz)
-    assert np.allclose(vJs[1], evx)
+    def test_jacobian_scalar(self, vectorize):
+        x = scalar()
+        y = x * 2
+        rng = np.random.default_rng(seed=utt.fetch_seed())
 
+        # test when the jacobian is called with a tensor as wrt
+        Jx = jacobian(y, x, vectorize=vectorize)
+        f = function([x], Jx)
+        vx = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        assert np.allclose(f(vx), 2)
 
-def test_jacobian_scalar():
-    x = scalar()
-    y = x * 2
-    rng = np.random.default_rng(seed=utt.fetch_seed())
+        # test when input is a shape (1,) vector -- should still be treated as a scalar
+        Jx = jacobian(y[None], x)
+        f = function([x], Jx)
 
-    # test when the jacobian is called with a tensor as wrt
-    Jx = jacobian(y, x)
-    f = pytensor.function([x], Jx)
-    vx = np.cast[pytensor.config.floatX](rng.uniform())
-    assert np.allclose(f(vx), 2)
+        # Ensure we hit the scalar grad case (doesn't use scan)
+        nodes = f.maker.fgraph.apply_nodes
+        assert not any(isinstance(node.op, Scan) for node in nodes)
 
-    # test when the jacobian is called with a tuple as wrt
-    Jx = jacobian(y, (x,))
-    assert isinstance(Jx, tuple)
-    f = pytensor.function([x], Jx[0])
-    vx = np.cast[pytensor.config.floatX](rng.uniform())
-    assert np.allclose(f(vx), 2)
+        vx = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        assert np.allclose(f(vx), 2)
 
-    # test when the jacobian is called with a list as wrt
-    Jx = jacobian(y, [x])
-    assert isinstance(Jx, list)
-    f = pytensor.function([x], Jx[0])
-    vx = np.cast[pytensor.config.floatX](rng.uniform())
-    assert np.allclose(f(vx), 2)
+        # test when the jacobian is called with a tuple as wrt
+        Jx = jacobian(y, (x,), vectorize=vectorize)
+        assert isinstance(Jx, tuple)
+        f = function([x], Jx[0])
+        vx = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        assert np.allclose(f(vx), 2)
 
-    # test when the jacobian is called with a list of two elements
-    z = scalar()
-    y = x * z
-    Jx = jacobian(y, [x, z])
-    f = pytensor.function([x, z], Jx)
-    vx = np.cast[pytensor.config.floatX](rng.uniform())
-    vz = np.cast[pytensor.config.floatX](rng.uniform())
-    vJx = f(vx, vz)
+        # test when the jacobian is called with a list as wrt
+        Jx = jacobian(y, [x], vectorize=vectorize)
+        assert isinstance(Jx, list)
+        f = function([x], Jx[0])
+        vx = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        assert np.allclose(f(vx), 2)
 
-    assert np.allclose(vJx[0], vz)
-    assert np.allclose(vJx[1], vx)
+        # test when the jacobian is called with a list of two elements
+        z = scalar()
+        y = x * z
+        Jx = jacobian(y, [x, z], vectorize=vectorize)
+        f = function([x, z], Jx)
+        vx = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        vz = np.asarray(rng.uniform(), dtype=pytensor.config.floatX)
+        vJx = f(vx, vz)
+
+        assert np.allclose(vJx[0], vz)
+        assert np.allclose(vJx[1], vx)
+
+    @pytest.mark.parametrize("square_jac", [False, True])
+    def test_jacobian_matrix_expression(self, vectorize, square_jac):
+        x = vector("x", shape=(3,))
+        y = outer(x, x)
+        if not square_jac:
+            y = y[:, 1:]
+        Jy_wrt_x = jacobian(y, wrt=x, vectorize=vectorize)
+        f = function([x], Jy_wrt_x)
+        x_test = np.arange(3, dtype=x.type.dtype)
+        res = f(x_test)
+        expected_res = np.array(
+            [
+                # Jy[0]_wrt_x (y[0] = x[0] * x)
+                [[0, 0, 0], [1, 0, 0], [2, 0, 0]],
+                # Jy[1]_wrt_x (y[1] = x[1] * x)
+                [
+                    [1, 0, 0],
+                    [0, 2, 0],
+                    [0, 2, 1],
+                ],
+                # Jy[2]_wrt_x (y[2] = x[2] * x)
+                [
+                    [2, 0, 0],
+                    [0, 2, 1],
+                    [0, 0, 4],
+                ],
+            ]
+        )
+        if not square_jac:
+            expected_res = expected_res[:, 1:, :]
+        np.testing.assert_allclose(res, expected_res)
+
+    def test_jacobian_disconnected_inputs(self, vectorize):
+        # Test that disconnected inputs are properly handled by jacobian.
+        s1 = scalar("s1")
+        s2 = scalar("s2")
+        jacobian_s = jacobian(1 + s1, s2, disconnected_inputs="ignore")
+        func_s = function([s2], jacobian_s)
+        val = np.array(1.0, dtype=config.floatX)
+        np.testing.assert_allclose(func_s(val), np.zeros(1))
+
+        v1 = vector("v1")
+        v2 = vector("v2")
+        jacobian_v = jacobian(
+            1 + v1, v2, disconnected_inputs="ignore", vectorize=vectorize
+        )
+        func_v = function([v1, v2], jacobian_v, on_unused_input="ignore")
+        val = np.arange(4.0, dtype=pytensor.config.floatX)
+        np.testing.assert_allclose(func_v(val, val), np.zeros((4, 4)))
+
+        m1 = matrix("m1")
+        m2 = matrix("m2")
+        jacobian_m = jacobian(
+            1 + m1[1:, 2:], m2, disconnected_inputs="ignore", vectorize=vectorize
+        )
+        func_v = function([m1, m2], jacobian_m, on_unused_input="ignore")
+        val = np.ones((4, 4), dtype=config.floatX)
+        np.testing.assert_allclose(func_v(val, val), np.zeros((3, 2, 4, 4)))
 
 
 def test_hessian():
@@ -1070,25 +1146,7 @@ def test_hessian():
     assert np.allclose(f(vx), np.eye(10) * 2)
 
 
-def test_jacobian_disconnected_inputs():
-    # Test that disconnected inputs are properly handled by jacobian.
-
-    v1 = vector()
-    v2 = vector()
-    jacobian_v = pytensor.gradient.jacobian(1 + v1, v2, disconnected_inputs="ignore")
-    func_v = pytensor.function([v1, v2], jacobian_v)
-    val = np.arange(4.0).astype(pytensor.config.floatX)
-    assert np.allclose(func_v(val, val), np.zeros((4, 4)))
-
-    s1 = scalar()
-    s2 = scalar()
-    jacobian_s = pytensor.gradient.jacobian(1 + s1, s2, disconnected_inputs="ignore")
-    func_s = pytensor.function([s2], jacobian_s)
-    val = np.array(1.0).astype(pytensor.config.floatX)
-    assert np.allclose(func_s(val), np.zeros(1))
-
-
-class TestHessianVectorProdudoct:
+class TestHessianVectorProduct:
     def test_rosen(self):
         x = vector("x", dtype="float64")
         rosen = (100 * (x[1:] - x[:-1] ** 2) ** 2 + (1 - x[:-1]) ** 2).sum()
@@ -1123,3 +1181,20 @@ class TestHessianVectorProdudoct:
         hessp_x_eval, hessp_y_eval = hessp_fn(**test)
         np.testing.assert_allclose(hessp_x_eval, [2, 4, 6])
         np.testing.assert_allclose(hessp_y_eval, [-6, -4, -2])
+
+
+def test_scalar_pullback():
+    xtm1 = float64("xtm1")
+    xt = xtm1**2
+
+    dout_dxt = float64("dout_dxt")
+    dout_dxtm1 = pullback(xt, wrt=xtm1, cotangents=dout_dxt)
+    assert dout_dxtm1.type == dout_dxt.type
+    assert dout_dxtm1.eval({xtm1: 3.0, dout_dxt: 1.5}) == 2 * 3.0 * 1.5
+
+
+def test_disconnected_type_filter_variable_raises():
+    # Regression: the override was misspelled (fiter_variable), so the base
+    # Type.filter_variable was used and assignment silently went unguarded.
+    with pytest.raises(AssertionError, match="DisconnectedType"):
+        DisconnectedType().filter_variable(vector("x"))

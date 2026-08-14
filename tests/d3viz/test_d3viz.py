@@ -7,14 +7,16 @@ import pytest
 
 import pytensor.d3viz as d3v
 from pytensor import compile
-from pytensor.compile.function import function
+from pytensor.compile.maker import function
 from pytensor.configdefaults import config
-from pytensor.printing import pydot_imported, pydot_imported_msg
+from pytensor.printing import _try_pydot_import
 from tests.d3viz import models
 
 
-if not pydot_imported:
-    pytest.skip("pydot not available: " + pydot_imported_msg, allow_module_level=True)
+try:
+    _try_pydot_import()
+except Exception as e:
+    pytest.skip(f"pydot not available: {e!s}", allow_module_level=True)
 
 
 class TestD3Viz:
@@ -26,7 +28,7 @@ class TestD3Viz:
         tmp_dir = Path(tempfile.mkdtemp())
         html_file = tmp_dir / "index.html"
         if verbose:
-            print(html_file)
+            print(html_file)  # noqa: T201
         d3v.d3viz(f, html_file)
         assert html_file.stat().st_size > 0
         if reference:

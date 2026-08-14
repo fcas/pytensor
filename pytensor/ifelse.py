@@ -17,16 +17,22 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-import pytensor.tensor as pt
-from pytensor import as_symbolic
+from pytensor.basic import as_symbolic
 from pytensor.compile import optdb
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Apply, Variable, apply_depends_on
+from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import _NoPythonOp
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.basic import GraphRewriter, in2out, node_rewriter
+from pytensor.graph.traversal import apply_depends_on
 from pytensor.graph.type import HasDataType, HasShape
-from pytensor.tensor.shape import Reshape, Shape, SpecifyShape, Unbroadcast
+from pytensor.tensor import as_tensor_variable
+from pytensor.tensor.basic import Alloc, zeros_like
+from pytensor.tensor.blockwise import Blockwise
+from pytensor.tensor.elemwise import DimShuffle, Elemwise
+from pytensor.tensor.math import Argmax, Dot, Max
+from pytensor.tensor.shape import Reshape, Shape, SpecifyShape
+from pytensor.tensor.subtensor import IncSubtensor, Subtensor
 
 
 if TYPE_CHECKING:
@@ -97,7 +103,7 @@ class IfElse(_NoPythonOp):
             args.append("inplace")
         return f"if{{{','.join(args)}}}"
 
-    def infer_shape(self, fgraph, node, inputs_shapes):
+    def infer_shape(self, node, inputs_shapes):
         # By construction, corresponding then/else pairs have the same number
         # of dimensions
 
@@ -159,7 +165,7 @@ class IfElse(_NoPythonOp):
                 f"{int(2 * self.n_outs)}, got {len(true_false_branches)}"
             )
 
-        condition = pt.basic.as_tensor_variable(condition)
+        condition = as_tensor_variable(condition)
 
         if condition.type.ndim > 0:
             raise TypeError("The condition argument must be a truthy scalar value")
@@ -235,10 +241,10 @@ class IfElse(_NoPythonOp):
             output_vars,
         )
 
-    def R_op(self, inputs, eval_points):
+    def pushforward(self, inputs, outputs, eval_points):
         return self(inputs[0], *eval_points[1:], return_list=True)
 
-    def grad(self, ins, grads):
+    def pullback(self, ins, outputs, grads):
         condition = ins[0]
         inputs_true_branch = ins[1:][: self.n_outs]
         inputs_false_branch = ins[1:][self.n_outs :]
@@ -261,14 +267,14 @@ class IfElse(_NoPythonOp):
             [condition]
             + grads
             + [
-                pt.basic.zeros_like(t, dtype=grads[i].dtype)
+                zeros_like(t, dtype=grads[i].dtype)
                 for i, t in enumerate(inputs_true_branch)
             ]
         )
         inputs_false_grad = (
             [condition]
             + [
-                pt.basic.zeros_like(f, dtype=grads[i].dtype)
+                zeros_like(f, dtype=grads[i].dtype)
                 for i, f in enumerate(inputs_false_branch)
             ]
             + grads
@@ -305,8 +311,8 @@ class IfElse(_NoPythonOp):
                     if len(ls) > 0:
                         return ls
                     else:
-                        # strict=False because we are in a hot loop
-                        for out, t in zip(outputs, input_true_branch, strict=False):
+                        # zip strict not specified because we are in a hot loop
+                        for out, t in zip(outputs, input_true_branch):
                             compute_map[out][0] = 1
                             val = storage_map[t][0]
                             if self.as_view:
@@ -326,8 +332,8 @@ class IfElse(_NoPythonOp):
                     if len(ls) > 0:
                         return ls
                     else:
-                        # strict=False because we are in a hot loop
-                        for out, f in zip(outputs, inputs_false_branch, strict=False):
+                        # zip strict not specified because we are in a hot loop
+                        for out, f in zip(outputs, inputs_false_branch):
                             compute_map[out][0] = 1
                             # can't view both outputs unless destroyhandler
                             # improves
@@ -417,21 +423,16 @@ def ifelse(
 @node_rewriter([IfElse])
 def cond_make_inplace(fgraph, node):
     op = node.op
-    if (
-        isinstance(op, IfElse)
-        and not op.as_view
-        and
-        # For big graph, do not make inplace scalar to speed up
-        # optimization.
-        (
-            len(fgraph.apply_nodes) < 500
-            or not all(getattr(o.type, "ndim", -1) == 0 for o in node.outputs)
-        )
+    if op.as_view:
+        return False
+    # For big graph, do not make inplace scalar to speed up optimization.
+    if len(fgraph.apply_nodes) >= 500 and all(
+        getattr(o.type, "ndim", -1) == 0 for o in node.outputs
     ):
-        return IfElse(n_outs=op.n_outs, as_view=True, name=op.name)(
-            *node.inputs, return_list=True
-        )
-    return False
+        return False
+    return IfElse(n_outs=op.n_outs, as_view=True, name=op.name)(
+        *node.inputs, return_list=True
+    )
 
 
 optdb.register(
@@ -481,16 +482,15 @@ acceptable_ops = (
     Shape,
     SpecifyShape,
     Reshape,
-    Unbroadcast,
-    pt.math.Dot,
-    pt.math.Max,
-    pt.math.Argmax,
-    pt.subtensor.Subtensor,
-    pt.subtensor.IncSubtensor,
-    pt.basic.Alloc,
-    pt.elemwise.Elemwise,
-    pt.elemwise.DimShuffle,
-    pt.blockwise.Blockwise,
+    Dot,
+    Max,
+    Argmax,
+    Subtensor,
+    IncSubtensor,
+    Alloc,
+    Elemwise,
+    DimShuffle,
+    Blockwise,
 )
 
 
@@ -544,8 +544,6 @@ def ifelse_lift_single_if_through_acceptable_ops(fgraph, main_node):
 @node_rewriter([IfElse])
 def cond_merge_ifs_true(fgraph, node):
     op = node.op
-    if not isinstance(op, IfElse):
-        return False
     t_ins = node.inputs[1:][: op.n_outs]
 
     replace = {}
@@ -571,8 +569,6 @@ def cond_merge_ifs_true(fgraph, node):
 @node_rewriter([IfElse])
 def cond_merge_ifs_false(fgraph, node):
     op = node.op
-    if not isinstance(op, IfElse):
-        return False
     f_ins = node.inputs[1:][op.n_outs :]
 
     replace = {}
@@ -651,8 +647,6 @@ class CondMerge(GraphRewriter):
 def cond_remove_identical(fgraph, node):
     op = node.op
 
-    if not isinstance(op, IfElse):
-        return False
     aes = node.inputs[1:][: op.n_outs]
     fs = node.inputs[1:][op.n_outs :]
 

@@ -3,9 +3,11 @@ import pytest
 import scipy as sp
 
 import pytensor
+import pytensor.sparse.math as smath
 from pytensor import sparse
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.configdefaults import config
+from pytensor.link.numba import NumbaLinker
 from pytensor.sparse.rewriting import SamplingDotCSR, sd_csc
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.math import sum as pt_sum
@@ -67,22 +69,28 @@ def test_local_csm_grad_c():
 @pytest.mark.skipif(
     not pytensor.config.cxx, reason="G++ not available, so we need to skip this test."
 )
+@pytest.mark.skipif(
+    isinstance(get_default_mode().linker, NumbaLinker),
+    reason="This is a C-specific test",
+)
 def test_local_mul_s_d():
-    mode = get_default_mode()
-    mode = mode.including("specialize", "local_mul_s_d")
-
     for sp_format in sparse.sparse_formats:
         inputs = [getattr(pytensor.sparse, sp_format + "_matrix")(), matrix()]
 
-        f = pytensor.function(inputs, sparse.mul_s_d(*inputs), mode=mode)
+        f = pytensor.function(inputs, smath.mul_s_d(*inputs), mode="CVM")
 
         assert not any(
-            isinstance(node.op, sparse.MulSD) for node in f.maker.fgraph.toposort()
+            isinstance(node.op, smath.SparseDenseMultiply)
+            for node in f.maker.fgraph.toposort()
         )
 
 
 @pytest.mark.skipif(
     not pytensor.config.cxx, reason="G++ not available, so we need to skip this test."
+)
+@pytest.mark.skipif(
+    isinstance(get_default_mode().linker, NumbaLinker),
+    reason="This is a C-specific test",
 )
 def test_local_mul_s_v():
     mode = get_default_mode()
@@ -91,27 +99,10 @@ def test_local_mul_s_v():
     for sp_format in ["csr"]:  # Not implemented for other format
         inputs = [getattr(pytensor.sparse, sp_format + "_matrix")(), vector()]
 
-        f = pytensor.function(inputs, sparse.mul_s_v(*inputs), mode=mode)
+        f = pytensor.function(inputs, smath.mul_s_v(*inputs), mode="CVM")
 
         assert not any(
-            isinstance(node.op, sparse.MulSV) for node in f.maker.fgraph.toposort()
-        )
-
-
-@pytest.mark.skipif(
-    not pytensor.config.cxx, reason="G++ not available, so we need to skip this test."
-)
-def test_local_structured_add_s_v():
-    mode = get_default_mode()
-    mode = mode.including("specialize", "local_structured_add_s_v")
-
-    for sp_format in ["csr"]:  # Not implemented for other format
-        inputs = [getattr(pytensor.sparse, sp_format + "_matrix")(), vector()]
-
-        f = pytensor.function(inputs, sparse.structured_add_s_v(*inputs), mode=mode)
-
-        assert not any(
-            isinstance(node.op, sparse.StructuredAddSV)
+            isinstance(node.op, smath.SparseDenseVectorMultiply)
             for node in f.maker.fgraph.toposort()
         )
 
@@ -119,10 +110,30 @@ def test_local_structured_add_s_v():
 @pytest.mark.skipif(
     not pytensor.config.cxx, reason="G++ not available, so we need to skip this test."
 )
-def test_local_sampling_dot_csr():
-    mode = get_default_mode()
-    mode = mode.including("specialize", "local_sampling_dot_csr")
+@pytest.mark.skipif(
+    isinstance(get_default_mode().linker, NumbaLinker),
+    reason="This is a C-specific test",
+)
+def test_local_structured_add_s_v():
+    for sp_format in ["csr"]:  # Not implemented for other format
+        inputs = [getattr(pytensor.sparse, sp_format + "_matrix")(), vector()]
 
+        f = pytensor.function(inputs, smath.structured_add_s_v(*inputs), mode="CVM")
+
+        assert not any(
+            isinstance(node.op, smath.StructuredAddSV)
+            for node in f.maker.fgraph.toposort()
+        )
+
+
+@pytest.mark.skipif(
+    not pytensor.config.cxx, reason="G++ not available, so we need to skip this test."
+)
+@pytest.mark.skipif(
+    isinstance(get_default_mode().linker, NumbaLinker),
+    reason="This is a C-specific test",
+)
+def test_local_sampling_dot_csr():
     for sp_format in ["csr"]:  # Not implemented for other format
         inputs = [
             matrix(),
@@ -130,11 +141,11 @@ def test_local_sampling_dot_csr():
             getattr(pytensor.sparse, sp_format + "_matrix")(),
         ]
 
-        f = pytensor.function(inputs, sparse.sampling_dot(*inputs), mode=mode)
+        f = pytensor.function(inputs, smath.sampling_dot(*inputs), mode="CVM")
 
         if pytensor.config.blas__ldflags:
             assert not any(
-                isinstance(node.op, sparse.SamplingDot)
+                isinstance(node.op, smath.SamplingDot)
                 for node in f.maker.fgraph.toposort()
             )
         else:

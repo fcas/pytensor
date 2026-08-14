@@ -5,7 +5,7 @@ import pytensor
 import pytensor.tensor as pt
 from pytensor.configdefaults import config
 from pytensor.graph.fg import FunctionGraph
-from pytensor.printing import debugprint, pydot_imported, pydotprint
+from pytensor.printing import _try_pydot_import, debugprint, pydotprint
 from pytensor.tensor.type import dvector, iscalar, scalar, vector
 
 
@@ -15,7 +15,7 @@ def test_debugprint_sitsot():
     A = dvector("A")
 
     # Symbolic description of the result
-    result, updates = pytensor.scan(
+    result, _updates = pytensor.scan(
         fn=lambda prior_result, A: prior_result * A,
         outputs_info=pt.ones_like(A),
         non_sequences=A,
@@ -36,33 +36,31 @@ def test_debugprint_sitsot():
      │  │  │  │  │  ├─ k [id D]
      │  │  │  │  │  └─ Subtensor{i} [id H]
      │  │  │  │  │     ├─ Shape [id I]
-     │  │  │  │  │     │  └─ Unbroadcast{0} [id J]
-     │  │  │  │  │     │     └─ ExpandDims{axis=0} [id K]
-     │  │  │  │  │     │        └─ Second [id L]
-     │  │  │  │  │     │           ├─ A [id M]
-     │  │  │  │  │     │           └─ ExpandDims{axis=0} [id N]
-     │  │  │  │  │     │              └─ 1.0 [id O]
-     │  │  │  │  │     └─ 0 [id P]
-     │  │  │  │  └─ Subtensor{i} [id Q]
-     │  │  │  │     ├─ Shape [id R]
-     │  │  │  │     │  └─ Unbroadcast{0} [id J]
-     │  │  │  │     │     └─ ···
-     │  │  │  │     └─ 1 [id S]
-     │  │  │  ├─ Unbroadcast{0} [id J]
+     │  │  │  │  │     │  └─ ExpandDims{axis=0} [id J]
+     │  │  │  │  │     │     └─ Second [id K]
+     │  │  │  │  │     │        ├─ A [id L]
+     │  │  │  │  │     │        └─ ExpandDims{axis=0} [id M]
+     │  │  │  │  │     │           └─ 1.0 [id N]
+     │  │  │  │  │     └─ 0 [id O]
+     │  │  │  │  └─ Subtensor{i} [id P]
+     │  │  │  │     ├─ Shape [id I]
+     │  │  │  │     │  └─ ···
+     │  │  │  │     └─ 1 [id Q]
+     │  │  │  ├─ ExpandDims{axis=0} [id J]
      │  │  │  │  └─ ···
-     │  │  │  └─ ScalarFromTensor [id T]
+     │  │  │  └─ ScalarFromTensor [id R]
      │  │  │     └─ Subtensor{i} [id H]
      │  │  │        └─ ···
-     │  │  └─ A [id M] (outer_in_non_seqs-0)
-     │  └─ 1 [id U]
-     └─ -1 [id V]
+     │  │  └─ A [id L] (outer_in_non_seqs-0)
+     │  └─ 1 [id S]
+     └─ -1 [id T]
 
     Inner graphs:
 
     Scan{scan_fn, while_loop=False, inplace=none} [id C]
-     ← Mul [id W] (inner_out_sit_sot-0)
-        ├─ *0-<Vector(float64, shape=(?,))> [id X] -> [id E] (inner_in_sit_sot-0)
-        └─ *1-<Vector(float64, shape=(?,))> [id Y] -> [id M] (inner_in_non_seqs-0)
+     ← Mul [id U] (inner_out_sit_sot-0)
+        ├─ i0 [id V] -> [id E] (inner_in_sit_sot-0)
+        └─ i1 [id W] -> [id L] (inner_in_non_seqs-0)
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -74,7 +72,7 @@ def test_debugprint_sitsot_no_extra_info():
     A = dvector("A")
 
     # Symbolic description of the result
-    result, updates = pytensor.scan(
+    result, _updates = pytensor.scan(
         fn=lambda prior_result, A: prior_result * A,
         outputs_info=pt.ones_like(A),
         non_sequences=A,
@@ -95,33 +93,31 @@ def test_debugprint_sitsot_no_extra_info():
      │  │  │  │  │  ├─ k [id D]
      │  │  │  │  │  └─ Subtensor{i} [id H]
      │  │  │  │  │     ├─ Shape [id I]
-     │  │  │  │  │     │  └─ Unbroadcast{0} [id J]
-     │  │  │  │  │     │     └─ ExpandDims{axis=0} [id K]
-     │  │  │  │  │     │        └─ Second [id L]
-     │  │  │  │  │     │           ├─ A [id M]
-     │  │  │  │  │     │           └─ ExpandDims{axis=0} [id N]
-     │  │  │  │  │     │              └─ 1.0 [id O]
-     │  │  │  │  │     └─ 0 [id P]
-     │  │  │  │  └─ Subtensor{i} [id Q]
-     │  │  │  │     ├─ Shape [id R]
-     │  │  │  │     │  └─ Unbroadcast{0} [id J]
-     │  │  │  │     │     └─ ···
-     │  │  │  │     └─ 1 [id S]
-     │  │  │  ├─ Unbroadcast{0} [id J]
+     │  │  │  │  │     │  └─ ExpandDims{axis=0} [id J]
+     │  │  │  │  │     │     └─ Second [id K]
+     │  │  │  │  │     │        ├─ A [id L]
+     │  │  │  │  │     │        └─ ExpandDims{axis=0} [id M]
+     │  │  │  │  │     │           └─ 1.0 [id N]
+     │  │  │  │  │     └─ 0 [id O]
+     │  │  │  │  └─ Subtensor{i} [id P]
+     │  │  │  │     ├─ Shape [id I]
+     │  │  │  │     │  └─ ···
+     │  │  │  │     └─ 1 [id Q]
+     │  │  │  ├─ ExpandDims{axis=0} [id J]
      │  │  │  │  └─ ···
-     │  │  │  └─ ScalarFromTensor [id T]
+     │  │  │  └─ ScalarFromTensor [id R]
      │  │  │     └─ Subtensor{i} [id H]
      │  │  │        └─ ···
-     │  │  └─ A [id M]
-     │  └─ 1 [id U]
-     └─ -1 [id V]
+     │  │  └─ A [id L]
+     │  └─ 1 [id S]
+     └─ -1 [id T]
 
     Inner graphs:
 
     Scan{scan_fn, while_loop=False, inplace=none} [id C]
-     ← Mul [id W]
-        ├─ *0-<Vector(float64, shape=(?,))> [id X] -> [id E]
-        └─ *1-<Vector(float64, shape=(?,))> [id Y] -> [id M]
+     ← Mul [id U]
+        ├─ i0 [id V] -> [id E]
+        └─ i1 [id W] -> [id L]
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -136,9 +132,10 @@ def test_debugprint_nitsot():
     max_coefficients_supported = 10000
 
     # Generate the components of the polynomial
-    components, updates = pytensor.scan(
-        fn=lambda coefficient, power, free_variable: coefficient
-        * (free_variable**power),
+    components, _updates = pytensor.scan(
+        fn=lambda coefficient, power, free_variable: (
+            coefficient * (free_variable**power)
+        ),
         outputs_info=None,
         sequences=[coefficients, pt.arange(max_coefficients_supported)],
         non_sequences=x,
@@ -187,10 +184,10 @@ def test_debugprint_nitsot():
 
     Scan{scan_fn, while_loop=False, inplace=none} [id B]
      ← Mul [id X] (inner_out_nit_sot-0)
-        ├─ *0-<Scalar(float64, shape=())> [id Y] -> [id S] (inner_in_seqs-0)
+        ├─ i0 [id Y] -> [id S] (inner_in_seqs-0)
         └─ Pow [id Z]
-           ├─ *2-<Scalar(float64, shape=())> [id BA] -> [id W] (inner_in_non_seqs-0)
-           └─ *1-<Scalar(int64, shape=())> [id BB] -> [id U] (inner_in_seqs-1)
+           ├─ i2 [id BA] -> [id W] (inner_in_non_seqs-0)
+           └─ i1 [id BB] -> [id U] (inner_in_seqs-1)
    """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -206,7 +203,7 @@ def test_debugprint_nested_scans():
     A = dvector("A")
 
     def compute_A_k(A, k):
-        result, updates = pytensor.scan(
+        result, _updates = pytensor.scan(
             fn=lambda prior_result, A: prior_result * A,
             outputs_info=pt.ones_like(A),
             non_sequences=A,
@@ -217,7 +214,7 @@ def test_debugprint_nested_scans():
 
         return A_k
 
-    components, updates = pytensor.scan(
+    components, _updates = pytensor.scan(
         fn=lambda c, power, some_A, some_k: c * (compute_A_k(some_A, some_k) ** power),
         outputs_info=None,
         sequences=[c, pt.arange(n)],
@@ -268,45 +265,43 @@ def test_debugprint_nested_scans():
     Scan{scan_fn, while_loop=False, inplace=none} [id B]
      ← Mul [id Y] (inner_out_nit_sot-0)
         ├─ ExpandDims{axis=0} [id Z]
-        │  └─ *0-<Scalar(float64, shape=())> [id BA] -> [id S] (inner_in_seqs-0)
+        │  └─ i0 [id BA] -> [id S] (inner_in_seqs-0)
         └─ Pow [id BB]
            ├─ Subtensor{i} [id BC]
            │  ├─ Subtensor{start:} [id BD]
            │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id BE] (outer_out_sit_sot-0)
-           │  │  │  ├─ *3-<Scalar(int32, shape=())> [id BF] -> [id X] (inner_in_non_seqs-1) (n_steps)
+           │  │  │  ├─ i3 [id BF] -> [id X] (inner_in_non_seqs-1) (n_steps)
            │  │  │  ├─ SetSubtensor{:stop} [id BG] (outer_in_sit_sot-0)
            │  │  │  │  ├─ AllocEmpty{dtype='float64'} [id BH]
            │  │  │  │  │  ├─ Add [id BI]
-           │  │  │  │  │  │  ├─ *3-<Scalar(int32, shape=())> [id BF] -> [id X] (inner_in_non_seqs-1)
+           │  │  │  │  │  │  ├─ i3 [id BF] -> [id X] (inner_in_non_seqs-1)
            │  │  │  │  │  │  └─ Subtensor{i} [id BJ]
            │  │  │  │  │  │     ├─ Shape [id BK]
-           │  │  │  │  │  │     │  └─ Unbroadcast{0} [id BL]
-           │  │  │  │  │  │     │     └─ ExpandDims{axis=0} [id BM]
-           │  │  │  │  │  │     │        └─ Second [id BN]
-           │  │  │  │  │  │     │           ├─ *2-<Vector(float64, shape=(?,))> [id BO] -> [id W] (inner_in_non_seqs-0)
-           │  │  │  │  │  │     │           └─ ExpandDims{axis=0} [id BP]
-           │  │  │  │  │  │     │              └─ 1.0 [id BQ]
-           │  │  │  │  │  │     └─ 0 [id BR]
-           │  │  │  │  │  └─ Subtensor{i} [id BS]
-           │  │  │  │  │     ├─ Shape [id BT]
-           │  │  │  │  │     │  └─ Unbroadcast{0} [id BL]
-           │  │  │  │  │     │     └─ ···
-           │  │  │  │  │     └─ 1 [id BU]
-           │  │  │  │  ├─ Unbroadcast{0} [id BL]
+           │  │  │  │  │  │     │  └─ ExpandDims{axis=0} [id BL]
+           │  │  │  │  │  │     │     └─ Second [id BM]
+           │  │  │  │  │  │     │        ├─ i2 [id BN] -> [id W] (inner_in_non_seqs-0)
+           │  │  │  │  │  │     │        └─ ExpandDims{axis=0} [id BO]
+           │  │  │  │  │  │     │           └─ 1.0 [id BP]
+           │  │  │  │  │  │     └─ 0 [id BQ]
+           │  │  │  │  │  └─ Subtensor{i} [id BR]
+           │  │  │  │  │     ├─ Shape [id BK]
+           │  │  │  │  │     │  └─ ···
+           │  │  │  │  │     └─ 1 [id BS]
+           │  │  │  │  ├─ ExpandDims{axis=0} [id BL]
            │  │  │  │  │  └─ ···
-           │  │  │  │  └─ ScalarFromTensor [id BV]
+           │  │  │  │  └─ ScalarFromTensor [id BT]
            │  │  │  │     └─ Subtensor{i} [id BJ]
            │  │  │  │        └─ ···
-           │  │  │  └─ *2-<Vector(float64, shape=(?,))> [id BO] -> [id W] (inner_in_non_seqs-0) (outer_in_non_seqs-0)
-           │  │  └─ 1 [id BW]
-           │  └─ -1 [id BX]
-           └─ ExpandDims{axis=0} [id BY]
-              └─ *1-<Scalar(int64, shape=())> [id BZ] -> [id U] (inner_in_seqs-1)
+           │  │  │  └─ i2 [id BN] -> [id W] (inner_in_non_seqs-0) (outer_in_non_seqs-0)
+           │  │  └─ 1 [id BU]
+           │  └─ -1 [id BV]
+           └─ ExpandDims{axis=0} [id BW]
+              └─ i1 [id BX] -> [id U] (inner_in_seqs-1)
 
     Scan{scan_fn, while_loop=False, inplace=none} [id BE]
-     ← Mul [id CA] (inner_out_sit_sot-0)
-        ├─ *0-<Vector(float64, shape=(?,))> [id CB] -> [id BG] (inner_in_sit_sot-0)
-        └─ *1-<Vector(float64, shape=(?,))> [id CC] -> [id BO] (inner_in_non_seqs-0)
+     ← Mul [id BY] (inner_out_sit_sot-0)
+        ├─ i0 [id BZ] -> [id BG] (inner_in_sit_sot-0)
+        └─ i1 [id CA] -> [id BN] (inner_in_non_seqs-0)
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -360,53 +355,51 @@ def test_debugprint_nested_scans():
     Inner graphs:
 
     Scan{scan_fn, while_loop=False, inplace=none} [id E]
-     → *0-<Scalar(float64, shape=())> [id Y] -> [id U] (inner_in_seqs-0)
-     → *1-<Scalar(int64, shape=())> [id Z] -> [id W] (inner_in_seqs-1)
-     → *2-<Vector(float64, shape=(?,))> [id BA] -> [id C] (inner_in_non_seqs-0)
-     → *3-<Scalar(int32, shape=())> [id BB] -> [id B] (inner_in_non_seqs-1)
+     → i0 [id Y] -> [id U] (inner_in_seqs-0)
+     → i1 [id Z] -> [id W] (inner_in_seqs-1)
+     → i2 [id BA] -> [id C] (inner_in_non_seqs-0)
+     → i3 [id BB] -> [id B] (inner_in_non_seqs-1)
      ← Mul [id BC] (inner_out_nit_sot-0)
         ├─ ExpandDims{axis=0} [id BD]
-        │  └─ *0-<Scalar(float64, shape=())> [id Y] (inner_in_seqs-0)
+        │  └─ i0 [id Y] (inner_in_seqs-0)
         └─ Pow [id BE]
            ├─ Subtensor{i} [id BF]
            │  ├─ Subtensor{start:} [id BG]
            │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id BH] (outer_out_sit_sot-0)
-           │  │  │  ├─ *3-<Scalar(int32, shape=())> [id BB] (inner_in_non_seqs-1) (n_steps)
+           │  │  │  ├─ i3 [id BB] (inner_in_non_seqs-1) (n_steps)
            │  │  │  ├─ SetSubtensor{:stop} [id BI] (outer_in_sit_sot-0)
            │  │  │  │  ├─ AllocEmpty{dtype='float64'} [id BJ]
            │  │  │  │  │  ├─ Add [id BK]
-           │  │  │  │  │  │  ├─ *3-<Scalar(int32, shape=())> [id BB] (inner_in_non_seqs-1)
+           │  │  │  │  │  │  ├─ i3 [id BB] (inner_in_non_seqs-1)
            │  │  │  │  │  │  └─ Subtensor{i} [id BL]
            │  │  │  │  │  │     ├─ Shape [id BM]
-           │  │  │  │  │  │     │  └─ Unbroadcast{0} [id BN]
-           │  │  │  │  │  │     │     └─ ExpandDims{axis=0} [id BO]
-           │  │  │  │  │  │     │        └─ Second [id BP]
-           │  │  │  │  │  │     │           ├─ *2-<Vector(float64, shape=(?,))> [id BA] (inner_in_non_seqs-0)
-           │  │  │  │  │  │     │           └─ ExpandDims{axis=0} [id BQ]
-           │  │  │  │  │  │     │              └─ 1.0 [id BR]
-           │  │  │  │  │  │     └─ 0 [id BS]
-           │  │  │  │  │  └─ Subtensor{i} [id BT]
-           │  │  │  │  │     ├─ Shape [id BU]
-           │  │  │  │  │     │  └─ Unbroadcast{0} [id BN]
-           │  │  │  │  │     │     └─ ···
-           │  │  │  │  │     └─ 1 [id BV]
-           │  │  │  │  ├─ Unbroadcast{0} [id BN]
+           │  │  │  │  │  │     │  └─ ExpandDims{axis=0} [id BN]
+           │  │  │  │  │  │     │     └─ Second [id BO]
+           │  │  │  │  │  │     │        ├─ i2 [id BA] (inner_in_non_seqs-0)
+           │  │  │  │  │  │     │        └─ ExpandDims{axis=0} [id BP]
+           │  │  │  │  │  │     │           └─ 1.0 [id BQ]
+           │  │  │  │  │  │     └─ 0 [id BR]
+           │  │  │  │  │  └─ Subtensor{i} [id BS]
+           │  │  │  │  │     ├─ Shape [id BM]
+           │  │  │  │  │     │  └─ ···
+           │  │  │  │  │     └─ 1 [id BT]
+           │  │  │  │  ├─ ExpandDims{axis=0} [id BN]
            │  │  │  │  │  └─ ···
-           │  │  │  │  └─ ScalarFromTensor [id BW]
+           │  │  │  │  └─ ScalarFromTensor [id BU]
            │  │  │  │     └─ Subtensor{i} [id BL]
            │  │  │  │        └─ ···
-           │  │  │  └─ *2-<Vector(float64, shape=(?,))> [id BA] (inner_in_non_seqs-0) (outer_in_non_seqs-0)
-           │  │  └─ 1 [id BX]
-           │  └─ -1 [id BY]
-           └─ ExpandDims{axis=0} [id BZ]
-              └─ *1-<Scalar(int64, shape=())> [id Z] (inner_in_seqs-1)
+           │  │  │  └─ i2 [id BA] (inner_in_non_seqs-0) (outer_in_non_seqs-0)
+           │  │  └─ 1 [id BV]
+           │  └─ -1 [id BW]
+           └─ ExpandDims{axis=0} [id BX]
+              └─ i1 [id Z] (inner_in_seqs-1)
 
     Scan{scan_fn, while_loop=False, inplace=none} [id BH]
-     → *0-<Vector(float64, shape=(?,))> [id CA] -> [id BI] (inner_in_sit_sot-0)
-     → *1-<Vector(float64, shape=(?,))> [id CB] -> [id BA] (inner_in_non_seqs-0)
-     ← Mul [id CC] (inner_out_sit_sot-0)
-        ├─ *0-<Vector(float64, shape=(?,))> [id CA] (inner_in_sit_sot-0)
-        └─ *1-<Vector(float64, shape=(?,))> [id CB] (inner_in_non_seqs-0)
+     → i0 [id BY] -> [id BI] (inner_in_sit_sot-0)
+     → i1 [id BZ] -> [id BA] (inner_in_non_seqs-0)
+     ← Mul [id CA] (inner_out_sit_sot-0)
+        ├─ i0 [id BY] (inner_in_sit_sot-0)
+        └─ i1 [id BZ] (inner_in_non_seqs-0)
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -478,11 +471,11 @@ def test_debugprint_mitsot():
 
     Scan{scan_fn, while_loop=False, inplace=none} [id C]
      ← Add [id BB] (inner_out_mit_sot-0)
-        ├─ *1-<Scalar(int64, shape=())> [id BC] -> [id E] (inner_in_mit_sot-0-1)
-        └─ *0-<Scalar(int64, shape=())> [id BD] -> [id E] (inner_in_mit_sot-0-0)
+        ├─ i1 [id BC] -> [id E] (inner_in_mit_sot-0-1)
+        └─ i0 [id BD] -> [id E] (inner_in_mit_sot-0-0)
      ← Add [id BE] (inner_out_mit_sot-1)
-        ├─ *3-<Scalar(int64, shape=())> [id BF] -> [id O] (inner_in_mit_sot-1-1)
-        └─ *2-<Scalar(int64, shape=())> [id BG] -> [id O] (inner_in_mit_sot-1-0)
+        ├─ i3 [id BF] -> [id O] (inner_in_mit_sot-1-1)
+        └─ i2 [id BG] -> [id O] (inner_in_mit_sot-1-0)
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -495,7 +488,7 @@ def test_debugprint_mitmot():
     A = dvector("A")
 
     # Symbolic description of the result
-    result, updates = pytensor.scan(
+    result, _updates = pytensor.scan(
         fn=lambda prior_result, A: prior_result * A,
         outputs_info=pt.ones_like(A),
         non_sequences=A,
@@ -520,106 +513,94 @@ def test_debugprint_mitmot():
      │  │  │  │     │  │  │  ├─ k [id G]
      │  │  │  │     │  │  │  └─ Subtensor{i} [id K]
      │  │  │  │     │  │  │     ├─ Shape [id L]
-     │  │  │  │     │  │  │     │  └─ Unbroadcast{0} [id M]
-     │  │  │  │     │  │  │     │     └─ ExpandDims{axis=0} [id N]
-     │  │  │  │     │  │  │     │        └─ Second [id O]
-     │  │  │  │     │  │  │     │           ├─ A [id P]
-     │  │  │  │     │  │  │     │           └─ ExpandDims{axis=0} [id Q]
-     │  │  │  │     │  │  │     │              └─ 1.0 [id R]
-     │  │  │  │     │  │  │     └─ 0 [id S]
-     │  │  │  │     │  │  └─ Subtensor{i} [id T]
-     │  │  │  │     │  │     ├─ Shape [id U]
-     │  │  │  │     │  │     │  └─ Unbroadcast{0} [id M]
-     │  │  │  │     │  │     │     └─ ···
-     │  │  │  │     │  │     └─ 1 [id V]
-     │  │  │  │     │  ├─ Unbroadcast{0} [id M]
+     │  │  │  │     │  │  │     │  └─ ExpandDims{axis=0} [id M]
+     │  │  │  │     │  │  │     │     └─ Second [id N]
+     │  │  │  │     │  │  │     │        ├─ A [id O]
+     │  │  │  │     │  │  │     │        └─ ExpandDims{axis=0} [id P]
+     │  │  │  │     │  │  │     │           └─ 1.0 [id Q]
+     │  │  │  │     │  │  │     └─ 0 [id R]
+     │  │  │  │     │  │  └─ Subtensor{i} [id S]
+     │  │  │  │     │  │     ├─ Shape [id L]
+     │  │  │  │     │  │     │  └─ ···
+     │  │  │  │     │  │     └─ 1 [id T]
+     │  │  │  │     │  ├─ ExpandDims{axis=0} [id M]
      │  │  │  │     │  │  └─ ···
-     │  │  │  │     │  └─ ScalarFromTensor [id W]
+     │  │  │  │     │  └─ ScalarFromTensor [id U]
      │  │  │  │     │     └─ Subtensor{i} [id K]
      │  │  │  │     │        └─ ···
-     │  │  │  │     └─ A [id P] (outer_in_non_seqs-0)
-     │  │  │  └─ 0 [id X]
-     │  │  └─ 1 [id Y]
-     │  ├─ Subtensor{:stop} [id Z] (outer_in_seqs-0)
-     │  │  ├─ Subtensor{::step} [id BA]
-     │  │  │  ├─ Subtensor{:stop} [id BB]
+     │  │  │  │     └─ A [id O] (outer_in_non_seqs-0)
+     │  │  │  └─ 0 [id V]
+     │  │  └─ 1 [id W]
+     │  ├─ Subtensor{:stop} [id X] (outer_in_seqs-0)
+     │  │  ├─ Subtensor{::step} [id Y]
+     │  │  │  ├─ Subtensor{:stop} [id Z]
      │  │  │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id F] (outer_out_sit_sot-0)
      │  │  │  │  │  └─ ···
-     │  │  │  │  └─ -1 [id BC]
-     │  │  │  └─ -1 [id BD]
-     │  │  └─ ScalarFromTensor [id BE]
+     │  │  │  │  └─ -1 [id BA]
+     │  │  │  └─ -1 [id BB]
+     │  │  └─ ScalarFromTensor [id BC]
      │  │     └─ Sub [id C]
      │  │        └─ ···
-     │  ├─ Subtensor{:stop} [id BF] (outer_in_seqs-1)
-     │  │  ├─ Subtensor{:stop} [id BG]
-     │  │  │  ├─ Subtensor{::step} [id BH]
+     │  ├─ Subtensor{::step} [id BD] (outer_in_mit_mot-0)
+     │  │  ├─ IncSubtensor{start:} [id BE]
+     │  │  │  ├─ Second [id BF]
      │  │  │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id F] (outer_out_sit_sot-0)
      │  │  │  │  │  └─ ···
-     │  │  │  │  └─ -1 [id BI]
-     │  │  │  └─ -1 [id BJ]
-     │  │  └─ ScalarFromTensor [id BK]
-     │  │     └─ Sub [id C]
-     │  │        └─ ···
-     │  ├─ Subtensor{::step} [id BL] (outer_in_mit_mot-0)
-     │  │  ├─ IncSubtensor{start:} [id BM]
-     │  │  │  ├─ Second [id BN]
-     │  │  │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id F] (outer_out_sit_sot-0)
-     │  │  │  │  │  └─ ···
-     │  │  │  │  └─ ExpandDims{axes=[0, 1]} [id BO]
-     │  │  │  │     └─ 0.0 [id BP]
-     │  │  │  ├─ IncSubtensor{i} [id BQ]
-     │  │  │  │  ├─ Second [id BR]
-     │  │  │  │  │  ├─ Subtensor{start:} [id BS]
+     │  │  │  │  └─ ExpandDims{axes=(0, 1)} [id BG]
+     │  │  │  │     └─ 0.0 [id BH]
+     │  │  │  ├─ IncSubtensor{i} [id BI]
+     │  │  │  │  ├─ Second [id BJ]
+     │  │  │  │  │  ├─ Subtensor{start:} [id BK]
      │  │  │  │  │  │  ├─ Scan{scan_fn, while_loop=False, inplace=none} [id F] (outer_out_sit_sot-0)
      │  │  │  │  │  │  │  └─ ···
-     │  │  │  │  │  │  └─ 1 [id BT]
-     │  │  │  │  │  └─ ExpandDims{axes=[0, 1]} [id BU]
-     │  │  │  │  │     └─ 0.0 [id BV]
-     │  │  │  │  ├─ Second [id BW]
-     │  │  │  │  │  ├─ Subtensor{i} [id BX]
-     │  │  │  │  │  │  ├─ Subtensor{start:} [id BS]
+     │  │  │  │  │  │  └─ 1 [id BL]
+     │  │  │  │  │  └─ ExpandDims{axes=(0, 1)} [id BM]
+     │  │  │  │  │     └─ 0.0 [id BN]
+     │  │  │  │  ├─ Second [id BO]
+     │  │  │  │  │  ├─ Subtensor{i} [id BP]
+     │  │  │  │  │  │  ├─ Subtensor{start:} [id BK]
      │  │  │  │  │  │  │  └─ ···
-     │  │  │  │  │  │  └─ -1 [id BY]
-     │  │  │  │  │  └─ ExpandDims{axis=0} [id BZ]
-     │  │  │  │  │     └─ Second [id CA]
-     │  │  │  │  │        ├─ Sum{axes=None} [id CB]
-     │  │  │  │  │        │  └─ Subtensor{i} [id BX]
+     │  │  │  │  │  │  └─ -1 [id BQ]
+     │  │  │  │  │  └─ ExpandDims{axis=0} [id BR]
+     │  │  │  │  │     └─ Second [id BS]
+     │  │  │  │  │        ├─ Sum{axes=None} [id BT]
+     │  │  │  │  │        │  └─ Subtensor{i} [id BP]
      │  │  │  │  │        │     └─ ···
-     │  │  │  │  │        └─ 1.0 [id CC]
-     │  │  │  │  └─ -1 [id BY]
-     │  │  │  └─ 1 [id BT]
-     │  │  └─ -1 [id CD]
-     │  ├─ Alloc [id CE] (outer_in_sit_sot-0)
-     │  │  ├─ 0.0 [id CF]
-     │  │  ├─ Add [id CG]
+     │  │  │  │  │        └─ 1.0 [id BU]
+     │  │  │  │  └─ -1 [id BQ]
+     │  │  │  └─ 1 [id BL]
+     │  │  └─ -1 [id BV]
+     │  ├─ Alloc [id BW] (outer_in_sit_sot-0)
+     │  │  ├─ 0.0 [id BX]
+     │  │  ├─ Add [id BY]
      │  │  │  ├─ Sub [id C]
      │  │  │  │  └─ ···
-     │  │  │  └─ 1 [id CH]
-     │  │  └─ Subtensor{i} [id CI]
-     │  │     ├─ Shape [id CJ]
-     │  │     │  └─ A [id P]
-     │  │     └─ 0 [id CK]
-     │  └─ A [id P] (outer_in_non_seqs-0)
-     └─ -1 [id CL]
+     │  │  │  └─ 1 [id BZ]
+     │  │  └─ Subtensor{i} [id CA]
+     │  │     ├─ Shape [id CB]
+     │  │     │  └─ A [id O]
+     │  │     └─ 0 [id CC]
+     │  └─ A [id O] (outer_in_non_seqs-0)
+     └─ -1 [id CD]
 
     Inner graphs:
 
     Scan{grad_of_scan_fn, while_loop=False, inplace=none} [id B]
-     ← Add [id CM] (inner_out_mit_mot-0-0)
-        ├─ Mul [id CN]
-        │  ├─ *2-<Vector(float64, shape=(?,))> [id CO] -> [id BL] (inner_in_mit_mot-0-0)
-        │  └─ *5-<Vector(float64, shape=(?,))> [id CP] -> [id P] (inner_in_non_seqs-0)
-        └─ *3-<Vector(float64, shape=(?,))> [id CQ] -> [id BL] (inner_in_mit_mot-0-1)
-     ← Add [id CR] (inner_out_sit_sot-0)
-        ├─ Mul [id CS]
-        │  ├─ *2-<Vector(float64, shape=(?,))> [id CO] -> [id BL] (inner_in_mit_mot-0-0)
-        │  └─ *0-<Vector(float64, shape=(?,))> [id CT] -> [id Z] (inner_in_seqs-0)
-        └─ *4-<Vector(float64, shape=(?,))> [id CU] -> [id CE] (inner_in_sit_sot-0)
+     ← Add [id CE] (inner_out_mit_mot-0-0)
+        ├─ Mul [id CF]
+        │  ├─ i1 [id CG] -> [id BD] (inner_in_mit_mot-0-0)
+        │  └─ i4 [id CH] -> [id O] (inner_in_non_seqs-0)
+        └─ i2 [id CI] -> [id BD] (inner_in_mit_mot-0-1)
+     ← Add [id CJ] (inner_out_sit_sot-0)
+        ├─ Mul [id CK]
+        │  ├─ i1 [id CG] -> [id BD] (inner_in_mit_mot-0-0)
+        │  └─ i0 [id CL] -> [id X] (inner_in_seqs-0)
+        └─ i3 [id CM] -> [id BW] (inner_in_sit_sot-0)
 
     Scan{scan_fn, while_loop=False, inplace=none} [id F]
-     ← Mul [id CV] (inner_out_sit_sot-0)
-        ├─ *0-<Vector(float64, shape=(?,))> [id CT] -> [id H] (inner_in_sit_sot-0)
-        └─ *1-<Vector(float64, shape=(?,))> [id CW] -> [id P] (inner_in_non_seqs-0)
+     ← Mul [id CN] (inner_out_sit_sot-0)
+        ├─ i0 [id CL] -> [id H] (inner_in_sit_sot-0)
+        └─ i1 [id CG] -> [id O] (inner_in_non_seqs-0)
     """
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
@@ -648,35 +629,37 @@ def test_debugprint_compiled_fn():
     # (i.e. from `Scan._fn`)
     out = pytensor.function([M], out, updates=updates, mode="FAST_RUN")
 
-    expected_output = """Scan{scan_fn, while_loop=False, inplace=all} [id A] 2 (outer_out_sit_sot-0)
-     ├─ 20000 [id B] (n_steps)
-     ├─ [    0 ... 998 19999] [id C] (outer_in_seqs-0)
-     ├─ SetSubtensor{:stop} [id D] 1 (outer_in_sit_sot-0)
-     │  ├─ AllocEmpty{dtype='int64'} [id E] 0
-     │  │  └─ 20000 [id B]
-     │  ├─ [0] [id F]
-     │  └─ 1 [id G]
-     └─ <Tensor3(float64, shape=(20000, 2, 2))> [id H] (outer_in_non_seqs-0)
+    expected_output = """Subtensor{start:} [id A] 3
+ ├─ Scan{scan_fn, while_loop=False, inplace=all} [id B] 2 (outer_out_sit_sot-0)
+ │  ├─ 20000 [id C] (n_steps)
+ │  ├─ [    0 ... 998 19999] [id D] (outer_in_seqs-0)
+ │  ├─ SetSubtensor{:stop} [id E] 1 (outer_in_sit_sot-0)
+ │  │  ├─ AllocEmpty{dtype='int64'} [id F] 0
+ │  │  │  └─ 20001 [id G]
+ │  │  ├─ [0] [id H]
+ │  │  └─ 1 [id I]
+ │  └─ <Tensor3(float64, shape=(20000, 2, 2))> [id J] (outer_in_non_seqs-0)
+ └─ 1 [id I]
 
-    Inner graphs:
+Inner graphs:
 
-    Scan{scan_fn, while_loop=False, inplace=all} [id A]
-     ← Composite{switch(lt(0, i0), 1, 0)} [id I] (inner_out_sit_sot-0)
-        └─ Subtensor{i, j, k} [id J]
-           ├─ *2-<Tensor3(float64, shape=(20000, 2, 2))> [id K] -> [id H] (inner_in_non_seqs-0)
-           ├─ ScalarFromTensor [id L]
-           │  └─ *0-<Scalar(int64, shape=())> [id M] -> [id C] (inner_in_seqs-0)
-           ├─ ScalarFromTensor [id N]
-           │  └─ *1-<Scalar(int64, shape=())> [id O] -> [id D] (inner_in_sit_sot-0)
-           └─ 0 [id P]
+Scan{scan_fn, while_loop=False, inplace=all} [id B]
+ ← Composite{switch(lt(0, i0), 1, 0)} [id K] (inner_out_sit_sot-0)
+    └─ Subtensor{i, j, k} [id L]
+       ├─ i2 [id M] -> [id J] (inner_in_non_seqs-0)
+       ├─ ScalarFromTensor [id N]
+       │  └─ i0 [id O] -> [id D] (inner_in_seqs-0)
+       ├─ ScalarFromTensor [id P]
+       │  └─ i1 [id Q] -> [id E] (inner_in_sit_sot-0)
+       └─ 0 [id R]
 
-    Composite{switch(lt(0, i0), 1, 0)} [id I]
-     ← Switch [id Q] 'o0'
-        ├─ LT [id R]
-        │  ├─ 0 [id S]
-        │  └─ i0 [id T]
-        ├─ 1 [id U]
-        └─ 0 [id S]
+Composite{switch(lt(0, i0), 1, 0)} [id K]
+ ← Switch [id S]
+    ├─ LT [id T]
+    │  ├─ 0 [id U]
+    │  └─ i0 [id V]
+    ├─ 1 [id W]
+    └─ 0 [id U]
     """
 
     output_str = debugprint(out, file="str", print_op_info=True)
@@ -684,6 +667,13 @@ def test_debugprint_compiled_fn():
 
     for truth, out in zip(expected_output.split("\n"), lines, strict=True):
         assert truth.strip() == out.strip()
+
+
+try:
+    _try_pydot_import()
+    pydot_imported = True
+except Exception:
+    pydot_imported = False
 
 
 @pytest.mark.skipif(not pydot_imported, reason="pydot not available")

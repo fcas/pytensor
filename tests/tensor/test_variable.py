@@ -7,9 +7,10 @@ from numpy.testing import assert_array_equal, assert_equal, assert_string_equal
 
 import pytensor
 import tests.unittest_tools as utt
-from pytensor.compile import DeepCopyOp
 from pytensor.compile.mode import get_default_mode
+from pytensor.compile.ops import DeepCopyOp
 from pytensor.graph.basic import Constant, equal_computations
+from pytensor.graph.traversal import io_toposort
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.basic import constant
 from pytensor.tensor.elemwise import DimShuffle
@@ -34,7 +35,7 @@ from pytensor.tensor.type import (
     scalar,
     tensor3,
 )
-from pytensor.tensor.type_other import MakeSlice, NoneConst
+from pytensor.tensor.type_other import NoneConst
 from pytensor.tensor.variable import (
     DenseTensorConstant,
     DenseTensorVariable,
@@ -44,7 +45,11 @@ from pytensor.tensor.variable import (
 from tests.tensor.utils import random
 
 
-pytestmark = pytest.mark.filterwarnings("error")
+pytestmark = pytest.mark.filterwarnings(
+    "error",
+    r"ignore:^Numba will use object mode to run.*perform method\.:UserWarning",
+    r"ignore:Cannot cache compiled function \"numba_funcified_fgraph.*:numba.NumbaWarning",
+)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +149,7 @@ def test__getitem__Subtensor():
     i = iscalar("i")
 
     z = x[i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == Subtensor
 
     # This should ultimately do nothing (i.e. just return `x`)
@@ -156,29 +161,29 @@ def test__getitem__Subtensor():
     # It lands in the `full_slices` condition in
     # `_tensor_py_operators.__getitem__`
     z = x[..., None]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert all(op_type == DimShuffle for op_type in op_types)
 
     z = x[None, :, None, :]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert all(op_type == DimShuffle for op_type in op_types)
 
     # This one lands in the non-`full_slices` condition in
     # `_tensor_py_operators.__getitem__`
     z = x[:i, :, None]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[1:] == [DimShuffle, Subtensor]
 
     z = x[:]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == Subtensor
 
     z = x[..., :]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == Subtensor
 
     z = x[..., i, :]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == Subtensor
 
 
@@ -187,24 +192,24 @@ def test__getitem__AdvancedSubtensor_bool():
     i = TensorType("bool", shape=(None, None))("i")
 
     z = x[i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
     i = TensorType("bool", shape=(None,))("i")
     z = x[:, i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
     i = TensorType("bool", shape=(None,))("i")
     z = x[..., i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
     with pytest.raises(TypeError):
         z = x[[True, False], i]
 
     z = x[ivector("b"), i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
 
@@ -215,26 +220,26 @@ def test__getitem__AdvancedSubtensor():
 
     # This is a `__getitem__` call that's redirected to `_tensor_py_operators.take`
     z = x[i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
     # This should index nothing (i.e. return an empty copy of `x`)
     # We check that the index is empty
     z = x[[]]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types == [AdvancedSubtensor]
     assert isinstance(z.owner.inputs[1], TensorConstant)
 
     z = x[:, i]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
-    assert op_types == [MakeSlice, AdvancedSubtensor]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
+    assert op_types == [AdvancedSubtensor]
 
     z = x[..., i, None]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
-    assert op_types == [MakeSlice, AdvancedSubtensor]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
+    assert op_types == [DimShuffle, AdvancedSubtensor]
 
     z = x[i, None]
-    op_types = [type(node.op) for node in pytensor.graph.basic.io_toposort([x, i], [z])]
+    op_types = [type(node.op) for node in io_toposort([x, i], [z])]
     assert op_types[-1] == AdvancedSubtensor
 
 
@@ -343,7 +348,7 @@ class TestTensorConstantSignature:
         # Also test that nan !=0 and nan != nan.
         x = scalar()
         mode = get_default_mode()
-        if isinstance(mode, pytensor.compile.debugmode.DebugMode):
+        if isinstance(mode, pytensor.compile.debug.debugmode.DebugMode):
             # Disable the check preventing usage of NaN / Inf values.
             # We first do a copy of the mode to avoid side effects on other tests.
             mode = copy(mode)
@@ -422,11 +427,13 @@ class TestTensorInstanceMethods:
             X.take(indices, -1, mode="clip").eval({X: x}),
             x.take(indices, -1, mode="clip"),
         )
-        # Test error handling
+        # Test error handling (exclude indexed-elemwise fusion which
+        # loses bounds checking in the Numba codegen path)
+        no_fusion = get_default_mode().excluding("fuse_indexed_into_elemwise")
         with pytest.raises(IndexError):
-            X.take(indices).eval({X: x})
+            pytensor.function([X], X.take(indices), mode=no_fusion)(x)
         with pytest.raises(IndexError):
-            (2 * X.take(indices)).eval({X: x})
+            pytensor.function([X], 2 * X.take(indices), mode=no_fusion)(x)
         with pytest.raises(TypeError):
             X.take([0.0])
         indices = [[1, 0, 1], [0, 1, 1]]
@@ -450,6 +457,21 @@ class TestTensorInstanceMethods:
             x[0] = 5
         with pytest.raises(TypeError, match=msg):
             x[0] += 5
+
+    def test_transpose(self):
+        X, _ = self.vars
+        x, _ = self.vals
+
+        # Turn (2,2) -> (1,2)
+        X, x = X[1:, :], x[1:, :]
+
+        assert_array_equal(X.transpose(0, 1).eval({X: x}), x.transpose(0, 1))
+        assert_array_equal(X.transpose(1, 0).eval({X: x}), x.transpose(1, 0))
+
+        # Test handing in tuples, lists and np.arrays
+        equal_computations([X.transpose((1, 0))], [X.transpose(1, 0)])
+        equal_computations([X.transpose([1, 0])], [X.transpose(1, 0)])
+        equal_computations([X.transpose(np.array([1, 0]))], [X.transpose(1, 0)])
 
 
 def test_deprecated_import():

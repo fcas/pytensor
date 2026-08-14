@@ -7,9 +7,9 @@ name: pytensor-dev
 channels:
   - conda-forge
 dependencies:
-  - python=>3.10
+  - python>=3.12
   - compilers
-  - numpy>=1.17.0,<2
+  - numpy>=2.0.0
   - scipy>=1,<2
   - filelock>=3.15
   - etuples
@@ -19,7 +19,6 @@ dependencies:
   - pydeprecate
   # Apple BLAS
   - libblas=*=*accelerate
-  # numba backend
   - numba>=0.57
   # For testing
   - coveralls
@@ -31,8 +30,7 @@ dependencies:
   - pytest-xdist
   - pytest-benchmark
   - pytest-mock
-  - pip:
-    - pytest-sphinx
+  - pytest-sphinx
   # For building docs
   - sphinx>=5.1.0,<6
   - sphinx_rtd_theme
@@ -51,3 +49,4 @@ dependencies:
   - cython
   - graphviz
   - pydot
+  - rich

@@ -10,17 +10,13 @@ from copy import copy
 from io import StringIO
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
-
 from pytensor.compile.compilelock import lock_ctx
 from pytensor.configdefaults import config
 from pytensor.graph.basic import (
     AtomicVariable,
     Constant,
-    NoParams,
-    io_toposort,
-    vars_between,
 )
+from pytensor.graph.traversal import io_toposort, vars_between
 from pytensor.graph.utils import MethodNotDefined
 from pytensor.link.basic import Container, Linker, LocalLinker, PerformLinker
 from pytensor.link.c.cmodule import (
@@ -33,7 +29,10 @@ from pytensor.link.c.cmodule import (
 from pytensor.link.c.cmodule import get_module_cache as _get_module_cache
 from pytensor.link.c.interface import CLinkerObject, CLinkerOp, CLinkerType
 from pytensor.link.utils import gc_helper, map_storage, raise_with_op, streamline
-from pytensor.utils import difference, uniq
+from pytensor.utils import NDARRAY_C_VERSION, difference, uniq
+
+
+NoParams = object()
 
 
 if TYPE_CHECKING:
@@ -109,12 +108,12 @@ def failure_code(sub, use_goto=True):
         be careful to avoid executing incorrect code.
 
     """
-    if use_goto:
-        goto_statement = "goto __label_%(id)i;" % sub
-    else:
-        goto_statement = ""
     id = sub["id"]
     failure_var = sub["failure_var"]
+    if use_goto:
+        goto_statement = f"goto __label_{id};"
+    else:
+        goto_statement = ""
     return f"""{{
         {failure_var} = {id};
         if (!PyErr_Occurred()) {{
@@ -822,9 +821,9 @@ class CLinker(Linker):
 
             behavior = op.c_code(node, name, isyms, osyms, sub)
 
-            assert isinstance(
-                behavior, str
-            ), f"{node.op} didn't return a string for c_code"
+            assert isinstance(behavior, str), (
+                f"{node.op} didn't return a string for c_code"
+            )
             # To help understand what is following. It help read the c code.
             # This prevent different op that generate the same c code
             # to be merged, I suppose this won't happen...
@@ -875,10 +874,10 @@ class CLinker(Linker):
         self.c_init_code_apply = c_init_code_apply
 
         if (self.init_tasks, self.tasks) != self.get_init_tasks():
-            print("init_tasks\n", self.init_tasks, file=sys.stderr)
-            print(self.get_init_tasks()[0], file=sys.stderr)
-            print("tasks\n", self.tasks, file=sys.stderr)
-            print(self.get_init_tasks()[1], file=sys.stderr)
+            print("init_tasks\n", self.init_tasks, file=sys.stderr)  # noqa: T201
+            print(self.get_init_tasks()[0], file=sys.stderr)  # noqa: T201
+            print("tasks\n", self.tasks, file=sys.stderr)  # noqa: T201
+            print(self.get_init_tasks()[1], file=sys.stderr)  # noqa: T201
             assert (self.init_tasks, self.tasks) == self.get_init_tasks()
 
         # List of indices that should be ignored when passing the arguments
@@ -1367,13 +1366,9 @@ class CLinker(Linker):
 
         # We must always add the numpy ABI version here as
         # DynamicModule always add the include <numpy/arrayobject.h>
-        if np.lib.NumpyVersion(np.__version__) < "1.16.0a":
-            ndarray_c_version = np.core.multiarray._get_ndarray_c_version()
-        else:
-            ndarray_c_version = np.core._multiarray_umath._get_ndarray_c_version()
-        sig.append(f"NPY_ABI_VERSION=0x{ndarray_c_version:X}")
+        sig.append(f"NPY_ABI_VERSION=0x{NDARRAY_C_VERSION:X}")
         if c_compiler:
-            sig.append("c_compiler_str=" + c_compiler.version_str())
+            sig.append(f"c_compiler_str={config.cxx} {config.gcc_version_str}")
 
         # IMPORTANT: The 'md5' prefix is used to isolate the compilation
         # parameters from the rest of the key. If you want to add more key
@@ -1397,7 +1392,8 @@ class CLinker(Linker):
 
             # It is important that a variable (i)
             # yield a 'position' that reflects its role in code_gen()
-            if isinstance(i, AtomicVariable):  # orphans
+            inp_sig = isig = fgraph_inputs_dict.get(i, False)  # inputs
+            if isinstance(i, AtomicVariable):  # orphans or constant inputs
                 if id(i) not in constant_ids:
                     isig = (i.signature(), topological_pos, i_idx)
                     # If the PyTensor constant provides a strong hash
@@ -1417,11 +1413,7 @@ class CLinker(Linker):
                     constant_ids[id(i)] = isig
                 else:
                     isig = constant_ids[id(i)]
-                # print 'SIGNATURE', i.signature()
-                # return i.signature()
-            elif i in fgraph_inputs_dict:  # inputs
-                isig = fgraph_inputs_dict[i]
-            else:
+            elif inp_sig is None:
                 if i.owner is None:
                     assert all(all(out is not None for out in o.outputs) for o in order)
                     assert all(input.owner is None for input in fgraph.inputs)
@@ -1437,7 +1429,7 @@ class CLinker(Linker):
                     )
                 else:
                     isig = (op_pos[i.owner], i.owner.outputs.index(i))  # temps
-            return (isig, i in no_recycling)
+            return (inp_sig, isig, i in no_recycling)
 
         version = []
         for node_pos, node in enumerate(order):
@@ -1498,7 +1490,7 @@ class CLinker(Linker):
             if not len(fgraph.clients[var])
         )
 
-        # crystalize the signature and version
+        # crystallize the signature and version
         sig = tuple(sig)
         version = tuple(version)
         for v in version:
@@ -1726,6 +1718,7 @@ class _CThunk:
         self.error_storage = error_storage
         self.module = module
         self.nodes = None
+        self.allow_gc = False
 
     def find_task(self, failure_code):
         """
@@ -1743,7 +1736,7 @@ class _CThunk:
     def __call__(self):
         failure = self.run_cthunk(self.cthunk)
         if failure:
-            task, taskname, id = self.find_task(failure)
+            task, _taskname, _id = self.find_task(failure)
             try:
                 trace = task.trace
             except AttributeError:
@@ -1756,15 +1749,14 @@ class _CThunk:
                 exc_value = exc_type(_exc_value)
                 exc_value.__thunk_trace__ = trace
             except Exception:
-                print(
+                print(  # noqa: T201
                     (
-                        "ERROR retrieving error_storage."
-                        "Was the error set in the c code?"
+                        "ERROR retrieving error_storage. Was the error set in the c code?"
                     ),
                     end=" ",
                     file=sys.stderr,
                 )
-                print(self.error_storage, file=sys.stderr)
+                print(self.error_storage, file=sys.stderr)  # noqa: T201
                 raise
             raise exc_value.with_traceback(exc_trace)
 
@@ -1795,8 +1787,6 @@ class OpWiseCLinker(LocalLinker):
     elements or less).
 
     """
-
-    __cache__: dict = {}
 
     def __init__(
         self, fallback_on_perform=True, allow_gc=None, nice_errors=True, schedule=None
@@ -1880,9 +1870,10 @@ class OpWiseCLinker(LocalLinker):
             fgraph,
             thunks,
             order,
-            post_thunk_old_storage,
+            post_thunk_old_storage=post_thunk_old_storage,
             no_recycling=no_recycling,
             nice_errors=self.nice_errors,
+            output_storage=output_storage,
         )
 
         f.allow_gc = self.allow_gc
@@ -1986,34 +1977,30 @@ class DualLinker(Linker):
             .make_all(**kwargs)
         )
         kwargs.pop("input_storage", None)
-        _f, i2, o2, thunks2, order2 = (
+        _f, i2, _o2, thunks2, order2 = (
             OpWiseCLinker(schedule=self.schedule)
             .accept(fgraph, no_recycling=no_recycling)
             .make_all(**kwargs)
         )
 
         def f():
-            # strict=False because we are in a hot loop
-            for input1, input2 in zip(i1, i2, strict=False):
+            # zip strict not specified because we are in a hot loop
+            for input1, input2 in zip(i1, i2):
                 # Set the inputs to be the same in both branches.
                 # The copy is necessary in order for inplace ops not to
                 # interfere.
                 input2.storage[0] = copy(input1.storage[0])
-            for thunk1, thunk2, node1, node2 in zip(
-                thunks1, thunks2, order1, order2, strict=False
-            ):
-                for output, storage in zip(node1.outputs, thunk1.outputs, strict=False):
+            for thunk1, thunk2, node1, node2 in zip(thunks1, thunks2, order1, order2):
+                for output, storage in zip(node1.outputs, thunk1.outputs):
                     if output in no_recycling:
                         storage[0] = None
-                for output, storage in zip(node2.outputs, thunk2.outputs, strict=False):
+                for output, storage in zip(node2.outputs, thunk2.outputs):
                     if output in no_recycling:
                         storage[0] = None
                 try:
                     thunk1()
                     thunk2()
-                    for output1, output2 in zip(
-                        thunk1.outputs, thunk2.outputs, strict=False
-                    ):
+                    for output1, output2 in zip(thunk1.outputs, thunk2.outputs):
                         self.checker(output1, output2)
                 except Exception:
                     raise_with_op(fgraph, node1)

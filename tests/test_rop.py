@@ -1,14 +1,12 @@
 """
-WRITE ME
+Tests for pushforward / pullback (forward / reverse mode autodiff).
 
-Tests for the R operator / L operator
-
-For the list of op with r op defined, with or without missing test
+For the list of ops with pushforward defined, with or without missing test
 see this file: doc/library/tensor/basic.txt
 
-For function to automatically test your Rop implementation, look at
-the docstring of the functions: check_mat_rop_lop, check_rop_lop,
-check_nondiff_rop,
+For functions to automatically test your pushforward implementation, look at
+the docstring of the functions: check_mat_pushforward_pullback,
+check_pushforward_pullback, check_nondiff_pushforward,
 """
 
 import numpy as np
@@ -16,18 +14,24 @@ import pytest
 
 import pytensor
 import pytensor.tensor as pt
-from pytensor import function
-from pytensor.gradient import Lop, Rop, grad, grad_undefined
+from pytensor import config, function
+from pytensor.gradient import (
+    NullTypeGradError,
+    grad,
+    grad_undefined,
+    pullback,
+    pushforward,
+)
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
-from pytensor.tensor.math import argmax, dot
+from pytensor.graph.replace import clone_replace
+from pytensor.tensor.math import Max, Min, argmax, dot
 from pytensor.tensor.math import max as pt_max
-from pytensor.tensor.shape import unbroadcast
 from pytensor.tensor.type import matrix, vector
 from tests import unittest_tools as utt
 
 
-class BreakRop(Op):
+class BreakPushforward(Op):
     """
     Special Op created to test what happens when you have one op that is not
     differentiable in the computational graph
@@ -52,14 +56,18 @@ class BreakRop(Op):
         return [None]
 
 
-break_op = BreakRop()
+break_op = BreakPushforward()
 
 
-class RopLopChecker:
+class PushforwardPullbackChecker:
     """
     Don't perform any test, but provide the function to test the
-    Rop to class that inherit from it.
+    pushforward to class that inherit from it.
     """
+
+    @staticmethod
+    def rtol():
+        return 1e-7 if config.floatX == "float64" else 1e-5
 
     def setup_method(self):
         # Using vectors make things a lot simpler for generating the same
@@ -72,28 +80,28 @@ class RopLopChecker:
         self.mv = matrix("mv")
         self.mat_in_shape = (5 + self.rng.integers(3), 5 + self.rng.integers(3))
 
-    def check_nondiff_rop(self, y):
+    def check_nondiff_pushforward(self, y, x, v):
         """
-        If your op is not differentiable(so you can't define Rop)
+        If your op is not differentiable(so you can't define pushforward)
         test that an error is raised.
         """
         with pytest.raises(ValueError):
-            Rop(y, self.x, self.v)
+            pushforward(y, x, v, use_op_pushforward=True)
 
-    def check_mat_rop_lop(self, y, out_shape):
+    def check_mat_pushforward_pullback(self, y, out_shape):
         """
-        Test the Rop/Lop when input is a matrix and the output is a vector
+        Test the pushforward/pullback when input is a matrix and the output is a vector
 
         :param y: the output variable of the op applied to self.mx
         :param out_shape: Used to generate a random tensor
-                          corresponding to the evaluation point of the Rop
+                          corresponding to the evaluation point of the pushforward
                           (i.e. the tensor with which you multiply the
                           Jacobian). It should be a tuple of ints.
 
         If the Op has more than 1 input, one of them must be mx, while
         others must be shared variables / constants. We will test only
         against the input self.mx, so you must call
-        check_mat_rop_lop/check_rop_lop for the other inputs.
+        check_mat_pushforward_pullback/check_pushforward_pullback for the other inputs.
 
         We expect all inputs/outputs have dtype floatX.
 
@@ -106,8 +114,14 @@ class RopLopChecker:
         vv = np.asarray(
             self.rng.uniform(size=self.mat_in_shape), pytensor.config.floatX
         )
-        yv = Rop(y, self.mx, self.mv)
-        rop_f = function([self.mx, self.mv], yv, on_unused_input="ignore")
+        yv = pushforward(y, self.mx, self.mv, use_op_pushforward=True)
+        pushforward_f = function([self.mx, self.mv], yv, on_unused_input="ignore")
+
+        yv_through_lop = pushforward(y, self.mx, self.mv, use_op_pushforward=False)
+        pushforward_via_pullback_f = function(
+            [self.mx, self.mv], yv_through_lop, on_unused_input="ignore"
+        )
+
         sy, _ = pytensor.scan(
             lambda i, y, x, v: (grad(y[i], x) * v).sum(),
             sequences=pt.arange(y.shape[0]),
@@ -115,190 +129,255 @@ class RopLopChecker:
         )
         scan_f = function([self.mx, self.mv], sy, on_unused_input="ignore")
 
-        v1 = rop_f(vx, vv)
-        v2 = scan_f(vx, vv)
+        v_ref = scan_f(vx, vv)
+        np.testing.assert_allclose(pushforward_f(vx, vv), v_ref)
+        np.testing.assert_allclose(pushforward_via_pullback_f(vx, vv), v_ref)
 
-        assert np.allclose(v1, v2), f"ROP mismatch: {v1} {v2}"
-
-        self.check_nondiff_rop(
-            pytensor.clone_replace(y, replace={self.mx: break_op(self.mx)})
+        self.check_nondiff_pushforward(
+            clone_replace(y, replace={self.mx: break_op(self.mx)}),
+            self.mx,
+            self.mv,
         )
 
         vv = np.asarray(self.rng.uniform(size=out_shape), pytensor.config.floatX)
-        yv = Lop(y, self.mx, self.v)
-        lop_f = function([self.mx, self.v], yv)
+        yv = pullback(y, self.mx, self.v)
+        pullback_f = function([self.mx, self.v], yv)
 
         sy = grad((self.v * y).sum(), self.mx)
         scan_f = function([self.mx, self.v], sy)
 
-        v1 = lop_f(vx, vv)
-        v2 = scan_f(vx, vv)
-        assert np.allclose(v1, v2), f"LOP mismatch: {v1} {v2}"
+        v = pullback_f(vx, vv)
+        v_ref = scan_f(vx, vv)
+        np.testing.assert_allclose(v, v_ref)
 
-    def check_rop_lop(self, y, out_shape):
+    def check_pushforward_pullback(
+        self, y, out_shape, check_nondiff_pushforward: bool = True
+    ):
         """
-        As check_mat_rop_lop, except the input is self.x which is a
+        As check_mat_pushforward_pullback, except the input is self.x which is a
         vector. The output is still a vector.
         """
-        # TEST ROP
+        rtol = self.rtol()
+
+        # TEST PUSHFORWARD
         vx = np.asarray(self.rng.uniform(size=self.in_shape), pytensor.config.floatX)
         vv = np.asarray(self.rng.uniform(size=self.in_shape), pytensor.config.floatX)
 
-        yv = Rop(y, self.x, self.v)
-        rop_f = function([self.x, self.v], yv, on_unused_input="ignore")
+        yv = pushforward(y, self.x, self.v, use_op_pushforward=True)
+        pushforward_f = function([self.x, self.v], yv, on_unused_input="ignore")
+
+        yv_through_lop = pushforward(y, self.x, self.v, use_op_pushforward=False)
+        pushforward_via_pullback_f = function(
+            [self.x, self.v], yv_through_lop, on_unused_input="ignore"
+        )
+
         J, _ = pytensor.scan(
             lambda i, y, x: grad(y[i], x),
             sequences=pt.arange(y.shape[0]),
             non_sequences=[y, self.x],
         )
         sy = dot(J, self.v)
-
         scan_f = function([self.x, self.v], sy, on_unused_input="ignore")
 
-        v1 = rop_f(vx, vv)
-        v2 = scan_f(vx, vv)
-        assert np.allclose(v1, v2), f"ROP mismatch: {v1} {v2}"
+        v_ref = scan_f(vx, vv)
+        np.testing.assert_allclose(pushforward_f(vx, vv), v_ref, rtol=rtol)
+        np.testing.assert_allclose(pushforward_via_pullback_f(vx, vv), v_ref, rtol=rtol)
 
-        try:
-            Rop(
-                pytensor.clone_replace(y, replace={self.x: break_op(self.x)}),
+        if check_nondiff_pushforward:
+            self.check_nondiff_pushforward(
+                clone_replace(y, replace={self.x: break_op(self.x)}),
                 self.x,
                 self.v,
-            )
-        except ValueError:
-            pytest.skip(
-                "Rop does not handle non-differentiable inputs "
-                "correctly. Bug exposed by fixing Add.grad method."
             )
 
         vx = np.asarray(self.rng.uniform(size=self.in_shape), pytensor.config.floatX)
         vv = np.asarray(self.rng.uniform(size=out_shape), pytensor.config.floatX)
 
-        yv = Lop(y, self.x, self.v)
-        lop_f = function([self.x, self.v], yv, on_unused_input="ignore")
+        yv = pullback(y, self.x, self.v)
+        pullback_f = function([self.x, self.v], yv, on_unused_input="ignore")
         J, _ = pytensor.scan(
             lambda i, y, x: grad(y[i], x),
             sequences=pt.arange(y.shape[0]),
             non_sequences=[y, self.x],
         )
         sy = dot(self.v, J)
-
         scan_f = function([self.x, self.v], sy)
 
-        v1 = lop_f(vx, vv)
-        v2 = scan_f(vx, vv)
-        assert np.allclose(v1, v2), f"LOP mismatch: {v1} {v2}"
+        v = pullback_f(vx, vv)
+        v_ref = scan_f(vx, vv)
+        np.testing.assert_allclose(v, v_ref, rtol=rtol)
 
 
-class TestRopLop(RopLopChecker):
+class TestPushforwardPullback(PushforwardPullbackChecker):
     def test_max(self):
-        # self.check_mat_rop_lop(pt_max(self.mx, axis=[0,1])[0], ())
-        self.check_mat_rop_lop(pt_max(self.mx, axis=0), (self.mat_in_shape[1],))
-        self.check_mat_rop_lop(pt_max(self.mx, axis=1), (self.mat_in_shape[0],))
+        self.check_mat_pushforward_pullback(
+            pt_max(self.mx, axis=0), (self.mat_in_shape[1],)
+        )
+        self.check_mat_pushforward_pullback(
+            pt_max(self.mx, axis=1), (self.mat_in_shape[0],)
+        )
+
+    def test_min(self):
+        # `Min` is the bare reduction Op. Unlike `pt.min`, which lowers to
+        # ``-max(-x)`` and never instantiates `Min`, this exercises the Op's
+        # own pushforward/pullback. It must behave exactly like `Max`.
+        self.check_mat_pushforward_pullback(
+            Min(axis=[0])(self.mx), (self.mat_in_shape[1],)
+        )
+        self.check_mat_pushforward_pullback(
+            Min(axis=[1])(self.mx), (self.mat_in_shape[0],)
+        )
+
+    def test_max_min_pushforward_on_ties(self):
+        # With tied extrema, reverse-mode (`pullback`) routes the cotangent to
+        # *every* position attaining the extremum. For forward-mode to remain
+        # the exact transpose (adjoint) of reverse-mode, `pushforward` must
+        # *sum* the tied input tangents. The previous matrix-only, `Argmax`-
+        # based implementation instead picked a single winner and was therefore
+        # NOT the adjoint of its own pullback on ties. Random data is tie-free
+        # almost surely (so `test_max`/`test_min` would not catch a regression
+        # to single-winner semantics); this checks the tied case explicitly for
+        # both `Max` and `Min`.
+        mx = matrix("mx")
+        mv = matrix("mv")
+        # Columns 0 and 2 are constant -> 3-way ties along axis 0; column 1 has
+        # a unique max (row 1) and a unique min (row 0).
+        x_val = np.array(
+            [[1.0, 2.0, 1.0], [1.0, 5.0, 1.0], [1.0, 4.0, 1.0]],
+            dtype=config.floatX,
+        )
+        v_val = np.array(
+            [[1.0, 10.0, 100.0], [2.0, 20.0, 200.0], [4.0, 30.0, 300.0]],
+            dtype=config.floatX,
+        )
+
+        for op_cls in (Max, Min):
+            for axis in ([0], [1]):
+                y = op_cls(axis=axis)(mx)
+                # The Op's own `pushforward` must equal the pushforward obtained
+                # by transposing the `pullback` (`use_op_pushforward=False`).
+                yv_op = pushforward(y, mx, mv, use_op_pushforward=True)
+                yv_ref = pushforward(y, mx, mv, use_op_pushforward=False)
+                f_op = function([mx, mv], yv_op, on_unused_input="ignore")
+                f_ref = function([mx, mv], yv_ref, on_unused_input="ignore")
+                np.testing.assert_allclose(f_op(x_val, v_val), f_ref(x_val, v_val))
+
+        # Pin the tie convention explicitly: along axis 0 the tied columns sum
+        # their tangents (1+2+4=7 and 100+200+300=600); the unique-extremum
+        # column selects the winning row (max -> row 1 = 20, min -> row 0 = 10).
+        f_max0 = function([mx, mv], pushforward(Max(axis=[0])(mx), mx, mv))
+        f_min0 = function([mx, mv], pushforward(Min(axis=[0])(mx), mx, mv))
+        np.testing.assert_allclose(f_max0(x_val, v_val), [7.0, 20.0, 600.0])
+        np.testing.assert_allclose(f_min0(x_val, v_val), [7.0, 10.0, 600.0])
 
     def test_argmax(self):
-        self.check_nondiff_rop(argmax(self.mx, axis=1))
+        self.check_nondiff_pushforward(argmax(self.mx, axis=1), self.mx, self.mv)
 
     def test_subtensor(self):
-        self.check_rop_lop(self.x[:4], (4,))
+        self.check_pushforward_pullback(self.x[:4], (4,))
 
     def test_incsubtensor1(self):
         tv = np.asarray(self.rng.uniform(size=(3,)), pytensor.config.floatX)
         t = pytensor.shared(tv)
         out = pytensor.tensor.subtensor.inc_subtensor(self.x[:3], t)
-        self.check_rop_lop(out, self.in_shape)
+        self.check_pushforward_pullback(out, self.in_shape)
 
     def test_incsubtensor2(self):
         tv = np.asarray(self.rng.uniform(size=(10,)), pytensor.config.floatX)
         t = pytensor.shared(tv)
         out = pytensor.tensor.subtensor.inc_subtensor(t[:4], self.x[:4])
-        self.check_rop_lop(out, (10,))
+        self.check_pushforward_pullback(out, (10,))
 
     def test_setsubtensor1(self):
         tv = np.asarray(self.rng.uniform(size=(3,)), pytensor.config.floatX)
         t = pytensor.shared(tv)
         out = pytensor.tensor.subtensor.set_subtensor(self.x[:3], t)
-        self.check_rop_lop(out, self.in_shape)
+        self.check_pushforward_pullback(out, self.in_shape)
 
     def test_print(self):
         out = pytensor.printing.Print("x", attrs=("shape",))(self.x)
-        self.check_rop_lop(out, self.in_shape)
+        self.check_pushforward_pullback(out, self.in_shape)
 
     def test_setsubtensor2(self):
         tv = np.asarray(self.rng.uniform(size=(10,)), pytensor.config.floatX)
         t = pytensor.shared(tv)
         out = pytensor.tensor.subtensor.set_subtensor(t[:4], self.x[:4])
-        self.check_rop_lop(out, (10,))
+        self.check_pushforward_pullback(out, (10,))
 
     def test_dimshuffle(self):
         # I need the sum, because the setup expects the output to be a
         # vector
-        self.check_rop_lop(self.x[:4].dimshuffle("x", 0).sum(axis=0), (4,))
-
-    def test_unbroadcast(self):
-        # I need the sum, because the setup expects the output to be a
-        # vector
-        self.check_rop_lop(
-            unbroadcast(self.x[:4].dimshuffle("x", 0), 0).sum(axis=1), (1,)
-        )
+        self.check_pushforward_pullback(self.x[:4].dimshuffle("x", 0).sum(axis=0), (4,))
 
     def test_join(self):
         tv = np.asarray(self.rng.uniform(size=(10,)), pytensor.config.floatX)
         t = pytensor.shared(tv)
         out = pt.join(0, self.x, t)
-        self.check_rop_lop(out, (self.in_shape[0] + 10,))
+        self.check_pushforward_pullback(out, (self.in_shape[0] + 10,))
 
     def test_dot(self):
         insh = self.in_shape[0]
         vW = np.asarray(self.rng.uniform(size=(insh, insh)), pytensor.config.floatX)
         W = pytensor.shared(vW)
-        self.check_rop_lop(dot(self.x, W), self.in_shape)
+        # check_nondiff_pushforward reveals an error in how legacy pushforward handles non-differentiable paths
+        # See: test_pushforward_partially_differentiable_paths
+        self.check_pushforward_pullback(
+            dot(self.x, W), self.in_shape, check_nondiff_pushforward=False
+        )
 
     def test_elemwise0(self):
-        self.check_rop_lop((self.x + 1) ** 2, self.in_shape)
+        # check_nondiff_pushforward reveals an error in how legacy pushforward handles non-differentiable paths
+        # See: test_pushforward_partially_differentiable_paths
+        self.check_pushforward_pullback(
+            (self.x + 1) ** 2, self.in_shape, check_nondiff_pushforward=False
+        )
 
     def test_elemwise1(self):
-        self.check_rop_lop(self.x + pt.cast(self.x, "int32"), self.in_shape)
+        self.check_pushforward_pullback(
+            self.x + pt.cast(self.x, "int32"), self.in_shape
+        )
 
     def test_flatten(self):
-        self.check_mat_rop_lop(
+        self.check_mat_pushforward_pullback(
             self.mx.flatten(), (self.mat_in_shape[0] * self.mat_in_shape[1],)
         )
 
     def test_sum(self):
-        self.check_mat_rop_lop(self.mx.sum(axis=1), (self.mat_in_shape[0],))
+        self.check_mat_pushforward_pullback(
+            self.mx.sum(axis=1), (self.mat_in_shape[0],)
+        )
 
     def test_softmax(self):
-        self.check_rop_lop(
+        self.check_pushforward_pullback(
             pytensor.tensor.special.softmax(self.x, axis=-1), self.in_shape
         )
 
     def test_alloc(self):
         # Alloc of the sum of x into a vector
         out1d = pt.alloc(self.x.sum(), self.in_shape[0])
-        self.check_rop_lop(out1d, self.in_shape[0])
+        self.check_pushforward_pullback(out1d, self.in_shape[0])
 
         # Alloc of x into a 3-D tensor, flattened
         out3d = pt.alloc(
             self.x, self.mat_in_shape[0], self.mat_in_shape[1], self.in_shape[0]
         )
-        self.check_rop_lop(
+        self.check_pushforward_pullback(
             out3d.flatten(),
             self.mat_in_shape[0] * self.mat_in_shape[1] * self.in_shape[0],
         )
 
-    def test_invalid_input(self):
-        success = False
+    @pytest.mark.parametrize("use_op_pushforward", [True, False])
+    def test_invalid_input(self, use_op_pushforward):
+        with pytest.raises(ValueError):
+            pushforward(
+                0.0,
+                [matrix()],
+                [vector()],
+                use_op_pushforward=use_op_pushforward,
+            )
 
-        try:
-            Rop(0.0, [matrix()], [vector()])
-            success = True
-        except ValueError:
-            pass
-
-        assert not success
-
-    def test_multiple_outputs(self):
+    @pytest.mark.parametrize("use_op_pushforward", [True, False])
+    def test_multiple_outputs(self, use_op_pushforward):
         m = matrix("m")
         v = vector("v")
         m_ = matrix("m_")
@@ -309,10 +388,20 @@ class TestRopLop(RopLopChecker):
         m_val = self.rng.uniform(size=(3, 7)).astype(pytensor.config.floatX)
         v_val = self.rng.uniform(size=(7,)).astype(pytensor.config.floatX)
 
-        rop_out1 = Rop([m, v, m + v], [m, v], [m_, v_])
+        rop_out1 = pushforward(
+            [m, v, m + v],
+            [m, v],
+            [m_, v_],
+            use_op_pushforward=use_op_pushforward,
+        )
         assert isinstance(rop_out1, list)
         assert len(rop_out1) == 3
-        rop_out2 = Rop((m, v, m + v), [m, v], [m_, v_])
+        rop_out2 = pushforward(
+            (m, v, m + v),
+            [m, v],
+            [m_, v_],
+            use_op_pushforward=use_op_pushforward,
+        )
         assert isinstance(rop_out2, tuple)
         assert len(rop_out2) == 3
 
@@ -322,12 +411,65 @@ class TestRopLop(RopLopChecker):
         f = pytensor.function([m, v, m_, v_], all_outs)
         f(mval, vval, m_val, v_val)
 
-    def test_Rop_dot_bug_18Oct2013_Jeremiah(self):
+    @pytest.mark.parametrize(
+        "use_op_pushforward",
+        [pytest.param(True, marks=pytest.mark.xfail()), False],
+    )
+    def test_pushforward_partially_differentiable_paths(self, use_op_pushforward):
         # This test refers to a bug reported by Jeremiah Lowin on 18th Oct
         # 2013. The bug consists when through a dot operation there is only
         # one differentiable path (i.e. there is no gradient wrt to one of
         # the inputs).
         x = pt.arange(20.0).reshape([1, 20])
-        v = pytensor.shared(np.ones([20]))
+        v = pytensor.shared(np.ones([20]), name="v")
         d = dot(x, v).sum()
-        Rop(grad(d, v), v, v)
+
+        pushforward(
+            grad(d, v),
+            v,
+            v,
+            use_op_pushforward=use_op_pushforward,
+            # 2025: This is a tricky case, the gradient of the gradient does not depend on v
+            # although v still exists in the graph inside a `Second` operator.
+            # The original test was checking that pushforward wouldn't raise an error, but pullback does.
+            # Since the correct behavior is ambiguous, I let both implementations off the hook.
+            disconnected_outputs="raise" if use_op_pushforward else "ignore",
+        )
+
+        # 2025: Here is an unambiguous test for the original commented issue:
+        x = pt.matrix("x")
+        y = pt.matrix("y")
+        out = dot(x, break_op(y)).sum()
+        # Should not raise an error
+        pushforward(
+            out,
+            [x],
+            [x.type()],
+            use_op_pushforward=use_op_pushforward,
+            disconnected_outputs="raise",
+        )
+
+        # More extensive testing shows that the legacy pushforward implementation FAILS to raise when
+        # the cost is linked through strictly non-differentiable paths.
+        # This is not Dot specific, we would observe the same with any operation where the gradient
+        # with respect to one of the inputs does not depend on the original input (such as `mul`, `add`, ...)
+        out = dot(break_op(x), y).sum()
+        with pytest.raises((ValueError, NullTypeGradError)):
+            pushforward(
+                out,
+                [x],
+                [x.type()],
+                use_op_pushforward=use_op_pushforward,
+                disconnected_outputs="raise",
+            )
+
+        # Only when both paths are non-differentiable is an error correctly raised again.
+        out = dot(break_op(x), break_op(y)).sum()
+        with pytest.raises((ValueError, NullTypeGradError)):
+            pushforward(
+                out,
+                [x],
+                [x.type()],
+                use_op_pushforward=use_op_pushforward,
+                disconnected_outputs="raise",
+            )

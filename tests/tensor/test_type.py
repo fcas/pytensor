@@ -10,6 +10,10 @@ from pytensor.tensor.shape import SpecifyShape
 from pytensor.tensor.type import (
     TensorType,
     col,
+    dmatrix,
+    drow,
+    fmatrix,
+    frow,
     matrix,
     row,
     scalar,
@@ -111,14 +115,10 @@ def test_filter_variable():
     with pytest.raises(TypeError):
         test_type.filter(np.empty((0, 1), dtype=config.floatX))
 
-    with pytest.raises(TypeError, match=".*not aligned.*"):
+    with pytest.raises(TypeError, match=r".*not aligned.*"):
         test_val = np.empty((1, 2), dtype=config.floatX)
         test_val.flags.aligned = False
         test_type.filter(test_val)
-
-    with pytest.raises(ValueError, match="Non-finite"):
-        test_type.filter_checks_isfinite = True
-        test_type.filter(np.full((1, 2), np.inf, dtype=config.floatX))
 
     test_type2 = TensorType(config.floatX, shape=(None, None))
     test_var = test_type()
@@ -399,7 +399,7 @@ def test_tensor_creator_dtype_catch(dtype):
         tensor(dtype, shape=(None,))
 
     # This should work
-    assert tensor(dtype=dtype, shape=(None,))
+    assert tensor(dtype=dtype, shape=(None,)) is not None
 
 
 def test_tensor_creator_ignores_rare_dtype_name():
@@ -477,3 +477,21 @@ def test_row_matrix_creator_helpers(helper):
         match = "The second dimension of a `col` must have shape 1, got 5"
     with pytest.raises(ValueError, match=match):
         helper(shape=(2, 5))
+
+
+def test_shape_of_predefined_dtype_tensor():
+    # Valid: None dimensions can be specialized
+    assert fmatrix(shape=(1, None)).type == frow
+    assert drow(shape=(1, 5)).type == dmatrix(shape=(1, 5)).type
+
+    # Invalid: Number of dimensions must match
+    with pytest.raises(ValueError):
+        fmatrix(shape=(None, None, None))
+
+    # Invalid: Fixed shapes must match
+    with pytest.raises(ValueError):
+        fmatrix(shape=(3, 5)).type(shape=(4, 5))
+
+    # Invalid: Known shapes can't be lost
+    with pytest.raises(ValueError):
+        drow(shape=(None, None))

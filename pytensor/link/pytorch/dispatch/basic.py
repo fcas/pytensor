@@ -3,12 +3,11 @@ from types import NoneType
 
 import numpy as np
 import torch
-import torch.compiler
 
-from pytensor.compile import PYTORCH
 from pytensor.compile.builders import OpFromGraph
-from pytensor.compile.ops import DeepCopyOp
-from pytensor.graph.fg import FunctionGraph
+from pytensor.compile.ops import DeepCopyOp, TypeCastingOp
+from pytensor.graph.basic import Constant
+from pytensor.graph.fg import AbstractFunctionGraph
 from pytensor.ifelse import IfElse
 from pytensor.link.utils import fgraph_to_python
 from pytensor.raise_op import CheckAndRaise
@@ -19,6 +18,8 @@ from pytensor.tensor.basic import (
     Eye,
     Join,
     MakeVector,
+    ScalarFromTensor,
+    Split,
     TensorFromScalar,
 )
 
@@ -49,7 +50,7 @@ def pytorch_funcify(op, node=None, storage_map=None, **kwargs):
     )
 
 
-@pytorch_funcify.register(FunctionGraph)
+@pytorch_funcify.register(AbstractFunctionGraph)
 def pytorch_funcify_FunctionGraph(
     fgraph,
     node=None,
@@ -67,6 +68,22 @@ def pytorch_funcify_FunctionGraph(
     )
 
 
+@pytorch_funcify.register(TypeCastingOp)
+def pytorch_funcify_CastingOp(op, node, **kwargs):
+    def type_cast(x):
+        return x
+
+    return type_cast
+
+
+@pytorch_funcify.register(ScalarFromTensor)
+def pytorch_funcify_ScalarFromTensor(op, node, **kwargs):
+    def scalar_from_tensor(x):
+        return x[()]
+
+    return scalar_from_tensor
+
+
 @pytorch_funcify.register(CheckAndRaise)
 def pytorch_funcify_CheckAndRaise(op, **kwargs):
     error = op.exc_type
@@ -74,7 +91,7 @@ def pytorch_funcify_CheckAndRaise(op, **kwargs):
 
     def assert_fn(x, *conditions):
         for cond in conditions:
-            if not cond.item():
+            if not cond:
                 raise error(msg)
         return x
 
@@ -120,11 +137,10 @@ def pytorch_funcify_arange(op, **kwargs):
 
 
 @pytorch_funcify.register(Join)
-def pytorch_funcify_Join(op, **kwargs):
-    def join(axis, *tensors):
-        # tensors could also be tuples, and in this case they don't have a ndim
-        tensors = [torch.tensor(tensor) for tensor in tensors]
+def pytorch_funcify_Join(op, node, **kwargs):
+    axis = op.axis
 
+    def join(*tensors):
         return torch.cat(tensors, dim=axis)
 
     return join
@@ -172,9 +188,6 @@ def pytorch_funcify_IfElse(op, **kwargs):
 @pytorch_funcify.register(OpFromGraph)
 def pytorch_funcify_OpFromGraph(op, node, **kwargs):
     kwargs.pop("storage_map", None)
-
-    # Apply inner rewrites
-    PYTORCH.optimizer(op.fgraph)
     fgraph_fn = pytorch_funcify(op.fgraph, **kwargs, squeeze_output=True)
     return fgraph_fn
 
@@ -185,3 +198,23 @@ def pytorch_funcify_TensorFromScalar(op, **kwargs):
         return torch.as_tensor(x)
 
     return tensorfromscalar
+
+
+@pytorch_funcify.register(Split)
+def pytorch_funcify_Split(op, node, **kwargs):
+    _x, split_sizes = node.inputs
+    dim = op.axis
+    if isinstance(split_sizes, Constant):
+        split_sizes = tuple(int(size) for size in split_sizes.data)
+
+        def split_constant_sizes(x, _):
+            return x.split(split_sizes, dim=dim)
+
+        return split_constant_sizes
+
+    else:
+
+        def inner_fn(x, split_amounts):
+            return x.split(split_amounts.tolist(), dim=dim)
+
+        return inner_fn

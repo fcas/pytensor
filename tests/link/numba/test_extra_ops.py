@@ -1,15 +1,14 @@
 import contextlib
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
 
 import pytensor.tensor as pt
 from pytensor import config
-from pytensor.compile.sharedvalue import SharedVariable
-from pytensor.graph.basic import Constant
-from pytensor.graph.fg import FunctionGraph
 from pytensor.tensor import extra_ops
-from tests.link.numba.test_basic import compare_numba_and_py, set_test_value
+from pytensor.tensor.extra_ops import RavelMultiIndex
+from tests.link.numba.test_basic import compare_numba_and_py
 
 
 rng = np.random.default_rng(42849)
@@ -18,20 +17,17 @@ rng = np.random.default_rng(42849)
 @pytest.mark.parametrize(
     "val",
     [
-        set_test_value(pt.lscalar(), np.array(6, dtype="int64")),
+        (pt.lscalar(), np.array(6, dtype="int64")),
     ],
 )
 def test_Bartlett(val):
+    val, test_val = val
     g = extra_ops.bartlett(val)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [val],
+        g,
+        [test_val],
         assert_fn=lambda x, y: np.testing.assert_allclose(x, y, atol=1e-15),
     )
 
@@ -40,97 +36,67 @@ def test_Bartlett(val):
     "val, axis, mode",
     [
         (
-            set_test_value(
-                pt.matrix(), np.arange(3, dtype=config.floatX).reshape((3, 1))
-            ),
+            (pt.matrix(), np.arange(3, dtype=config.floatX).reshape((3, 1))),
             1,
             "add",
         ),
         (
-            set_test_value(
-                pt.dtensor3(), np.arange(30, dtype=config.floatX).reshape((2, 3, 5))
-            ),
-            -1,
-            "add",
-        ),
-        (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
+            (pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))),
             0,
             "add",
         ),
         (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
+            (pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))),
             1,
             "add",
         ),
         (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
-            None,
-            "add",
-        ),
-        (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
+            (pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))),
             0,
             "mul",
         ),
         (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
+            (pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))),
             1,
             "mul",
         ),
+        # Regression tests for https://github.com/pymc-devs/pytensor/issues/1689
         (
-            set_test_value(
-                pt.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
-            ),
-            None,
+            (pt.vector(), np.arange(6, dtype=config.floatX)),
+            0,
+            "add",
+        ),
+        (
+            (pt.vector(), np.arange(6, dtype=config.floatX)),
+            0,
             "mul",
         ),
     ],
 )
 def test_CumOp(val, axis, mode):
+    val, test_val = val
     g = extra_ops.CumOp(axis=axis, mode=mode)(val)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [val],
+        g,
+        [test_val],
     )
 
 
-@pytest.mark.parametrize(
-    "a, val",
-    [
-        (
-            set_test_value(pt.lmatrix(), np.zeros((10, 2), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-        )
-    ],
-)
-def test_FillDiagonal(a, val):
+def test_FillDiagonal():
+    a = pt.lmatrix("a")
+    test_a = np.zeros((10, 2), dtype="int64")
+
+    val = pt.lscalar("val")
+    test_val = np.array(1, dtype="int64")
+
     g = extra_ops.FillDiagonal()(a, val)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [a, val],
+        g,
+        [test_a, test_val],
     )
 
 
@@ -138,118 +104,133 @@ def test_FillDiagonal(a, val):
     "a, val, offset",
     [
         (
-            set_test_value(pt.lmatrix(), np.zeros((10, 2), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(-1, dtype="int64")),
+            (pt.lmatrix(), np.zeros((10, 2), dtype="int64")),
+            (pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lscalar(), np.array(-1, dtype="int64")),
         ),
         (
-            set_test_value(pt.lmatrix(), np.zeros((10, 2), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(0, dtype="int64")),
+            (pt.lmatrix(), np.zeros((10, 2), dtype="int64")),
+            (pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lscalar(), np.array(0, dtype="int64")),
         ),
         (
-            set_test_value(pt.lmatrix(), np.zeros((10, 3), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lmatrix(), np.zeros((10, 3), dtype="int64")),
+            (pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lscalar(), np.array(1, dtype="int64")),
         ),
     ],
 )
 def test_FillDiagonalOffset(a, val, offset):
+    a, test_a = a
+    val, test_val = val
+    offset, test_offset = offset
     g = extra_ops.FillDiagonalOffset()(a, val, offset)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        [a, val, offset],
+        g,
+        [test_a, test_val, test_offset],
     )
 
 
 @pytest.mark.parametrize(
-    "arr, shape, mode, order, exc",
+    "arr, shape, mode, exc",
     [
         (
-            tuple(set_test_value(pt.lscalar(), v) for v in np.array([0])),
-            set_test_value(pt.lvector(), np.array([2])),
+            tuple((pt.lscalar(), v) for v in np.array([0])),
+            (pt.lvector(), np.array([2])),
             "raise",
-            "C",
             None,
         ),
         (
-            tuple(set_test_value(pt.lscalar(), v) for v in np.array([0, 0, 3])),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
+            tuple((pt.lscalar(), v) for v in np.array([0, 0, 3])),
+            (pt.lvector(), np.array([2, 3, 4])),
             "raise",
-            "C",
+            None,
+        ),
+        (
+            tuple((pt.lvector(), v) for v in np.array([[0, 1], [2, 0], [1, 3]])),
+            (pt.lvector(), np.array([2, 3, 4])),
+            "raise",
             None,
         ),
         (
             tuple(
-                set_test_value(pt.lvector(), v)
+                (pt.lmatrix(), np.broadcast_to(v, (3, 2)).copy())
                 for v in np.array([[0, 1], [2, 0], [1, 3]])
             ),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
+            (pt.lvector(), np.array([2, 3, 4])),
             "raise",
-            "C",
             None,
         ),
         (
             tuple(
-                set_test_value(pt.lvector(), v)
-                for v in np.array([[0, 1], [2, 0], [1, 3]])
+                (pt.lvector(), v) for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
             ),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
+            (pt.lvector(), np.array([2, 3, 4])),
             "raise",
-            "F",
-            NotImplementedError,
-        ),
-        (
-            tuple(
-                set_test_value(pt.lvector(), v)
-                for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
-            ),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
-            "raise",
-            "C",
             ValueError,
         ),
         (
-            tuple(
-                set_test_value(pt.lvector(), v)
-                for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
-            ),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
+            tuple((pt.lscalar(), v) for v in np.array([0, 0, 3])),
+            (pt.lvector(), np.array([2, 3, 4])),
             "wrap",
-            "C",
             None,
         ),
         (
             tuple(
-                set_test_value(pt.lvector(), v)
+                (pt.lvector(), v) for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
+            ),
+            (pt.lvector(), np.array([2, 3, 4])),
+            "wrap",
+            None,
+        ),
+        (
+            tuple(
+                (pt.ltensor3(), np.broadcast_to(v, (2, 2, 3)).copy())
                 for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
             ),
-            set_test_value(pt.lvector(), np.array([2, 3, 4])),
+            (pt.lvector(), np.array([2, 3, 4])),
+            "wrap",
+            None,
+        ),
+        (
+            tuple((pt.lscalar(), v) for v in np.array([0, 0, 3])),
+            (pt.lvector(), np.array([2, 3, 4])),
             "clip",
-            "C",
+            None,
+        ),
+        (
+            tuple(
+                (pt.lvector(), v) for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
+            ),
+            (pt.lvector(), np.array([2, 3, 4])),
+            "clip",
+            None,
+        ),
+        (
+            tuple(
+                (pt.lmatrix(), np.broadcast_to(v, (2, 3)).copy())
+                for v in np.array([[0, 1, 2], [2, 0, 3], [1, 3, 5]])
+            ),
+            (pt.lvector(), np.array([2, 3, 4])),
+            "clip",
             None,
         ),
     ],
 )
-def test_RavelMultiIndex(arr, shape, mode, order, exc):
-    g = extra_ops.RavelMultiIndex(mode, order)(*((*arr, shape)))
-    g_fg = FunctionGraph(outputs=[g])
+def test_RavelMultiIndex(arr, shape, mode, exc):
+    arr, test_arr = zip(*arr, strict=True)
+    shape, test_shape = shape
+    g_c = RavelMultiIndex(mode, order="C")(*arr, shape)
+    g_f = RavelMultiIndex(mode, order="F")(*arr, shape)
 
     cm = contextlib.suppress() if exc is None else pytest.raises(exc)
     with cm:
         compare_numba_and_py(
-            g_fg,
-            [
-                i.tag.test_value
-                for i in g_fg.inputs
-                if not isinstance(i, SharedVariable | Constant)
-            ],
+            [*arr, shape],
+            [g_c, g_f],
+            [*test_arr, test_shape],
         )
 
 
@@ -257,44 +238,30 @@ def test_RavelMultiIndex(arr, shape, mode, order, exc):
     "x, repeats, axis, exc",
     [
         (
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(0, dtype="int64")),
-            None,
-            None,
-        ),
-        (
-            set_test_value(pt.lmatrix(), np.zeros((2, 2), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
-            None,
+            (pt.lvector(), np.arange(2, dtype="int64")),
+            (pt.lvector(), np.array([1, 3], dtype="int64")),
+            0,
             None,
         ),
         (
-            set_test_value(pt.lvector(), np.arange(2, dtype="int64")),
-            set_test_value(pt.lvector(), np.array([1, 1], dtype="int64")),
-            None,
-            None,
-        ),
-        (
-            set_test_value(pt.lmatrix(), np.zeros((2, 2), dtype="int64")),
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lmatrix(), np.zeros((2, 2), dtype="int64")),
+            (pt.lvector(), np.array([1, 3], dtype="int64")),
             0,
             UserWarning,
         ),
     ],
 )
 def test_Repeat(x, repeats, axis, exc):
+    x, test_x = x
+    repeats, test_repeats = repeats
     g = extra_ops.Repeat(axis)(x, repeats)
-    g_fg = FunctionGraph(outputs=[g])
 
     cm = contextlib.suppress() if exc is None else pytest.warns(exc)
     with cm:
         compare_numba_and_py(
-            g_fg,
-            [
-                i.tag.test_value
-                for i in g_fg.inputs
-                if not isinstance(i, SharedVariable | Constant)
-            ],
+            [x, repeats],
+            g,
+            [test_x, test_repeats],
         )
 
 
@@ -302,7 +269,7 @@ def test_Repeat(x, repeats, axis, exc):
     "x, axis, return_index, return_inverse, return_counts, exc",
     [
         (
-            set_test_value(pt.lscalar(), np.array(1, dtype="int64")),
+            (pt.lscalar(), np.array(1, dtype="int64")),
             None,
             False,
             False,
@@ -310,7 +277,7 @@ def test_Repeat(x, repeats, axis, exc):
             None,
         ),
         (
-            set_test_value(pt.lvector(), np.array([1, 1, 2], dtype="int64")),
+            (pt.lvector(), np.array([1, 1, 2], dtype="int64")),
             None,
             False,
             False,
@@ -318,7 +285,7 @@ def test_Repeat(x, repeats, axis, exc):
             None,
         ),
         (
-            set_test_value(pt.lmatrix(), np.array([[1, 1], [2, 2]], dtype="int64")),
+            (pt.lmatrix(), np.array([[1, 1], [2, 2]], dtype="int64")),
             None,
             False,
             False,
@@ -326,9 +293,7 @@ def test_Repeat(x, repeats, axis, exc):
             None,
         ),
         (
-            set_test_value(
-                pt.lmatrix(), np.array([[1, 1], [1, 1], [2, 2]], dtype="int64")
-            ),
+            (pt.lmatrix(), np.array([[1, 1], [1, 1], [2, 2]], dtype="int64")),
             0,
             False,
             False,
@@ -336,10 +301,16 @@ def test_Repeat(x, repeats, axis, exc):
             UserWarning,
         ),
         (
-            set_test_value(
-                pt.lmatrix(), np.array([[1, 1], [1, 1], [2, 2]], dtype="int64")
-            ),
+            (pt.lmatrix(), np.array([[1, 1], [1, 1], [2, 2]], dtype="int64")),
             0,
+            True,
+            True,
+            True,
+            UserWarning,
+        ),
+        (
+            (pt.lmatrix(), np.array([[1, 1], [1, 1], [2, 2]], dtype="int64")),
+            None,
             True,
             True,
             True,
@@ -348,65 +319,62 @@ def test_Repeat(x, repeats, axis, exc):
     ],
 )
 def test_Unique(x, axis, return_index, return_inverse, return_counts, exc):
+    x, test_x = x
     g = extra_ops.Unique(return_index, return_inverse, return_counts, axis)(x)
-
-    if isinstance(g, list):
-        g_fg = FunctionGraph(outputs=g)
-    else:
-        g_fg = FunctionGraph(outputs=[g])
 
     cm = contextlib.suppress() if exc is None else pytest.warns(exc)
     with cm:
         compare_numba_and_py(
-            g_fg,
-            [
-                i.tag.test_value
-                for i in g_fg.inputs
-                if not isinstance(i, SharedVariable | Constant)
-            ],
+            [x],
+            g,
+            [test_x],
         )
 
 
 @pytest.mark.parametrize(
-    "arr, shape, order, exc",
+    "arr, shape, requires_obj_mode",
     [
         (
-            set_test_value(pt.lvector(), np.array([9, 15, 1], dtype="int64")),
+            (pt.lscalar(), np.array(9, dtype="int64")),
             pt.as_tensor([2, 3, 4]),
-            "C",
-            None,
+            True,
         ),
         (
-            set_test_value(pt.lvector(), np.array([1, 0], dtype="int64")),
+            (pt.lvector(), np.array([9, 15, 1], dtype="int64")),
+            pt.as_tensor([2, 3, 4]),
+            False,
+        ),
+        (
+            (pt.lvector(), np.array([1, 0], dtype="int64")),
             pt.as_tensor([2]),
-            "C",
-            None,
+            False,
         ),
         (
-            set_test_value(pt.lvector(), np.array([9, 15, 1], dtype="int64")),
+            (pt.lmatrix(), np.array([[9, 15, 1], [1, 9, 15]], dtype="int64")),
             pt.as_tensor([2, 3, 4]),
-            "F",
-            NotImplementedError,
+            False,
         ),
     ],
 )
-def test_UnravelIndex(arr, shape, order, exc):
-    g = extra_ops.UnravelIndex(order)(arr, shape)
-
-    if isinstance(g, list):
-        g_fg = FunctionGraph(outputs=g)
+def test_UnravelIndex(arr, shape, requires_obj_mode):
+    arr, test_arr = arr
+    g_c = extra_ops.UnravelIndex("C")(arr, shape)
+    g_f = extra_ops.UnravelIndex("F")(arr, shape)
+    if shape.type.shape == (1,):
+        outputs = [g_c, g_f]
     else:
-        g_fg = FunctionGraph(outputs=[g])
+        outputs = [*g_c, *g_f]
 
-    cm = contextlib.suppress() if exc is None else pytest.raises(exc)
+    cm = (
+        pytest.warns(UserWarning, match="object mode")
+        if requires_obj_mode
+        else nullcontext()
+    )
     with cm:
         compare_numba_and_py(
-            g_fg,
-            [
-                i.tag.test_value
-                for i in g_fg.inputs
-                if not isinstance(i, SharedVariable | Constant)
-            ],
+            [arr],
+            outputs,
+            [test_arr],
         )
 
 
@@ -414,18 +382,18 @@ def test_UnravelIndex(arr, shape, order, exc):
     "a, v, side, sorter, exc",
     [
         (
-            set_test_value(pt.vector(), np.array([1.0, 2.0, 3.0], dtype=config.floatX)),
-            set_test_value(pt.matrix(), rng.random((3, 2)).astype(config.floatX)),
+            (pt.vector(), np.array([1.0, 2.0, 3.0], dtype=config.floatX)),
+            (pt.matrix(), rng.random((3, 2)).astype(config.floatX)),
             "left",
             None,
             None,
         ),
         pytest.param(
-            set_test_value(
+            (
                 pt.vector(),
                 np.array([0.29769574, 0.71649186, 0.20475563]).astype(config.floatX),
             ),
-            set_test_value(
+            (
                 pt.matrix(),
                 np.array(
                     [
@@ -440,25 +408,26 @@ def test_UnravelIndex(arr, shape, order, exc):
             None,
         ),
         (
-            set_test_value(pt.vector(), np.array([1.0, 2.0, 3.0], dtype=config.floatX)),
-            set_test_value(pt.matrix(), rng.random((3, 2)).astype(config.floatX)),
+            (pt.vector(), np.array([1.0, 2.0, 3.0], dtype=config.floatX)),
+            (pt.matrix(), rng.random((3, 2)).astype(config.floatX)),
             "right",
-            set_test_value(pt.lvector(), np.array([0, 2, 1])),
+            (pt.lvector(), np.array([0, 2, 1])),
             UserWarning,
         ),
     ],
 )
 def test_Searchsorted(a, v, side, sorter, exc):
+    a, test_a = a
+    v, test_v = v
+    if sorter is not None:
+        sorter, test_sorter = sorter
+
     g = extra_ops.SearchsortedOp(side)(a, v, sorter)
-    g_fg = FunctionGraph(outputs=[g])
 
     cm = contextlib.suppress() if exc is None else pytest.warns(exc)
     with cm:
         compare_numba_and_py(
-            g_fg,
-            [
-                i.tag.test_value
-                for i in g_fg.inputs
-                if not isinstance(i, SharedVariable | Constant)
-            ],
+            [a, v] if sorter is None else [a, v, sorter],
+            g,
+            [test_a, test_v] if sorter is None else [test_a, test_v, test_sorter],
         )

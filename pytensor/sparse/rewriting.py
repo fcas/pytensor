@@ -3,6 +3,8 @@ import scipy
 
 import pytensor
 import pytensor.scalar as ps
+import pytensor.sparse.basic as sparse
+import pytensor.sparse.math as spm
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply
 from pytensor.graph.rewriting.basic import (
@@ -11,17 +13,8 @@ from pytensor.graph.rewriting.basic import (
     node_rewriter,
 )
 from pytensor.link.c.op import COp, _NoPythonCOp
-from pytensor.sparse import basic as sparse
-from pytensor.sparse.basic import (
-    CSC,
-    CSR,
-    csm_data,
-    csm_grad,
-    csm_indices,
-    csm_indptr,
-    csm_properties,
-    usmm,
-)
+from pytensor.sparse.basic import csm_properties
+from pytensor.sparse.math import usmm
 from pytensor.tensor import blas
 from pytensor.tensor.basic import as_tensor_variable, cast
 from pytensor.tensor.math import mul, neg, sub
@@ -34,35 +27,32 @@ _is_sparse_variable = sparse._is_sparse_variable
 _is_dense = sparse._is_dense
 
 
-@node_rewriter([csm_properties])
+@register_specialize
+@node_rewriter([sparse.csm_properties])
 def local_csm_properties_csm(fgraph, node):
     """
     If we find csm_properties(CSM(*args)), then we can replace that with the
     *args directly.
 
     """
-    if node.op == csm_properties:
+    if node.op == sparse.csm_properties:
         (csm,) = node.inputs
-        if csm.owner and (csm.owner.op == CSC or csm.owner.op == CSR):
+        if csm.owner and (csm.owner.op == sparse.CSC or csm.owner.op == sparse.CSR):
             return csm.owner.inputs
 
     return False
 
 
-register_specialize(local_csm_properties_csm)
-
-
-# This is tested in tests/test_basic.py:test_remove0
 @node_rewriter([sparse.Remove0])
 def local_inplace_remove0(fgraph, node):
     """Rewrite to insert inplace versions of `Remove0`."""
     # If inplace is not enabled, enable it and replace that op with a
     # new op which has inplace enabled
-    if isinstance(node.op, sparse.Remove0) and not node.op.inplace:
-        new_op = node.op.__class__(inplace=True)
-        new_node = new_op(*node.inputs)
-        return [new_node]
-    return False
+    if node.op.inplace:
+        return False
+    new_op = node.op.__class__(inplace=True)
+    new_node = new_op(*node.inputs)
+    return [new_node]
 
 
 pytensor.compile.optdb.register(
@@ -120,7 +110,11 @@ class AddSD_ccode(_NoPythonCOp):
         if self.inplace:
             assert out_dtype == y.dtype
 
-        indices, indptr, data = csm_indices(x), csm_indptr(x), csm_data(x)
+        indices, indptr, data = (
+            sparse.csm_indices(x),
+            sparse.csm_indptr(x),
+            sparse.csm_data(x),
+        )
         # We either use CSC or CSR depending on the format of input
         assert self.format == x.type.format
         # The magic number two here arises because L{scipy.sparse}
@@ -158,8 +152,8 @@ class AddSD_ccode(_NoPythonCOp):
 
                 dtype_{y}* ydata = (dtype_{y}*)PyArray_DATA({y});
                 dtype_{z}* zdata = (dtype_{z}*)PyArray_DATA({z});
-                npy_intp Yi = PyArray_STRIDES({y})[0]/PyArray_DESCR({y})->elsize;
-                npy_intp Yj = PyArray_STRIDES({y})[1]/PyArray_DESCR({y})->elsize;
+                npy_intp Yi = PyArray_STRIDES({y})[0]/PyArray_ITEMSIZE({y});
+                npy_intp Yj = PyArray_STRIDES({y})[1]/PyArray_ITEMSIZE({y});
 
                 npy_intp pos;
                 if ({format} == 0){{
@@ -182,25 +176,23 @@ class AddSD_ccode(_NoPythonCOp):
              """
         return code
 
-    def infer_shape(self, fgraph, node, shapes):
+    def infer_shape(self, node, shapes):
         return [shapes[3]]
 
     def c_code_cache_version(self):
-        return (2,)
+        return (3,)
 
 
-@node_rewriter([sparse.AddSD])
+@node_rewriter([spm.AddSD])
 def local_inplace_addsd_ccode(fgraph, node):
     """Rewrite to insert inplace versions of `AddSD`."""
-    if isinstance(node.op, sparse.AddSD) and config.cxx:
-        out_dtype = ps.upcast(*node.inputs)
-        if out_dtype != node.inputs[1].dtype:
-            return
-        new_node = AddSD_ccode(format=node.inputs[0].type.format, inplace=True)(
-            *node.inputs
-        )
-        return [new_node]
-    return False
+    out_dtype = ps.upcast(*[inp.type.dtype for inp in node.inputs])
+    if out_dtype != node.inputs[1].dtype:
+        return
+    new_node = AddSD_ccode(format=node.inputs[0].type.format, inplace=True)(
+        *node.inputs
+    )
+    return [new_node]
 
 
 pytensor.compile.optdb.register(
@@ -210,6 +202,7 @@ pytensor.compile.optdb.register(
     ),
     "fast_run",
     "inplace",
+    "cxx_only",
     position=50.1,
 )
 
@@ -218,22 +211,19 @@ pytensor.compile.optdb.register(
 @register_specialize
 @node_rewriter([sparse.DenseFromSparse])
 def local_dense_from_sparse_sparse_from_dense(fgraph, node):
-    if isinstance(node.op, sparse.DenseFromSparse):
-        inp = node.inputs[0]
-        if inp.owner and isinstance(inp.owner.op, sparse.SparseFromDense):
-            return inp.owner.inputs
+    inp = node.inputs[0]
+    if inp.owner and isinstance(inp.owner.op, sparse.SparseFromDense):
+        return inp.owner.inputs
 
 
-@node_rewriter([sparse.AddSD])
+@node_rewriter([spm.AddSD])
 def local_addsd_ccode(fgraph, node):
     """
     Convert AddSD to faster AddSD_ccode.
 
     """
-    if isinstance(node.op, sparse.AddSD) and config.cxx:
-        new_node = AddSD_ccode(format=node.inputs[0].type.format)(*node.inputs)
-        return [new_node]
-    return False
+    new_node = AddSD_ccode(format=node.inputs[0].type.format)(*node.inputs)
+    return [new_node]
 
 
 pytensor.compile.optdb.register(
@@ -241,6 +231,7 @@ pytensor.compile.optdb.register(
     WalkingGraphRewriter(local_addsd_ccode),
     # Must be after local_inplace_addsd_ccode at 70.0
     "fast_run",
+    "cxx_only",
     position=70.1,
 )
 
@@ -361,13 +352,13 @@ class StructuredDotCSC(COp):
             {{PyErr_SetString(PyExc_NotImplementedError, "array too big (overflows int32 index)"); {fail};}}
 
             // strides tell you how many bytes to skip to go to next column/row entry
-            npy_intp Szm = PyArray_STRIDES({z})[0] / PyArray_DESCR({z})->elsize;
-            npy_intp Szn = PyArray_STRIDES({z})[1] / PyArray_DESCR({z})->elsize;
-            //npy_intp Sbm = PyArray_STRIDES({b})[0] / PyArray_DESCR({b})->elsize;
-            npy_intp Sbn = PyArray_STRIDES({b})[1] / PyArray_DESCR({b})->elsize;
-            npy_intp Sval = PyArray_STRIDES({a_val})[0] / PyArray_DESCR({a_val})->elsize;
-            npy_intp Sind = PyArray_STRIDES({a_ind})[0] / PyArray_DESCR({a_ind})->elsize;
-            npy_intp Sptr = PyArray_STRIDES({a_ptr})[0] / PyArray_DESCR({a_ptr})->elsize;
+            npy_intp Szm = PyArray_STRIDES({z})[0] / PyArray_ITEMSIZE({z});
+            npy_intp Szn = PyArray_STRIDES({z})[1] / PyArray_ITEMSIZE({z});
+            //npy_intp Sbm = PyArray_STRIDES({b})[0] / PyArray_ITEMSIZE({b});
+            npy_intp Sbn = PyArray_STRIDES({b})[1] / PyArray_ITEMSIZE({b});
+            npy_intp Sval = PyArray_STRIDES({a_val})[0] / PyArray_ITEMSIZE({a_val});
+            npy_intp Sind = PyArray_STRIDES({a_ind})[0] / PyArray_ITEMSIZE({a_ind});
+            npy_intp Sptr = PyArray_STRIDES({a_ptr})[0] / PyArray_ITEMSIZE({a_ptr});
 
             // pointers to access actual data in the arrays passed as params.
             dtype_{z}*     __restrict__ Dz   = (dtype_{z}*)PyArray_DATA({z});
@@ -436,7 +427,7 @@ class StructuredDotCSC(COp):
         return rval
 
     def c_code_cache_version(self):
-        return (3,)
+        return (4,)
 
 
 sd_csc = StructuredDotCSC()
@@ -555,13 +546,13 @@ class StructuredDotCSR(COp):
             {{PyErr_SetString(PyExc_NotImplementedError, "array too big (overflows int32 index)"); {fail};}}
 
             // strides tell you how many bytes to skip to go to next column/row entry
-            npy_intp Szm = PyArray_STRIDES({z})[0] / PyArray_DESCR({z})->elsize;
-            npy_intp Szn = PyArray_STRIDES({z})[1] / PyArray_DESCR({z})->elsize;
-            npy_intp Sbm = PyArray_STRIDES({b})[0] / PyArray_DESCR({b})->elsize;
-            npy_intp Sbn = PyArray_STRIDES({b})[1] / PyArray_DESCR({b})->elsize;
-            npy_intp Sval = PyArray_STRIDES({a_val})[0] / PyArray_DESCR({a_val})->elsize;
-            npy_intp Sind = PyArray_STRIDES({a_ind})[0] / PyArray_DESCR({a_ind})->elsize;
-            npy_intp Sptr = PyArray_STRIDES({a_ptr})[0] / PyArray_DESCR({a_ptr})->elsize;
+            npy_intp Szm = PyArray_STRIDES({z})[0] / PyArray_ITEMSIZE({z});
+            npy_intp Szn = PyArray_STRIDES({z})[1] / PyArray_ITEMSIZE({z});
+            npy_intp Sbm = PyArray_STRIDES({b})[0] / PyArray_ITEMSIZE({b});
+            npy_intp Sbn = PyArray_STRIDES({b})[1] / PyArray_ITEMSIZE({b});
+            npy_intp Sval = PyArray_STRIDES({a_val})[0] / PyArray_ITEMSIZE({a_val});
+            npy_intp Sind = PyArray_STRIDES({a_ind})[0] / PyArray_ITEMSIZE({a_ind});
+            npy_intp Sptr = PyArray_STRIDES({a_ptr})[0] / PyArray_ITEMSIZE({a_ptr});
 
             // pointers to access actual data in the arrays passed as params.
             dtype_{z}* __restrict__ Dz = (dtype_{z}*)PyArray_DATA({z});
@@ -614,7 +605,7 @@ class StructuredDotCSR(COp):
         """
 
     def c_code_cache_version(self):
-        return (2,)
+        return (3,)
 
 
 sd_csr = StructuredDotCSR()
@@ -622,9 +613,9 @@ sd_csr = StructuredDotCSR()
 
 # register a specialization to replace StructuredDot -> StructuredDotCSx
 # This is tested in tests/test_basic.py:792
-@node_rewriter([sparse._structured_dot])
+@node_rewriter([spm._structured_dot])
 def local_structured_dot(fgraph, node):
-    if node.op == sparse._structured_dot:
+    if node.op == spm._structured_dot:
         a, b = node.inputs
         if a.type.format == "csc":
             a_val, a_ind, a_ptr, a_shape = csm_properties(a)
@@ -845,12 +836,12 @@ class UsmmCscDense(_NoPythonCOp):
             const npy_int32 * __restrict__ Dptr = (npy_int32*)PyArray_DATA({x_ptr});
             const dtype_{alpha} alpha = ((dtype_{alpha}*)PyArray_DATA({alpha}))[0];
 
-            npy_intp Sz = PyArray_STRIDES({z})[1] / PyArray_DESCR({z})->elsize;
-            npy_intp Szn = PyArray_STRIDES({zn})[1] / PyArray_DESCR({zn})->elsize;
-            npy_intp Sval = PyArray_STRIDES({x_val})[0] / PyArray_DESCR({x_val})->elsize;
-            npy_intp Sind = PyArray_STRIDES({x_ind})[0] / PyArray_DESCR({x_ind})->elsize;
-            npy_intp Sptr = PyArray_STRIDES({x_ptr})[0] / PyArray_DESCR({x_ptr})->elsize;
-            npy_intp Sy = PyArray_STRIDES({y})[1] / PyArray_DESCR({y})->elsize;
+            npy_intp Sz = PyArray_STRIDES({z})[1] / PyArray_ITEMSIZE({z});
+            npy_intp Szn = PyArray_STRIDES({zn})[1] / PyArray_ITEMSIZE({zn});
+            npy_intp Sval = PyArray_STRIDES({x_val})[0] / PyArray_ITEMSIZE({x_val});
+            npy_intp Sind = PyArray_STRIDES({x_ind})[0] / PyArray_ITEMSIZE({x_ind});
+            npy_intp Sptr = PyArray_STRIDES({x_ptr})[0] / PyArray_ITEMSIZE({x_ptr});
+            npy_intp Sy = PyArray_STRIDES({y})[1] / PyArray_ITEMSIZE({y});
 
             // blas expects ints; convert here (rather than just making N etc ints) to avoid potential overflow in the negative-stride correction
             if ((N > 0x7fffffffL)||(Sy > 0x7fffffffL)||(Szn > 0x7fffffffL)||(Sy < -0x7fffffffL)||(Szn < -0x7fffffffL))
@@ -896,7 +887,7 @@ class UsmmCscDense(_NoPythonCOp):
         return rval
 
     def c_code_cache_version(self):
-        return (3, blas.blas_header_version())
+        return (4, blas.blas_header_version())
 
 
 usmm_csc_dense = UsmmCscDense(inplace=False)
@@ -916,12 +907,12 @@ local_usmm = PatternNodeRewriter(
                     all(s == 1 for s in expr.type.shape) and config.blas__ldflags
                 ),
             },
-            (sparse._dot, "x", "y"),
+            (spm._dot, "x", "y"),
         ),
     ),
-    (usmm, (neg, "alpha"), "x", "y", "z"),
+    (spm.usmm, (neg, "alpha"), "x", "y", "z"),
 )
-register_specialize(local_usmm, name="local_usmm")
+register_specialize(local_usmm, "cxx_only", name="local_usmm")
 
 
 # register a specialization to replace usmm_csc_dense -> usmm_csc_dense_inplace
@@ -936,7 +927,7 @@ register_specialize(local_usmm_csc_dense_inplace, "cxx_only", "inplace")
 
 
 # This is tested in tests/test_basic.py:UsmmTests
-@node_rewriter([usmm])
+@node_rewriter([spm.usmm])
 def local_usmm_csx(fgraph, node):
     """
     usmm -> usmm_csc_dense
@@ -980,7 +971,7 @@ class CSMGradC(_NoPythonCOp):
 
     def c_code(self, node, name, inputs, outputs, sub):
         # retrieve dtype number
-        (a_val, a_ind, a_ptr, a_dim, b_val, b_ind, b_ptr, b_dim) = inputs
+        (a_val, a_ind, a_ptr, a_dim, b_val, b_ind, b_ptr, _b_dim) = inputs
         (z,) = outputs
         typenum_z = node.outputs[0].type.dtype_specs()[2]
         if node.inputs[0].type.dtype in ("complex64", "complex128"):
@@ -1035,13 +1026,13 @@ class CSMGradC(_NoPythonCOp):
             npy_intp sp_dim = (M == a_dim_0)?a_dim_1:a_dim_0;
 
             // strides tell you how many bytes to skip to go to next column/row entry
-            npy_intp Sz = PyArray_STRIDES({z})[0] / PyArray_DESCR({z})->elsize;
-            npy_intp Sa_val = PyArray_STRIDES({a_val})[0] / PyArray_DESCR({a_val})->elsize;
-            npy_intp Sa_ind = PyArray_STRIDES({a_ind})[0] / PyArray_DESCR({a_ind})->elsize;
-            npy_intp Sa_ptr = PyArray_STRIDES({a_ptr})[0] / PyArray_DESCR({a_ptr})->elsize;
-            npy_intp Sb_val = PyArray_STRIDES({b_val})[0] / PyArray_DESCR({b_val})->elsize;
-            npy_intp Sb_ind = PyArray_STRIDES({b_ind})[0] / PyArray_DESCR({b_ind})->elsize;
-            npy_intp Sb_ptr = PyArray_STRIDES({b_ptr})[0] / PyArray_DESCR({b_ptr})->elsize;
+            npy_intp Sz = PyArray_STRIDES({z})[0] / PyArray_ITEMSIZE({z});
+            npy_intp Sa_val = PyArray_STRIDES({a_val})[0] / PyArray_ITEMSIZE({a_val});
+            npy_intp Sa_ind = PyArray_STRIDES({a_ind})[0] / PyArray_ITEMSIZE({a_ind});
+            npy_intp Sa_ptr = PyArray_STRIDES({a_ptr})[0] / PyArray_ITEMSIZE({a_ptr});
+            npy_intp Sb_val = PyArray_STRIDES({b_val})[0] / PyArray_ITEMSIZE({b_val});
+            npy_intp Sb_ind = PyArray_STRIDES({b_ind})[0] / PyArray_ITEMSIZE({b_ind});
+            npy_intp Sb_ptr = PyArray_STRIDES({b_ptr})[0] / PyArray_ITEMSIZE({b_ptr});
 
             // pointers to access actual data in the arrays passed as params.
             dtype_{z}* __restrict__ Dz = (dtype_{z}*)PyArray_DATA({z});
@@ -1086,19 +1077,19 @@ class CSMGradC(_NoPythonCOp):
         """
 
     def c_code_cache_version(self):
-        return (3,)
+        return (4,)
 
 
 csm_grad_c = CSMGradC()
 
 
-@node_rewriter([csm_grad(None)])
+@node_rewriter([sparse.csm_grad(None)])
 def local_csm_grad_c(fgraph, node):
     """
     csm_grad(None) -> csm_grad_c
 
     """
-    if node.op == csm_grad(None):
+    if node.op == sparse.csm_grad(None):
         return [csm_grad_c(*node.inputs)]
     return False
 
@@ -1384,9 +1375,9 @@ mul_s_d_csr = MulSDCSR()
 
 
 # register a specialization to replace MulSD -> MulSDCSX
-@node_rewriter([sparse.mul_s_d])
+@node_rewriter([spm.mul_s_d])
 def local_mul_s_d(fgraph, node):
-    if node.op == sparse.mul_s_d:
+    if node.op == spm.mul_s_d:
         x, y = node.inputs
 
         x_is_sparse_variable = _is_sparse_variable(x)
@@ -1482,7 +1473,7 @@ class MulSVCSR(_NoPythonCOp):
         )
 
     def c_code_cache_version(self):
-        return (2,)
+        return (3,)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (
@@ -1544,7 +1535,7 @@ class MulSVCSR(_NoPythonCOp):
 
             dtype_{_zout} * const __restrict__ zout = (dtype_{_zout}*)PyArray_DATA({_zout});
 
-            const npy_intp Sb = PyArray_STRIDES({_b})[0] / PyArray_DESCR({_b})->elsize;
+            const npy_intp Sb = PyArray_STRIDES({_b})[0] / PyArray_ITEMSIZE({_b});
 
             // loop over rows
             for (npy_intp j = 0; j < N; ++j)
@@ -1570,9 +1561,9 @@ mul_s_v_csr = MulSVCSR()
 
 
 # register a specialization to replace MulSV -> MulSVCSR
-@node_rewriter([sparse.mul_s_v])
+@node_rewriter([spm.mul_s_v])
 def local_mul_s_v(fgraph, node):
-    if node.op == sparse.mul_s_v:
+    if node.op == spm.mul_s_v:
         x, y = node.inputs
 
         x_is_sparse_variable = _is_sparse_variable(x)
@@ -1655,7 +1646,7 @@ class StructuredAddSVCSR(_NoPythonCOp):
         )
 
     def c_code_cache_version(self):
-        return (3,)
+        return (4,)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (
@@ -1723,7 +1714,7 @@ class StructuredAddSVCSR(_NoPythonCOp):
 
             dtype_{_zout} * const __restrict__ zout = (dtype_{_zout}*)PyArray_DATA({_zout});
 
-            const npy_intp Sb = PyArray_STRIDES({_b})[0] / PyArray_DESCR({_b})->elsize;
+            const npy_intp Sb = PyArray_STRIDES({_b})[0] / PyArray_ITEMSIZE({_b});
 
             // loop over columns
             for (npy_intp j = 0; j < N; ++j)
@@ -1751,9 +1742,9 @@ structured_add_s_v_csr = StructuredAddSVCSR()
 
 # register a specialization to replace
 # structured_add_s_v -> structured_add_s_v_csr
-@node_rewriter([sparse.structured_add_s_v])
+@node_rewriter([spm.structured_add_s_v])
 def local_structured_add_s_v(fgraph, node):
-    if node.op == sparse.structured_add_s_v:
+    if node.op == spm.structured_add_s_v:
         x, y = node.inputs
 
         x_is_sparse_variable = _is_sparse_variable(x)
@@ -1868,7 +1859,7 @@ class SamplingDotCSR(_NoPythonCOp):
         )
 
     def c_code_cache_version(self):
-        return (4, blas.blas_header_version())
+        return (5, blas.blas_header_version())
 
     def c_support_code(self, **kwargs):
         return blas.blas_header_text()
@@ -1995,14 +1986,14 @@ PyErr_SetString(PyExc_NotImplementedError, "rank(y) != 2"); {fail};}}
             dtype_{z_ind}* __restrict__ Dzi = (dtype_{z_ind}*)PyArray_DATA({z_ind});
             dtype_{z_ptr}* __restrict__ Dzp = (dtype_{z_ptr}*)PyArray_DATA({z_ptr});
 
-            const npy_intp Sdx = PyArray_STRIDES({x})[1]/PyArray_DESCR({x})->elsize;
-            const npy_intp Sdy = PyArray_STRIDES({y})[1]/PyArray_DESCR({y})->elsize;
-            const npy_intp Sdpd = PyArray_STRIDES({p_data})[0] / PyArray_DESCR({p_data})->elsize;
-            const npy_intp Sdpi = PyArray_STRIDES({p_ind})[0] / PyArray_DESCR({p_ind})->elsize;
-            const npy_intp Sdpp = PyArray_STRIDES({p_ptr})[0] / PyArray_DESCR({p_ptr})->elsize;
-            const npy_intp Sdzd = PyArray_STRIDES({z_data})[0] / PyArray_DESCR({z_data})->elsize;
-            const npy_intp Sdzi = PyArray_STRIDES({z_ind})[0] / PyArray_DESCR({z_ind})->elsize;
-            const npy_intp Sdzp = PyArray_STRIDES({z_ptr})[0] / PyArray_DESCR({z_ptr})->elsize;
+            const npy_intp Sdx = PyArray_STRIDES({x})[1]/PyArray_ITEMSIZE({x});
+            const npy_intp Sdy = PyArray_STRIDES({y})[1]/PyArray_ITEMSIZE({y});
+            const npy_intp Sdpd = PyArray_STRIDES({p_data})[0] / PyArray_ITEMSIZE({p_data});
+            const npy_intp Sdpi = PyArray_STRIDES({p_ind})[0] / PyArray_ITEMSIZE({p_ind});
+            const npy_intp Sdpp = PyArray_STRIDES({p_ptr})[0] / PyArray_ITEMSIZE({p_ptr});
+            const npy_intp Sdzd = PyArray_STRIDES({z_data})[0] / PyArray_ITEMSIZE({z_data});
+            const npy_intp Sdzi = PyArray_STRIDES({z_ind})[0] / PyArray_ITEMSIZE({z_ind});
+            const npy_intp Sdzp = PyArray_STRIDES({z_ptr})[0] / PyArray_ITEMSIZE({z_ptr});
 
             memcpy(Dzi, Dpi, PyArray_DIMS({p_ind})[0]*sizeof(dtype_{p_ind}));
             memcpy(Dzp, Dpp, PyArray_DIMS({p_ptr})[0]*sizeof(dtype_{p_ptr}));
@@ -2042,12 +2033,12 @@ sampling_dot_csr = SamplingDotCSR()
 
 
 # register a specialization to replace SamplingDot -> SamplingDotCsr
-@node_rewriter([sparse.sampling_dot])
+@node_rewriter([spm.sampling_dot])
 def local_sampling_dot_csr(fgraph, node):
     if not config.blas__ldflags:
         # The C implementation of SamplingDotCsr relies on BLAS routines
         return
-    if node.op == sparse.sampling_dot:
+    if node.op == spm.sampling_dot:
         x, y, p = node.inputs
         if p.type.format == "csr":
             p_data, p_ind, p_ptr, p_shape = sparse.csm_properties(p)

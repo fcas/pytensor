@@ -5,23 +5,22 @@ import numpy as np
 import pytest
 import scipy.stats as stats
 
+import pytensor
 import pytensor.tensor as pt
 import pytensor.tensor.random.basic as ptr
 from pytensor import shared
 from pytensor.compile.builders import OpFromGraph
-from pytensor.compile.function import function
-from pytensor.compile.sharedvalue import SharedVariable
-from pytensor.graph.basic import Constant
-from pytensor.graph.fg import FunctionGraph
+from pytensor.compile.maker import function
+from pytensor.tensor.random.op import RandomVariableWithCoreShape
 from tests.link.numba.test_basic import (
     compare_numba_and_py,
     numba_mode,
-    set_test_value,
 )
 from tests.tensor.random.test_basic import (
     batched_permutation_tester,
     batched_unweighted_choice_without_replacement_tester,
     batched_weighted_choice_without_replacement_tester,
+    create_mvnormal_cov_decomposition_method_test,
 )
 
 
@@ -84,7 +83,7 @@ def test_rng_copy():
     rng.type.values_eq(rng.get_value(), np.random.default_rng(123))
 
 
-def test_rng_non_default_update():
+def test_rng_custom_update():
     rng = shared(np.random.default_rng(1))
     rng_new = shared(np.random.default_rng(2))
 
@@ -147,17 +146,22 @@ def test_multivariate_normal():
     )
 
 
+test_mvnormal_cov_decomposition_method = create_mvnormal_cov_decomposition_method_test(
+    "NUMBA"
+)
+
+
 @pytest.mark.parametrize(
     "rv_op, dist_args, size",
     [
         (
             ptr.uniform,
             [
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
@@ -167,15 +171,15 @@ def test_multivariate_normal():
         (
             ptr.triangular,
             [
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(-5.0, dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(5.0, dtype=np.float64),
                 ),
@@ -185,11 +189,11 @@ def test_multivariate_normal():
         (
             ptr.lognormal,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -199,11 +203,11 @@ def test_multivariate_normal():
         (
             ptr.pareto,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([2.0, 10.0], dtype=np.float64),
                 ),
@@ -213,7 +217,7 @@ def test_multivariate_normal():
         (
             ptr.exponential,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
@@ -223,7 +227,7 @@ def test_multivariate_normal():
         (
             ptr.weibull,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
@@ -233,11 +237,11 @@ def test_multivariate_normal():
         (
             ptr.logistic,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -247,40 +251,39 @@ def test_multivariate_normal():
         (
             ptr.geometric,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([0.3, 0.4], dtype=np.float64),
                 ),
             ],
             pt.as_tensor([3, 2]),
         ),
-        pytest.param(
+        (
             ptr.hypergeometric,
             [
-                set_test_value(
+                (
                     pt.lscalar(),
                     np.array(7, dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.lscalar(),
                     np.array(8, dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.lscalar(),
                     np.array(15, dtype=np.int64),
                 ),
             ],
             pt.as_tensor([3, 2]),
-            marks=pytest.mark.xfail,  # Not implemented
         ),
         (
             ptr.wald,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -290,11 +293,11 @@ def test_multivariate_normal():
         (
             ptr.laplace,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -304,11 +307,11 @@ def test_multivariate_normal():
         (
             ptr.binomial,
             [
-                set_test_value(
+                (
                     pt.lvector(),
                     np.array([1, 2], dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(0.9, dtype=np.float64),
                 ),
@@ -318,21 +321,21 @@ def test_multivariate_normal():
         (
             ptr.normal,
             [
-                set_test_value(
+                (
                     pt.lvector(),
                     np.array([1, 2], dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
             ],
-            pt.as_tensor(tuple(set_test_value(pt.lscalar(), v) for v in [3, 2])),
+            pt.as_tensor([3, 2]),
         ),
         (
             ptr.poisson,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
@@ -342,11 +345,11 @@ def test_multivariate_normal():
         (
             ptr.halfnormal,
             [
-                set_test_value(
+                (
                     pt.lvector(),
                     np.array([1, 2], dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -356,7 +359,7 @@ def test_multivariate_normal():
         (
             ptr.bernoulli,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([0.1, 0.9], dtype=np.float64),
                 ),
@@ -366,11 +369,11 @@ def test_multivariate_normal():
         (
             ptr.beta,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -380,11 +383,11 @@ def test_multivariate_normal():
         (
             ptr._gamma,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([0.5, 3.0], dtype=np.float64),
                 ),
@@ -394,7 +397,7 @@ def test_multivariate_normal():
         (
             ptr.chisquare,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 )
@@ -404,11 +407,11 @@ def test_multivariate_normal():
         (
             ptr.negative_binomial,
             [
-                set_test_value(
+                (
                     pt.lvector(),
                     np.array([100, 200], dtype=np.int64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(0.09, dtype=np.float64),
                 ),
@@ -418,11 +421,11 @@ def test_multivariate_normal():
         (
             ptr.vonmises,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([-0.5, 0.5], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
                     np.array(1.0, dtype=np.float64),
                 ),
@@ -432,14 +435,14 @@ def test_multivariate_normal():
         (
             ptr.permutation,
             [
-                set_test_value(pt.dmatrix(), np.eye(5, dtype=np.float64)),
+                (pt.dmatrix(), np.eye(5, dtype=np.float64)),
             ],
             (),
         ),
         (
             partial(ptr.choice, replace=True),
             [
-                set_test_value(pt.dmatrix(), np.eye(5, dtype=np.float64)),
+                (pt.dmatrix(), np.eye(5, dtype=np.float64)),
             ],
             pt.as_tensor([2]),
         ),
@@ -449,17 +452,15 @@ def test_multivariate_normal():
                 a, p=p, size=size, replace=True, rng=rng
             ),
             [
-                set_test_value(pt.dmatrix(), np.eye(3, dtype=np.float64)),
-                set_test_value(
-                    pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)
-                ),
+                (pt.dmatrix(), np.eye(3, dtype=np.float64)),
+                (pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)),
             ],
             (pt.as_tensor([2, 3])),
         ),
         pytest.param(
             partial(ptr.choice, replace=False),
             [
-                set_test_value(pt.dvector(), np.arange(5, dtype=np.float64)),
+                (pt.dvector(), np.arange(5, dtype=np.float64)),
             ],
             pt.as_tensor([2]),
             marks=pytest.mark.xfail(
@@ -470,7 +471,7 @@ def test_multivariate_normal():
         pytest.param(
             partial(ptr.choice, replace=False),
             [
-                set_test_value(pt.dmatrix(), np.eye(5, dtype=np.float64)),
+                (pt.dmatrix(), np.eye(5, dtype=np.float64)),
             ],
             pt.as_tensor([2]),
             marks=pytest.mark.xfail(
@@ -484,8 +485,8 @@ def test_multivariate_normal():
                 a, p=p, size=size, replace=False, rng=rng
             ),
             [
-                set_test_value(pt.vector(), np.arange(5, dtype=np.float64)),
-                set_test_value(
+                (pt.vector(), np.arange(5, dtype=np.float64)),
+                (
                     pt.dvector(),
                     np.array([0.5, 0.0, 0.25, 0.0, 0.25], dtype=np.float64),
                 ),
@@ -498,10 +499,8 @@ def test_multivariate_normal():
                 a, p=p, size=size, replace=False, rng=rng
             ),
             [
-                set_test_value(pt.dmatrix(), np.eye(3, dtype=np.float64)),
-                set_test_value(
-                    pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)
-                ),
+                (pt.dmatrix(), np.eye(3, dtype=np.float64)),
+                (pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)),
             ],
             (),
         ),
@@ -511,29 +510,49 @@ def test_multivariate_normal():
                 a, p=p, size=size, replace=False, rng=rng
             ),
             [
-                set_test_value(pt.dmatrix(), np.eye(3, dtype=np.float64)),
-                set_test_value(
-                    pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)
-                ),
+                (pt.dmatrix(), np.eye(3, dtype=np.float64)),
+                (pt.dvector(), np.array([0.25, 0.5, 0.25], dtype=np.float64)),
             ],
             (pt.as_tensor([2, 1])),
+        ),
+        (
+            ptr.invgamma,
+            [
+                (
+                    pt.dvector("shape"),
+                    np.array([1.0, 2.0], dtype=np.float64),
+                ),
+                (
+                    pt.dvector("scale"),
+                    np.array([0.5, 3.0], dtype=np.float64),
+                ),
+            ],
+            (2,),
+        ),
+        (
+            ptr.multinomial,
+            [
+                (
+                    pt.lvector("n"),
+                    np.array([1, 10, 1000], dtype=np.int64),
+                ),
+                (pt.dvector("p"), np.array([0.3, 0.7], dtype=np.float64)),
+            ],
+            None,
         ),
     ],
     ids=str,
 )
 def test_aligned_RandomVariable(rv_op, dist_args, size):
     """Tests for Numba samplers that are one-to-one with PyTensor's/NumPy's samplers."""
+    dist_args, test_dist_args = zip(*dist_args, strict=True)
     rng = shared(np.random.default_rng(29402))
     g = rv_op(*dist_args, size=size, rng=rng)
-    g_fg = FunctionGraph(outputs=[g])
 
     compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ],
+        dist_args,
+        [g],
+        test_dist_args,
         eval_obj_mode=False,  # No python impl
     )
 
@@ -544,13 +563,13 @@ def test_aligned_RandomVariable(rv_op, dist_args, size):
         (
             ptr.cauchy,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
-                    np.array(1.0, dtype=np.float64),
+                    np.array(3.0, dtype=np.float64),
                 ),
             ],
             (2,),
@@ -560,35 +579,47 @@ def test_aligned_RandomVariable(rv_op, dist_args, size):
         (
             ptr.gumbel,
             [
-                set_test_value(
+                (
                     pt.dvector(),
                     np.array([1.0, 2.0], dtype=np.float64),
                 ),
-                set_test_value(
+                (
                     pt.dscalar(),
-                    np.array(1.0, dtype=np.float64),
+                    np.array(4.0, dtype=np.float64),
                 ),
             ],
             (2,),
             "gumbel_r",
             lambda *args: args,
         ),
+        (
+            ptr.t,
+            [
+                (pt.scalar(), np.array(np.e, dtype=np.float64)),
+                (
+                    pt.dvector(),
+                    np.array([1.0, 2.0], dtype=np.float64),
+                ),
+                (
+                    pt.dscalar(),
+                    np.array(np.pi, dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "t",
+            lambda *args: args,
+        ),
     ],
 )
 def test_unaligned_RandomVariable(rv_op, dist_args, base_size, cdf_name, params_conv):
     """Tests for Numba samplers that are not one-to-one with PyTensor's/NumPy's samplers."""
+    dist_args, test_dist_args = zip(*dist_args, strict=True)
     rng = shared(np.random.default_rng(29402))
     g = rv_op(*dist_args, size=(2000, *base_size), rng=rng)
     g_fn = function(dist_args, g, mode=numba_mode)
-    samples = g_fn(
-        *[
-            i.tag.test_value
-            for i in g_fn.maker.fgraph.inputs
-            if not isinstance(i, SharedVariable | Constant)
-        ]
-    )
+    samples = g_fn(*test_dist_args)
 
-    bcast_dist_args = np.broadcast_arrays(*[i.tag.test_value for i in dist_args])
+    bcast_dist_args = np.broadcast_arrays(*test_dist_args)
 
     for idx in np.ndindex(*base_size):
         cdf_params = params_conv(*(arg[idx] for arg in bcast_dist_args))
@@ -602,7 +633,7 @@ def test_unaligned_RandomVariable(rv_op, dist_args, base_size, cdf_name, params_
     "a, size, cm",
     [
         pytest.param(
-            set_test_value(
+            (
                 pt.dvector(),
                 np.array([100000, 1, 1], dtype=np.float64),
             ),
@@ -610,7 +641,7 @@ def test_unaligned_RandomVariable(rv_op, dist_args, base_size, cdf_name, params_
             contextlib.suppress(),
         ),
         pytest.param(
-            set_test_value(
+            (
                 pt.dmatrix(),
                 np.array(
                     [[100000, 1, 1], [1, 100000, 1], [1, 1, 100000]],
@@ -621,7 +652,7 @@ def test_unaligned_RandomVariable(rv_op, dist_args, base_size, cdf_name, params_
             contextlib.suppress(),
         ),
         pytest.param(
-            set_test_value(
+            (
                 pt.dmatrix(),
                 np.array(
                     [[100000, 1, 1], [1, 100000, 1], [1, 1, 100000]],
@@ -631,27 +662,41 @@ def test_unaligned_RandomVariable(rv_op, dist_args, base_size, cdf_name, params_
             (10, 4),
             pytest.raises(
                 ValueError,
-                match="Vectorized input 0 has an incompatible shape in axis 1.",
+                match="Vectorized input 0 has an incompatible shape in axis 1\\.",
             ),
         ),
     ],
 )
 def test_DirichletRV(a, size, cm):
+    a, a_val = a
     rng = shared(np.random.default_rng(29402))
-    g = ptr.dirichlet(a, size=size, rng=rng)
-    g_fn = function([a], g, mode=numba_mode)
+    next_rng, g = ptr.dirichlet(a, size=size, rng=rng).owner.outputs
+    g_fn = function([a], g, mode=numba_mode, updates={rng: next_rng})
 
     with cm:
-        a_val = a.tag.test_value
-
-        all_samples = []
-        for i in range(1000):
-            samples = g_fn(a_val)
-            all_samples.append(samples)
-
+        all_samples = [g_fn(a_val) for _ in range(1000)]
         exp_res = a_val / a_val.sum(-1)
         res = np.mean(all_samples, axis=tuple(range(0, a_val.ndim - 1)))
         assert np.allclose(res, exp_res, atol=1e-4)
+
+
+def test_dirichlet_discrete_alpha():
+    alpha = pt.lvector()
+    g = ptr.dirichlet(alpha, size=100)
+    fn = function([alpha], g, mode=numba_mode)
+    res = fn(np.array([1, 1, 1], dtype=np.int64))
+    assert res.dtype == np.float64
+    np.testing.assert_allclose(res.sum(-1), 1.0)
+    assert np.unique(res).size > 2  # Make sure we have more than just 0s and 1s
+
+
+def test_cache_size_bcast_change():
+    # Regression bug for caching with the same key in case where size is meaningful vs not
+    alpha = pt.dvector()
+    for s in (1, 2, 3):
+        x = ptr.dirichlet(alpha, size=(s,))
+        fn = function([alpha], x, mode=numba_mode)
+        assert fn([0.2, 0.3, 0.5]).shape == (s, 3)
 
 
 def test_rv_inside_ofg():
@@ -685,3 +730,126 @@ def test_rv_inside_ofg():
 def test_unnatural_batched_dims(batch_dims_tester):
     """Tests for RVs that don't have natural batch dims in Numba API."""
     batch_dims_tester(mode="NUMBA")
+
+
+def test_repeated_args():
+    v = pt.scalar()
+    x = ptr.beta(v, v)
+    fn, _ = compare_numba_and_py([v], [x], [0.5 * 1e6], eval_obj_mode=False)
+
+    # Confirm we are testing a RandomVariable with repeated inputs
+    final_node = fn.maker.fgraph.outputs[0].owner
+    assert isinstance(final_node.op, RandomVariableWithCoreShape)
+    assert final_node.inputs[-2] is final_node.inputs[-1]
+
+
+def test_core_shape_from_random_input():
+    """A RV whose core shape reads the shape of another RV feeding it.
+
+    ``introduce_explicit_core_shape_rv`` must still wrap such a RV: the RV in the
+    core-shape graph (here the random ``mean``, whose runtime-only trailing dim is
+    the core shape) is computed before the node anyway, so reading its shape needs
+    no extra draw. Regression test for the previously over-conservative bail.
+    """
+    rng = shared(np.random.default_rng(123))
+    n = pt.scalar("n", dtype=int)
+    # Random mean whose trailing (core) dim is only known at runtime
+    mean = ptr.normal(size=(2, n), rng=rng)
+    x = ptr.multivariate_normal(mean=mean, cov=pt.eye(n), rng=rng)
+
+    fn = function([n], x, mode="NUMBA")
+    # Both RVs are wrapped -- no raw RandomVariable survives to funcify
+    assert not any(
+        isinstance(node.op, ptr.RandomVariable) for node in fn.maker.fgraph.apply_nodes
+    )
+    assert fn(3).shape == (2, 3)
+
+
+def test_rv_fallback():
+    """Test that random variables can fallback to object mode."""
+
+    class CustomRV(ptr.RandomVariable):
+        name = "custom"
+        signature = "()->()"
+        dtype = "float64"
+
+        def rng_fn(self, rng, value, size=None):
+            # Just return the value plus a random number
+            return value + rng.standard_normal(size=size)
+
+    custom_rv = CustomRV()
+
+    rng = shared(np.random.default_rng(123))
+    size = pt.scalar("size", dtype=int)
+    next_rng, x = custom_rv(np.pi, size=(size,), rng=rng).owner.outputs
+
+    fn = function([size], x, updates={rng: next_rng}, mode="NUMBA")
+
+    result1 = fn(1)
+    result2 = fn(1)
+    assert result1.shape == (1,)
+    assert result1 != result2
+
+    large_sample = fn(1000)
+    assert large_sample.shape == (1000,)
+    np.testing.assert_allclose(large_sample.mean(), np.pi, rtol=1e-2)
+    np.testing.assert_allclose(large_sample.std(), 1, rtol=1e-2)
+
+
+def _compiled_rv_dist_param_dtypes(out):
+    """Dtypes of the distribution parameters of the single RV in the compiled graph.
+
+    The numba backend wraps RVs in a ``RandomVariableWithCoreShape`` whose inputs are
+    ``(core_shape, rng, size, *dist_params)``, so the parameters are ``inputs[3:]``.
+    """
+    fn = function([], out, mode=numba_mode)
+    [node] = [
+        n
+        for n in fn.maker.fgraph.toposort()
+        if isinstance(n.op, RandomVariableWithCoreShape)
+    ]
+    return [inp.type.dtype for inp in node.inputs[3:]]
+
+
+@pytest.mark.parametrize("floatX", ["float64", "float32"])
+def test_rv_float_params_cast_to_float64(floatX):
+    # cast_rv_float_params_to_float64 upcasts the float params of opt-in RVs to float64
+    # (always float64, not the output dtype -- float32 would stay mismatched) and leaves
+    # every other RV untouched.
+    with pytensor.config.change_flags(floatX=floatX):
+        rng = shared(np.random.default_rng(123))
+
+        # Opt-in: the int8 literals 0, 1 become float64 regardless of floatX.
+        assert _compiled_rv_dist_param_dtypes(
+            pt.random.normal(0, 1, size=(5,), rng=rng)
+        ) == ["float64", "float64"]
+
+        # Opt-in, and required: numba's np.dot rejects a float32 covariance, so MvNormal
+        # only compiles once mean/cov are float64.
+        assert _compiled_rv_dist_param_dtypes(
+            pt.random.multivariate_normal(
+                np.zeros(3, dtype="float32"), np.eye(3, dtype="float32"), rng=rng
+            )
+        ) == ["float64", "float64"]
+
+        # Not opt-in (no measurable numba speedup): the float32 probability is left as-is,
+        # as is the integer count ``n``.
+        assert _compiled_rv_dist_param_dtypes(
+            pt.random.binomial(n=np.int64(10), p=np.float32(0.3), size=(5,), rng=rng)
+        ) == ["int64", "float32"]
+
+        # Not opt-in and data-following: upcasting Permutation's array would change the
+        # output dtype and pointlessly widen the sampled data.
+        assert _compiled_rv_dist_param_dtypes(
+            pt.random.permutation(np.arange(5, dtype="float32"), rng=rng)
+        ) == ["float32"]
+
+
+def test_rv_float_params_cast_respects_warn_float64():
+    # When the user asked to be warned/raised on float64, the rewrite must not silently
+    # introduce it; the int8 params are left as-is.
+    with pytensor.config.change_flags(floatX="float32", warn_float64="raise"):
+        rng = shared(np.random.default_rng(123))
+        assert _compiled_rv_dist_param_dtypes(
+            pt.random.normal(0, 1, size=(5,), rng=rng)
+        ) == ["int8", "int8"]

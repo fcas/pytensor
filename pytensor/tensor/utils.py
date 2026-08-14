@@ -1,12 +1,15 @@
 import re
 from collections.abc import Sequence
+from itertools import product
 from typing import cast
 
 import numpy as np
-from numpy.core.numeric import normalize_axis_tuple  # type: ignore
+from numpy import nditer
+from numpy.lib.array_utils import normalize_axis_tuple
 
 import pytensor
 from pytensor.graph import FunctionGraph, Variable
+from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.utils import hash_from_code
 
 
@@ -77,14 +80,19 @@ def shape_of_variables(
 
         fgraph.attach_feature(ShapeFeature())
 
-    shape_feature = fgraph.shape_feature  # type: ignore[attr-defined]
+    shape_feature = fgraph.shape_feature
 
     input_dims = [
-        dimension for inp in fgraph.inputs for dimension in shape_feature.shape_of[inp]
+        dimension
+        for inp in fgraph.inputs
+        for dimension in shape_feature.shape_tuple(inp)
     ]
 
     output_dims = [
-        dimension for shape in shape_feature.shape_of.values() for dimension in shape
+        dimension
+        for var in fgraph.variables
+        if hasattr(var.type, "ndim")
+        for dimension in shape_feature.shape_tuple(var)
     ]
 
     compute_shapes = pytensor.function(input_dims, output_dims)
@@ -102,17 +110,11 @@ def shape_of_variables(
     sym_to_num_dict = dict(zip(output_dims, numeric_output_dims, strict=True))
 
     l = {}
-    for var in shape_feature.shape_of:
-        l[var] = tuple(sym_to_num_dict[sym] for sym in shape_feature.shape_of[var])
+    for var in fgraph.variables:
+        shape = shape_feature.shape_tuple(var)
+        if shape is not None:
+            l[var] = tuple(sym_to_num_dict[sym] for sym in shape)
     return l
-
-
-def as_list(x):
-    """Convert x to a list if it is an iterable; otherwise, wrap it in a list."""
-    try:
-        return list(x)
-    except TypeError:
-        return [x]
 
 
 def import_func_from_string(func_string: str):  # -> Optional[Callable]:
@@ -227,17 +229,72 @@ def safe_signature(
     return f"{inputs_sig}->{outputs_sig}"
 
 
-def normalize_reduce_axis(axis, ndim: int) -> tuple[int, ...] | None:
-    """Normalize the axis parameter for reduce operations."""
+def normalize_reduce_axis(
+    axis, ndim: int, normalize_none: bool = False
+) -> tuple[int, ...] | None:
+    """Normalize the axis parameter for reduce operations.
+
+    With ``normalize_none`` a ``None`` axis becomes every axis, for Ops that need them
+    spelled out so that ``None`` and the explicit axes give Ops that compare equal.
+    """
     if axis is None:
-        return None
+        return tuple(range(ndim)) if normalize_none else None
 
     # scalar inputs are treated as 1D regarding axis in reduce operations
     if axis is not None:
         try:
             axis = normalize_axis_tuple(axis, ndim=max(1, ndim))
-        except np.AxisError:
-            raise np.AxisError(axis, ndim=ndim)
+        except np.exceptions.AxisError:
+            raise np.exceptions.AxisError(axis, ndim=ndim)
 
     # TODO: If axis tuple is equivalent to None, return None for more canonicalization?
     return cast(tuple, axis)
+
+
+def faster_broadcast_to(x, shape):
+    # Stripped down core logic of `np.broadcast_to`
+    return nditer(
+        (x,),
+        flags=["multi_index", "zerosize_ok"],
+        op_flags=["readonly"],
+        itershape=shape,
+        order="C",
+    ).itviews[0]
+
+
+def faster_ndindex(shape: Sequence[int]):
+    """Equivalent to `np.ndindex` but usually 10x faster.
+
+    Unlike `np.ndindex`, this function expects a single sequence of integers
+
+    https://github.com/numpy/numpy/issues/28921
+    """
+    return product(*(range(s) for s in shape))
+
+
+def get_static_shape_from_size_variables(
+    size_vars: Sequence[Variable],
+) -> tuple[int | None, ...]:
+    """Get static shape from size variables.
+
+    Parameters
+    ----------
+    size_vars : Sequence[Variable]
+        A sequence of variables representing the size of each dimension.
+    Returns
+    -------
+    tuple[int | None, ...]
+        A tuple containing the static lengths of each dimension, or None if
+        the length is not statically known.
+    """
+    from pytensor.tensor.basic import get_scalar_constant_value
+
+    static_lengths: list[None | int] = [None] * len(size_vars)
+    for i, length in enumerate(size_vars):
+        try:
+            static_length = get_scalar_constant_value(length)
+        except NotScalarConstantError:
+            pass
+        else:
+            static_lengths[i] = int(static_length)
+    return tuple(static_lengths)

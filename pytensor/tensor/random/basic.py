@@ -1,10 +1,15 @@
 import abc
 import warnings
+from typing import Literal
 
 import numpy as np
-import scipy.stats as stats
+from numpy import broadcast_shapes as np_broadcast_shapes
+from numpy import einsum as np_einsum
+from numpy import sqrt as np_sqrt
+from numpy.linalg import cholesky as np_cholesky
+from numpy.linalg import eigh as np_eigh
+from numpy.linalg import svd as np_svd
 
-import pytensor
 from pytensor.tensor import get_vector_length, specify_shape
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.math import sqrt
@@ -13,6 +18,12 @@ from pytensor.tensor.random.utils import (
     broadcast_params,
     normalize_size_param,
 )
+from pytensor.tensor.utils import faster_broadcast_to, faster_ndindex
+from pytensor.utils import lazy_scipy_module
+
+
+# scipy.stats is considerably slow to import; defer to first use
+stats = lazy_scipy_module("stats")
 
 
 try:
@@ -271,7 +282,7 @@ class NormalRV(RandomVariable):
 normal = NormalRV()
 
 
-def standard_normal(*, size=None, rng=None, dtype=None):
+def standard_normal(*, size=None, rng=None, dtype=None, return_next_rng=False):
     """Draw samples from a standard normal distribution.
 
     Signature
@@ -288,7 +299,9 @@ def standard_normal(*, size=None, rng=None, dtype=None):
         is returned.
 
     """
-    return normal(0.0, 1.0, size=size, rng=rng, dtype=dtype)
+    return normal(
+        0.0, 1.0, size=size, rng=rng, dtype=dtype, return_next_rng=return_next_rng
+    )
 
 
 class HalfNormalRV(ScipyRandomVariable):
@@ -469,7 +482,7 @@ def gamma(shape, rate=None, scale=None, **kwargs):
     return _gamma(shape, scale, **kwargs)
 
 
-def chisquare(df, size=None, **kwargs):
+def chisquare(df, size=None, rng=None, return_next_rng=False):
     r"""Draw samples from a chisquare distribution.
 
     The probability density function for `chisquare` in terms of the number of degrees of
@@ -499,10 +512,12 @@ def chisquare(df, size=None, **kwargs):
         returned. Default is `None` in which case a single random variable
         is returned.
     """
-    return gamma(shape=df / 2.0, scale=2.0, size=size, **kwargs)
+    return gamma(
+        shape=df / 2.0, scale=2.0, size=size, rng=rng, return_next_rng=return_next_rng
+    )
 
 
-def rayleigh(scale=1.0, *, size=None, **kwargs):
+def rayleigh(scale=1.0, *, size=None, rng=None, return_next_rng=False):
     r"""Draw samples from a Rayleigh distribution.
 
     The probability density function for `rayleigh` with parameter `scale` is given by:
@@ -536,7 +551,13 @@ def rayleigh(scale=1.0, *, size=None, **kwargs):
     scale = as_tensor_variable(scale)
     if size is None:
         size = scale.shape
-    return sqrt(chisquare(df=2, size=size, **kwargs)) * scale
+    next_rng, chisquare_draws = chisquare(
+        df=2, size=size, rng=rng, return_next_rng=True
+    )
+    rayleigh_draws = sqrt(chisquare_draws) * scale
+    if return_next_rng:
+        return next_rng, rayleigh_draws
+    return rayleigh_draws
 
 
 class ParetoRV(ScipyRandomVariable):
@@ -831,27 +852,6 @@ class VonMisesRV(RandomVariable):
 vonmises = VonMisesRV()
 
 
-def safe_multivariate_normal(mean, cov, size=None, rng=None):
-    """A shape consistent multivariate normal sampler.
-
-    What we mean by "shape consistent": SciPy will return scalars when the
-    arguments are vectors with dimension of size 1.  We require that the output
-    be at least 1D, so that it's consistent with the underlying random
-    variable.
-
-    """
-    res = np.atleast_1d(
-        stats.multivariate_normal(mean=mean, cov=cov, allow_singular=True).rvs(
-            size=size, random_state=rng
-        )
-    )
-
-    if size is not None:
-        res = res.reshape([*size, -1])
-
-    return res
-
-
 class MvNormalRV(RandomVariable):
     r"""A multivariate normal random variable.
 
@@ -870,8 +870,17 @@ class MvNormalRV(RandomVariable):
     signature = "(n),(n,n)->(n)"
     dtype = "floatX"
     _print_name = ("MultivariateNormal", "\\operatorname{MultivariateNormal}")
+    __props__ = ("name", "signature", "dtype", "inplace", "method")
 
-    def __call__(self, mean=None, cov=None, size=None, **kwargs):
+    def __init__(self, *args, method: Literal["cholesky", "svd", "eigh"], **kwargs):
+        super().__init__(*args, **kwargs)
+        if method not in ("cholesky", "svd", "eigh"):
+            raise ValueError(
+                f"Unknown method {method}. The method must be one of 'cholesky', 'svd', or 'eigh'."
+            )
+        self.method = method
+
+    def __call__(self, mean, cov, size=None, method=None, **kwargs):
         r""" "Draw samples from a multivariate normal distribution.
 
         Signature
@@ -894,38 +903,40 @@ class MvNormalRV(RandomVariable):
             is specified, a single `N`-dimensional sample is returned.
 
         """
-        dtype = pytensor.config.floatX if self.dtype == "floatX" else self.dtype
-
-        if mean is None:
-            mean = np.array([0.0], dtype=dtype)
-        if cov is None:
-            cov = np.array([[1.0]], dtype=dtype)
+        if method is not None and method != self.method:
+            # Recreate Op with the new method
+            props = self._props_dict()
+            props["method"] = method
+            new_op = type(self)(**props)
+            return new_op.__call__(mean, cov, size=size, method=method, **kwargs)
         return super().__call__(mean, cov, size=size, **kwargs)
 
-    @classmethod
-    def rng_fn(cls, rng, mean, cov, size):
-        if mean.ndim > 1 or cov.ndim > 2:
-            # Neither SciPy nor NumPy implement parameter broadcasting for
-            # multivariate normals (or any other multivariate distributions),
-            # so we need to implement that here
+    def rng_fn(self, rng, mean, cov, size):
+        if size is None:
+            size = np_broadcast_shapes(mean.shape[:-1], cov.shape[:-2])
 
-            if size is None:
-                mean, cov = broadcast_params([mean, cov], [1, 2])
-            else:
-                mean = np.broadcast_to(mean, size + mean.shape[-1:])
-                cov = np.broadcast_to(cov, size + cov.shape[-2:])
-
-            res = np.empty(mean.shape)
-            for idx in np.ndindex(mean.shape[:-1]):
-                m = mean[idx]
-                c = cov[idx]
-                res[idx] = safe_multivariate_normal(m, c, rng=rng)
-            return res
+        if self.method == "cholesky":
+            A = np_cholesky(cov)
+        elif self.method == "svd":
+            A, s, _ = np_svd(cov)
+            A *= np_sqrt(s, out=s)[..., None, :]
         else:
-            return safe_multivariate_normal(mean, cov, size=size, rng=rng)
+            w, A = np_eigh(cov)
+            A *= np_sqrt(w, out=w)[..., None, :]
+
+        out = rng.normal(size=(*size, mean.shape[-1]))
+        np_einsum(
+            "...ij,...j->...i",  # numpy doesn't have a batch matrix-vector product
+            A,
+            out,
+            optimize=False,  # Nothing to optimize with two operands, skip costly setup
+            out=out,
+        )
+        out += mean
+        return out
 
 
-multivariate_normal = MvNormalRV()
+multivariate_normal = MvNormalRV(method="cholesky")
 
 
 class DirichletRV(RandomVariable):
@@ -973,19 +984,13 @@ class DirichletRV(RandomVariable):
     @classmethod
     def rng_fn(cls, rng, alphas, size):
         if alphas.ndim > 1:
-            if size is None:
-                size = ()
-
-            size = tuple(np.atleast_1d(size))
-
-            if size:
-                alphas = np.broadcast_to(alphas, size + alphas.shape[-1:])
+            if size is not None:
+                alphas = faster_broadcast_to(alphas, size + alphas.shape[-1:])
 
             samples_shape = alphas.shape
             samples = np.empty(samples_shape)
-            for index in np.ndindex(*samples_shape[:-1]):
+            for index in faster_ndindex(samples_shape[:-1]):
                 samples[index] = rng.dirichlet(alphas[index])
-
             return samples
         else:
             return rng.dirichlet(alphas, size=size)
@@ -1229,7 +1234,7 @@ class HalfCauchyRV(ScipyRandomVariable):
 halfcauchy = HalfCauchyRV()
 
 
-class InvGammaRV(ScipyRandomVariable):
+class InvGammaRV(RandomVariable):
     r"""An inverse-gamma continuous random variable.
 
     The probability density function for `invgamma` in terms of its shape
@@ -1276,8 +1281,8 @@ class InvGammaRV(ScipyRandomVariable):
         return super().__call__(shape, scale, size=size, **kwargs)
 
     @classmethod
-    def rng_fn_scipy(cls, rng, shape, scale, size):
-        return stats.invgamma.rvs(shape, scale=scale, size=size, random_state=rng)
+    def rng_fn(cls, rng, shape, scale, size):
+        return 1 / rng.gamma(shape, 1 / scale, size)
 
 
 invgamma = InvGammaRV()
@@ -1627,8 +1632,7 @@ class NegBinomialRV(ScipyRandomVariable):
         return stats.nbinom.rvs(n, p, size=size, random_state=rng)
 
 
-nbinom = NegBinomialRV()
-negative_binomial = NegBinomialRV()
+nbinom = negative_binomial = NegBinomialRV()
 
 
 class BetaBinomialRV(ScipyRandomVariable):
@@ -1797,11 +1801,11 @@ class MultinomialRV(RandomVariable):
             if size is None:
                 n, p = broadcast_params([n, p], [0, 1])
             else:
-                n = np.broadcast_to(n, size)
-                p = np.broadcast_to(p, size + p.shape[-1:])
+                n = faster_broadcast_to(n, size)
+                p = faster_broadcast_to(p, size + p.shape[-1:])
 
             res = np.empty(p.shape, dtype=cls.dtype)
-            for idx in np.ndindex(p.shape[:-1]):
+            for idx in faster_ndindex(p.shape[:-1]):
                 res[idx] = rng.multinomial(n[idx], p[idx])
             return res
         else:
@@ -1809,6 +1813,7 @@ class MultinomialRV(RandomVariable):
 
 
 multinomial = MultinomialRV()
+
 
 vsearchsorted = np.vectorize(np.searchsorted, otypes=[int], signature="(n),()->()")
 
@@ -1862,8 +1867,8 @@ class CategoricalRV(RandomVariable):
             # to `p.shape[:-1]` in the call to `vsearchsorted` below.
             if len(size) < (p.ndim - 1):
                 raise ValueError("`size` is incompatible with the shape of `p`")
-            # strict=False because we are in a hot loop
-            for s, ps in zip(reversed(size), reversed(p.shape[:-1]), strict=False):
+            # zip strict not specified because we are in a hot loop
+            for s, ps in zip(reversed(size), reversed(p.shape[:-1])):
                 if s == 1 and ps != 1:
                     raise ValueError("`size` is incompatible with the shape of `p`")
 
@@ -1975,20 +1980,20 @@ class ChoiceWithoutReplacement(RandomVariable):
                     p.shape[:batch_ndim],
                 )
 
-        a = np.broadcast_to(a, size + a.shape[batch_ndim:])
+        a = faster_broadcast_to(a, size + a.shape[batch_ndim:])
         if p is not None:
-            p = np.broadcast_to(p, size + p.shape[batch_ndim:])
+            p = faster_broadcast_to(p, size + p.shape[batch_ndim:])
 
         a_indexed_shape = a.shape[len(size) + 1 :]
         out = np.empty(size + core_shape + a_indexed_shape, dtype=a.dtype)
-        for idx in np.ndindex(size):
+        for idx in faster_ndindex(size):
             out[idx] = rng.choice(
                 a[idx], p=None if p is None else p[idx], size=core_shape, replace=False
             )
         return out
 
 
-def choice(a, size=None, replace=True, p=None, rng=None):
+def choice(a, size=None, replace=True, p=None, rng=None, return_next_rng=False):
     r"""Generate a random sample from an array.
 
 
@@ -2014,21 +2019,20 @@ def choice(a, size=None, replace=True, p=None, rng=None):
         p = specify_shape(p, (a_size,))
 
     if replace or size is None:
-        # In this case we build an expression out of simpler RVs
-        # This is equivalent to the numpy implementation:
-        # https://github.com/numpy/numpy/blob/2a9b9134270371b43223fc848b753fceab96b4a5/numpy/random/_generator.pyx#L905-L914
         if p is None:
-            idxs = integers(0, a_size, size=size, rng=rng)
+            next_rng, idxs = integers(
+                0, a_size, size=size, rng=rng, return_next_rng=True
+            )
         else:
-            idxs = categorical(p, size=size, rng=rng)
+            next_rng, idxs = categorical(p, size=size, rng=rng, return_next_rng=True)
 
         if a.type.ndim == 0:
-            # A was an implicit arange, we don't need to do any indexing
-            # TODO: Add rewrite for this optimization if users passed arange
-            return idxs
-
-        # TODO: Can use take(a, idxs, axis) to support numpy axis argument to choice
-        return a[idxs]
+            out = idxs
+        else:
+            out = a[idxs]
+        if return_next_rng:
+            return next_rng, out
+        return out
 
     # Sampling with p is not as trivial
     # It involves some form of rejection sampling or iterative shuffling under the hood.
@@ -2065,7 +2069,7 @@ def choice(a, size=None, replace=True, p=None, rng=None):
     op = ChoiceWithoutReplacement(signature=signature, dtype=dtype)
 
     params = (a, core_shape) if p is None else (a, p, core_shape)
-    return op(*params, size=None, rng=rng)
+    return op(*params, size=None, rng=rng, return_next_rng=return_next_rng)
 
 
 class PermutationRV(RandomVariable):
@@ -2094,10 +2098,10 @@ class PermutationRV(RandomVariable):
             if size is None:
                 size = x.shape[:batch_ndim]
             else:
-                x = np.broadcast_to(x, size + x.shape[batch_ndim:])
+                x = faster_broadcast_to(x, size + x.shape[batch_ndim:])
 
             out = np.empty(size + x.shape[batch_ndim:], dtype=x.dtype)
-            for idx in np.ndindex(size):
+            for idx in faster_ndindex(size):
                 out[idx] = rng.permutation(x[idx])
             return out
 
@@ -2105,7 +2109,7 @@ class PermutationRV(RandomVariable):
             return rng.permutation(x.item() if self.ndims_params[0] == 0 else x)
 
 
-def permutation(x, **kwargs):
+def permutation(x, size=None, rng=None, return_next_rng=False):
     r"""Randomly permute a sequence or a range of values.
 
     Signature
@@ -2123,53 +2127,53 @@ def permutation(x, **kwargs):
     x = as_tensor_variable(x)
     x_ndim = x.type.ndim
     x_dtype = x.type.dtype
-    # PermutationRV has a signature () -> (x) if x is a scalar
-    # and (*x) -> (*x) otherwise, with has many entries as the dimensionsality of x
     if x_ndim == 0:
         signature = "()->(x)"
     else:
         arg_sig = ",".join(f"x{i}" for i in range(x_ndim))
         signature = f"({arg_sig})->({arg_sig})"
-    return PermutationRV(signature=signature, dtype=x_dtype)(x, **kwargs)
+    return PermutationRV(signature=signature, dtype=x_dtype)(
+        x, size=size, rng=rng, return_next_rng=return_next_rng
+    )
 
 
 __all__ = [
-    "permutation",
-    "choice",
-    "integers",
-    "categorical",
-    "multinomial",
-    "betabinom",
-    "nbinom",
-    "binomial",
-    "laplace",
     "bernoulli",
-    "truncexpon",
-    "wald",
-    "invgamma",
-    "halfcauchy",
-    "cauchy",
-    "hypergeometric",
-    "geometric",
-    "poisson",
-    "dirichlet",
-    "multivariate_normal",
-    "vonmises",
-    "logistic",
-    "weibull",
-    "exponential",
-    "gumbel",
-    "pareto",
-    "chisquare",
-    "gamma",
-    "lognormal",
-    "halfnormal",
-    "normal",
     "beta",
-    "triangular",
-    "uniform",
-    "standard_normal",
-    "negative_binomial",
+    "betabinom",
+    "binomial",
+    "categorical",
+    "cauchy",
+    "chisquare",
+    "choice",
+    "dirichlet",
+    "exponential",
+    "gamma",
     "gengamma",
+    "geometric",
+    "gumbel",
+    "halfcauchy",
+    "halfnormal",
+    "hypergeometric",
+    "integers",
+    "invgamma",
+    "laplace",
+    "logistic",
+    "lognormal",
+    "multinomial",
+    "multivariate_normal",
+    "nbinom",
+    "negative_binomial",
+    "normal",
+    "pareto",
+    "permutation",
+    "poisson",
+    "standard_normal",
     "t",
+    "triangular",
+    "truncexpon",
+    "uniform",
+    "vonmises",
+    "wald",
+    "weibull",
 ]

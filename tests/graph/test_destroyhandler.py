@@ -2,7 +2,6 @@ from copy import copy
 
 import pytest
 
-from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Constant, Variable, clone
 from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.features import ReplaceValidate
@@ -10,7 +9,6 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 from pytensor.graph.rewriting.basic import (
     NodeProcessingGraphRewriter,
-    OpKeyGraphRewriter,
     PatternNodeRewriter,
     SubstitutionNodeRewriter,
     WalkingGraphRewriter,
@@ -21,7 +19,7 @@ from tests.unittest_tools import assertFailure_fast
 
 
 def OpKeyPatternNodeRewriter(p1, p2, ign=True):
-    return OpKeyGraphRewriter(PatternNodeRewriter(p1, p2), ignore_newtrees=ign)
+    return WalkingGraphRewriter(PatternNodeRewriter(p1, p2), ignore_newtrees=ign)
 
 
 def TopoSubstitutionNodeRewriter(
@@ -156,7 +154,7 @@ def test_misc():
 
 @assertFailure_fast
 def test_aliased_inputs_replacement():
-    x, y, z = inputs()
+    x, y, _z = inputs()
     tv = transpose_view(x)
     tvv = transpose_view(tv)
     sx = sigmoid(x)
@@ -224,14 +222,14 @@ def test_destroyers_loop():
 
 
 def test_aliased_inputs():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place(x, x)
     g = create_fgraph([x], [e], False)
     assert not g.consistent()
 
 
 def test_aliased_inputs2():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place(x, transpose_view(x))
     g = create_fgraph([x], [e], False)
     assert not g.consistent()
@@ -239,14 +237,14 @@ def test_aliased_inputs2():
 
 @assertFailure_fast
 def test_aliased_inputs_tolerate():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place_2(x, x)
     g = create_fgraph([x], [e], False)
     assert g.consistent()
 
 
 def test_aliased_inputs_tolerate2():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place_2(x, transpose_view(x))
     g = create_fgraph([x], [e], False)
     assert not g.consistent()
@@ -254,7 +252,7 @@ def test_aliased_inputs_tolerate2():
 
 @assertFailure_fast
 def test_same_aliased_inputs_ignored():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place_3(x, x)
     g = create_fgraph([x], [e], False)
     assert g.consistent()
@@ -262,7 +260,7 @@ def test_same_aliased_inputs_ignored():
 
 @assertFailure_fast
 def test_different_aliased_inputs_ignored():
-    x, y, z = inputs()
+    x, _y, _z = inputs()
     e = add_in_place_3(x, transpose_view(x))
     g = create_fgraph([x], [e], False)
     assert g.consistent()
@@ -326,7 +324,7 @@ def test_long_destroyers_loop():
 
 
 def test_misc_2():
-    x, y, z = inputs()
+    x, y, _z = inputs()
     tv = transpose_view(x)
     e = add_in_place(x, tv)
     g = create_fgraph([x, y], [e], False)
@@ -399,7 +397,7 @@ def test_usage_loop_insert_views():
 
 
 def test_value_repl():
-    x, y, z = inputs()
+    x, y, _z = inputs()
     sy = sigmoid(y)
     e = add_in_place(x, sy)
     g = create_fgraph([x, y], [e], False)
@@ -408,9 +406,8 @@ def test_value_repl():
     assert g.consistent()
 
 
-@config.change_flags(compute_test_value="off")
 def test_value_repl_2():
-    x, y, z = inputs()
+    x, y, _z = inputs()
     sy = sigmoid(y)
     e = add_in_place(x, sy)
     g = create_fgraph([x, y], [e], False)
@@ -424,7 +421,7 @@ def test_multiple_inplace():
     # this tests issue #5223
     # there were some problems with Ops that have more than
     # one in-place input.
-    x, y, z = inputs()
+    x, y, _z = inputs()
     # we will try to replace this op with an in-place version
     m = multiple(x, y)
     # this makes it impossible to run in-place on x

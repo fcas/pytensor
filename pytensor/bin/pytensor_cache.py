@@ -1,6 +1,8 @@
 import logging
 import os
+import shutil
 import sys
+from pathlib import Path
 
 
 if sys.platform == "win32":
@@ -24,7 +26,7 @@ _logger = logging.getLogger("pytensor.bin.pytensor-cache")
 
 def print_help(exit_status):
     if exit_status:
-        print(f"command \"{' '.join(sys.argv)}\" not recognized")
+        print(f'command "{" ".join(sys.argv)}" not recognized')
     print('Type "pytensor-cache" to print the cache location')
     print('Type "pytensor-cache help" to print this help')
     print('Type "pytensor-cache clear" to erase the cache')
@@ -65,11 +67,7 @@ def main():
             # Print a warning if some cached modules were not removed, so that the
             # user knows he should manually delete them, or call
             # pytensor-cache purge, # to properly clear the cache.
-            items = [
-                item
-                for item in sorted(os.listdir(cache.dirname))
-                if item.startswith("tmp")
-            ]
+            items = list(Path(cache.dirname).glob("tmp*"))
             if items:
                 _logger.warning(
                     "There remain elements in the cache dir that you may "
@@ -77,7 +75,10 @@ def main():
                     'You can also call "pytensor-cache purge" to '
                     "remove everything from that directory."
                 )
-                _logger.debug(f"Remaining elements ({len(items)}): {', '.join(items)}")
+                _logger.debug(f"Remaining elements ({len(items)}): {items}")
+            numba_cache_dir: Path = config.base_compiledir / "numba"
+            shutil.rmtree(numba_cache_dir, ignore_errors=True)
+
         elif sys.argv[1] == "list":
             pytensor.compile.compiledir.print_compiledir_content()
         elif sys.argv[1] == "cleanup":
@@ -89,6 +90,8 @@ def main():
             print("Lock successfully removed!")
         elif sys.argv[1] == "purge":
             pytensor.compile.compiledir.compiledir_purge()
+            numba_cache_dir: Path = config.base_compiledir / "numba"
+            shutil.rmtree(numba_cache_dir, ignore_errors=True)
         elif sys.argv[1] == "basecompiledir":
             # Simply print the base_compiledir
             print(pytensor.config.base_compiledir)

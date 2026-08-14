@@ -405,31 +405,6 @@ import ``pytensor`` and print the config variable, as in:
     raise the exception (i.e. ``'raise'``).
 
 
-.. attribute:: config.warn__ignore_bug_before
-
-    String value: ``'None'``, ``'all'``, ``'0.3'``, ``'0.4'``, ``'0.4.1'``,
-    ``'0.5'``, ``'0.6'``, ``'0.7'``, ``'0.8'``, ``'0.8.1'``, ``'0.8.2'``,
-    ``'0.9'``, ``'0.10'``, ``'1.0'``, ``'1.0.1'``, ``'1.0.2'``, ``'1.0.3'``,
-    ``'1.0.4'``,``'1.0.5'``
-
-    Default: ``'0.9'``
-
-    When we an PyTensor bug that generated a bad result is fixed, we also make
-    PyTensor raise a warning when it encounters the same circumstances again. This
-    helps users determine whether or not said bug has affected past runs, since
-    one only needs to perform the same runs again with the new version, and one
-    does not have to understand the PyTensor internals that triggered the bug.
-
-    This flag lets users ignore warnings about old bugs that were
-    fixed before their first checkout of PyTensor.
-    You can set its value to the first version of PyTensor
-    that you used (probably 0.3 or higher)
-
-    ``'None'`` means that all warnings will be displayed.
-    ``'all'`` means all warnings will be ignored.
-
-    This flag's value cannot be modified during program execution.
-
 .. attribute:: base_compiledir
 
     Default: On Windows: ``$LOCALAPPDATA\\PyTensor`` if ``$LOCALAPPDATA`` is defined,
@@ -556,6 +531,15 @@ import ``pytensor`` and print the config variable, as in:
 
     When ``True``, print the rewrites applied to stdout.
 
+.. attribute:: compiler_verbose
+
+    Bool value: either ``True`` or ``False``
+
+    Default: ``False``
+
+    When ``True``, print detailed information about the compilation of a graph. The type of information printed will
+    vary depending on the computational backend, and some backends may not provide additional information.
+
 .. attribute:: nocleanup
 
     Bool value: either ``True`` or ``False``
@@ -651,42 +635,6 @@ import ``pytensor`` and print the config variable, as in:
     Controls whether ``NanGuardMode`` generates an error when it sees a
     big value (i.e. a value greater than ``1e10``).
 
-.. attribute:: compute_test_value
-
-    String Value: ``'off'``, ``'ignore'``, ``'warn'``, ``'raise'``.
-
-    Default: ``'off'``
-
-    Setting this attribute to something other than ``'off'`` activates a
-    debugging mechanism, for which PyTensor executes the graph on-the-fly, as it
-    is being built. This allows the user to spot errors early on (such as
-    dimension mis-matches) **before** rewrites are applied.
-
-    PyTensor will execute the graph using constants and/or shared variables
-    provided by the user. Purely symbolic variables (e.g. ``x =
-    pytensor.tensor.dmatrix()``) can be augmented with test values, by writing to
-    their ``.tag.test_value`` attributes (e.g. ``x.tag.test_value = np.ones((5, 4))``).
-
-    When not ``'off'``, the value of this option dictates what happens when
-    an :class:`Op`'s inputs do not provide appropriate test values:
-
-        - ``'ignore'`` will do nothing
-        - ``'warn'`` will raise a ``UserWarning``
-        - ``'raise'`` will raise an exception
-
-.. attribute:: compute_test_value_opt
-
-    As ``compute_test_value``, but it is the value used during PyTensor's
-    rewriting phase.  This is used to help debug shape errors in PyTensor's
-    rewrites.
-
-.. attribute:: print_test_value
-
-    Bool value, default: ``False``
-
-    If ``'True'``, PyTensor will include the test values in a variable's
-    ``__str__`` output.
-
 .. attribute:: exception_verbosity
 
     String Value: ``'low'``, ``'high'``.
@@ -761,11 +709,3 @@ import ``pytensor`` and print the config variable, as in:
     The number of traceback stack levels to keep for variables during PyTensor
     compilation. When this value is greater than zero, it will make PyTensor keep
     internal stack traces.
-
-.. attribute:: config.metaopt__verbose
-
-    Int value, default: 0
-
-    The verbosity level of the meta-rewriter: ``0`` for silent, ``1`` to only
-    warn when PyTensor cannot meta-rewrite an :class:`Op`, ``2`` for full output (e.g.
-    timings and the rewrites selected).

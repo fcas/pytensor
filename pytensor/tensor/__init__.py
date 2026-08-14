@@ -1,15 +1,14 @@
 """Symbolic tensor types and constructor functions."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Union
 
-from pytensor.graph.basic import Constant, Variable
-from pytensor.graph.op import Op
+from pytensor.graph import Constant, Op, Variable
 
 
 if TYPE_CHECKING:
-    from numpy.typing import ArrayLike, NDArray
+    from numpy.typing import ArrayLike
 
 
 TensorLike = Union[Variable, Sequence[Variable], "ArrayLike"]
@@ -106,8 +105,6 @@ from pytensor.gradient import grad, hessian, jacobian
 # adds shared-variable constructors
 from pytensor.tensor import (
     blas,
-    blas_c,
-    blas_scipy,
     sharedvar,
     xlogx,
 )
@@ -116,21 +113,27 @@ from pytensor.tensor import (
 # isort: off
 from pytensor.tensor import linalg
 from pytensor.tensor import special
-
-# For backward compatibility
-from pytensor.tensor import nlinalg
-from pytensor.tensor import slinalg
+from pytensor.tensor import signal
+from pytensor.tensor import optimize
 
 # isort: on
 # Allow accessing numpy constants from pytensor.tensor
-from numpy import e, euler_gamma, inf, infty, nan, newaxis, pi
+from numpy import e, euler_gamma, inf, nan, newaxis, pi
 
 from pytensor.tensor.basic import *
-from pytensor.tensor.blas import batched_dot, batched_tensordot
 from pytensor.tensor.extra_ops import *
-from pytensor.tensor.io import *
+from pytensor.tensor.interpolate import interp, interpolate1d
 from pytensor.tensor.math import *
 from pytensor.tensor.pad import pad
+
+# Kept in the top-level namespace for backwards compatibility; the rest of
+# `pytensor.tensor.special` is only reachable as `pt.special.*`
+from pytensor.tensor.special import logaddexp, logsumexp
+
+
+# isort: off
+# reshape needs to be imported before shape.reshape, otherwise the tensor.reshape imports fail
+from pytensor.tensor.reshape import *
 from pytensor.tensor.shape import (
     reshape,
     shape,
@@ -140,6 +143,8 @@ from pytensor.tensor.shape import (
     specify_broadcastable,
     specify_shape,
 )
+
+# isort: on
 
 # We import as `_shared` instead of `shared` to avoid confusion between
 # `pytensor.shared` and `tensor._shared`.
@@ -153,7 +158,5 @@ from pytensor.tensor.variable import TensorConstant, TensorVariable
 # isort: off
 from pytensor.tensor.einsum import einsum
 from pytensor.tensor.functional import vectorize
+from pytensor.tensor import random
 # isort: on
-
-
-__all__ = ["random"]  # noqa: F405

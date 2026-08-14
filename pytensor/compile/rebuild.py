@@ -1,0 +1,548 @@
+"""
+Provide a simple user friendly API.
+
+"""
+
+from collections.abc import Sequence
+from copy import copy
+from typing import overload
+
+from pytensor.compile.io import In, Out
+from pytensor.compile.sharedvalue import SharedVariable, shared
+from pytensor.graph.basic import Constant, Variable, clone_node_and_cache
+from pytensor.graph.fg import FunctionGraph
+
+
+class UnusedInputError(Exception):
+    """
+    A symbolic input passed to function is not needed.
+
+    """
+
+
+@overload
+def rebuild_collect_shared(
+    outputs: Variable,
+    inputs=None,
+    replace=None,
+    updates=None,
+    rebuild_strict=True,
+    copy_inputs_over=True,
+    no_default_updates=False,
+    clone_inner_graphs=None,
+) -> tuple[
+    list[Variable],
+    Variable,
+    tuple[
+        dict[Variable, Variable],
+        dict[SharedVariable, Variable],
+        list[Variable],
+        list[SharedVariable],
+    ],
+]: ...
+
+
+@overload
+def rebuild_collect_shared(
+    outputs: Sequence[Variable],
+    inputs=None,
+    replace=None,
+    updates=None,
+    rebuild_strict=True,
+    copy_inputs_over=True,
+    no_default_updates=False,
+    clone_inner_graphs=None,
+) -> tuple[
+    list[Variable],
+    list[Variable],
+    tuple[
+        dict[Variable, Variable],
+        dict[SharedVariable, Variable],
+        list[Variable],
+        list[SharedVariable],
+    ],
+]: ...
+
+
+@overload
+def rebuild_collect_shared(
+    outputs: Out,
+    inputs=None,
+    replace=None,
+    updates=None,
+    rebuild_strict=True,
+    copy_inputs_over=True,
+    no_default_updates=False,
+    clone_inner_graphs=None,
+) -> tuple[
+    list[Variable],
+    Out,
+    tuple[
+        dict[Variable, Variable],
+        dict[SharedVariable, Variable],
+        list[Variable],
+        list[SharedVariable],
+    ],
+]: ...
+
+
+@overload
+def rebuild_collect_shared(
+    outputs: Sequence[Out],
+    inputs=None,
+    replace=None,
+    updates=None,
+    rebuild_strict=True,
+    copy_inputs_over=True,
+    no_default_updates=False,
+    clone_inner_graphs=None,
+) -> tuple[
+    list[Variable],
+    list[Out],
+    tuple[
+        dict[Variable, Variable],
+        dict[SharedVariable, Variable],
+        list[Variable],
+        list[SharedVariable],
+    ],
+]: ...
+
+
+def rebuild_collect_shared(
+    outputs: Sequence[Variable] | Variable | Out | Sequence[Out],
+    inputs=None,
+    replace=None,
+    updates=None,
+    rebuild_strict=True,
+    copy_inputs_over=True,
+    no_default_updates=False,
+    clone_inner_graphs=None,
+) -> tuple[
+    list[Variable],
+    list[Variable] | Variable | Out | list[Out],
+    tuple[
+        dict[Variable, Variable],
+        dict[SharedVariable, Variable],
+        list[Variable],
+        list[SharedVariable],
+    ],
+]:
+    r"""Replace subgraphs of a computational graph.
+
+    It returns a set of dictionaries and lists which collect (partial?)
+    different information about shared variables. This info is required by
+    `pytensor.function`.
+
+    Parameters
+    ----------
+    outputs : list of PyTensor Variables (or PyTensor expressions)
+        List of PyTensor variables or expressions representing the outputs of the
+        computational graph.
+    inputs : list of PyTensor Variables (or PyTensor expressions)
+        List of PyTensor variables or expressions representing the inputs of the
+        computational graph (or None).
+    replace : dict
+        Dictionary describing which subgraphs should be replaced by what.
+        orig_value => new_value
+    updates : dict
+        Dictionary describing updates expressions for shared variables.
+    rebuild_strict : bool
+        Flag, if true the type of all inputs should be the same as the one for
+        the current node.
+    copy_inputs_over : bool
+        Flag; if False it will clone inputs.
+    no_default_updates : either bool or list of Variables
+        If True, do not perform any automatic update on Variables.
+        If False (default), perform them all.
+        Else, perform automatic updates on all Variables that are neither in
+        "updates" nor in "no_default_updates".
+
+    """
+
+    from pytensor.graph.basic import _warn_deprecated_clone_inner_graph
+
+    _warn_deprecated_clone_inner_graph(clone_inner_graphs, "clone_inner_graphs")
+
+    if isinstance(outputs, tuple):
+        outputs = list(outputs)
+
+    # This function implements similar functionality as graph.clone
+    # and it should be merged with that
+    clone_d = {}
+    update_d = {}
+    update_expr = []
+    # list of shared inputs that are used as inputs of the graph
+    shared_inputs = []
+
+    def clone_v_get_shared_updates(v, copy_inputs_over):
+        r"""Clones a variable and its inputs until all are in `clone_d`.
+
+        Also, it appends all `SharedVariable`\s met along the way to
+        `shared_inputs` and their corresponding
+        `SharedVariable.default_update`\s (when applicable) to `update_d` and
+        `update_expr`.
+
+        """
+        assert v is not None
+        # Iterative depth-first traversal; recursion exceeds Python's stack on deep graphs
+        stack = [v]
+        while stack:
+            var = stack.pop()
+            if var in clone_d:
+                continue
+            owner = var.owner
+            if owner is not None:
+                if owner not in clone_d:
+                    pending = [i for i in owner.inputs if i not in clone_d]
+                    if pending:
+                        stack.append(var)
+                        stack.extend(reversed(pending))
+                        continue
+                    clone_node_and_cache(
+                        owner,
+                        clone_d,
+                        strict=rebuild_strict,
+                    )
+                clone_d.setdefault(var, var)
+                continue
+            if isinstance(var, SharedVariable):
+                if var not in shared_inputs:
+                    shared_inputs.append(var)
+                if var.default_update is not None:
+                    # Check that var should not be excluded from the default
+                    # updates list
+                    if no_default_updates is False or (
+                        isinstance(no_default_updates, list)
+                        and var not in no_default_updates
+                    ):
+                        # Do not use default_update if a "real" update was
+                        # provided
+                        if var not in update_d:
+                            var_update = var.type.filter_variable(
+                                var.default_update, allow_convert=False
+                            )
+                            if not var.type.is_super(var_update.type):
+                                raise TypeError(
+                                    "An update must have a type compatible with "
+                                    "the original shared variable"
+                                )
+                            update_d[var] = var_update
+                            update_expr.append((var, var_update))
+            if not copy_inputs_over:
+                clone_d.setdefault(var, var.clone())
+            else:
+                clone_d.setdefault(var, var)
+        return clone_d[v]
+
+    # initialize the clone_d mapping with the replace dictionary
+    if replace is None:
+        replace = []
+    try:
+        replace_pairs = list(replace.items())
+    except Exception:
+        replace_pairs = replace
+
+    for v_orig, v_repl in replace_pairs:
+        if not isinstance(v_orig, Variable):
+            raise TypeError("`givens` keys must be Variables")
+        if not isinstance(v_repl, Variable):
+            v_repl = shared(v_repl)
+
+        if v_orig in clone_d:
+            raise AssertionError(
+                "When using 'givens' or 'replace' with several "
+                "(old_v, new_v) replacement pairs, you can not have a "
+                "new_v variable depend on an old_v one. For instance, "
+                "givens = {a:b, b:(a+1)} is not allowed. Here, the old_v "
+                f"{v_orig} is used to compute other new_v's, but it is scheduled "
+                f"to be replaced by {v_repl}."
+            )
+
+        clone_d[v_orig] = clone_v_get_shared_updates(v_repl, copy_inputs_over)
+
+    if inputs is None:
+        inputs = []
+
+    def clone_inputs(i):
+        if not copy_inputs_over:
+            return clone_d.setdefault(i, i.clone())
+        else:
+            return clone_d.setdefault(i, i)
+
+    input_variables = [clone_inputs(i) for i in inputs]
+
+    # It was decided, as a first step, to prevent shared variables from
+    # being used as function inputs. Although it is technically possible,
+    # it is also not clear when/how to use the value of that shared
+    # variable (is it a default? ignored?, if the shared variable changes,
+    # does that function default also change?).
+    for v in input_variables:
+        if isinstance(v, SharedVariable):
+            raise TypeError(
+                f"Cannot use a shared variable ({v}) as explicit "
+                "input. Consider substituting a non-shared"
+                " variable via the `givens` parameter"
+            )
+
+    # Fill update_d and update_expr with provided updates
+    if updates:
+        update_pairs = updates.items() if isinstance(updates, dict) else updates
+        for store_into, update_val in update_pairs:
+            if not isinstance(store_into, SharedVariable):
+                raise TypeError("update target must be a SharedVariable", store_into)
+            if store_into in update_d:
+                raise ValueError(
+                    "this shared variable already has an update expression",
+                    (store_into, update_d[store_into]),
+                )
+
+            try:
+                update_val = store_into.type.filter_variable(
+                    update_val, allow_convert=True
+                )
+            except TypeError:
+                raise TypeError(
+                    "An update must have the same type as the original shared variable "
+                    f"(shared_var={store_into}, shared_var.type={store_into.type}, "
+                    f"update_val={update_val}, update_val.type={getattr(update_val, 'type', None)})."
+                )
+            assert store_into.type.is_super(update_val.type)
+
+            update_d[store_into] = update_val
+            update_expr.append((store_into, update_val))
+
+    # Elements of "outputs" are here cloned to "cloned_outputs"
+    if isinstance(outputs, list):
+        cloned_outputs = []
+        for v in outputs:
+            if isinstance(v, Variable):
+                cloned_v = clone_v_get_shared_updates(v, copy_inputs_over)
+                cloned_outputs.append(cloned_v)
+            elif isinstance(v, Out):
+                cloned_v = clone_v_get_shared_updates(v.variable, copy_inputs_over)
+                cloned_outputs.append(Out(cloned_v, borrow=v.borrow))
+            else:
+                raise TypeError(
+                    "Outputs must be pytensor Variable or "
+                    "Out instances. Received " + str(v) + " of type " + str(type(v))
+                )
+            # computed_list.append(cloned_v)
+    else:
+        if isinstance(outputs, Variable):
+            cloned_v = clone_v_get_shared_updates(outputs, copy_inputs_over)
+            cloned_outputs = cloned_v
+            # computed_list.append(cloned_v)
+        elif isinstance(outputs, Out):
+            cloned_v = clone_v_get_shared_updates(outputs.variable, copy_inputs_over)
+            cloned_outputs = Out(cloned_v, borrow=outputs.borrow)
+            # computed_list.append(cloned_v)
+        elif outputs is None:
+            cloned_outputs = []  # TODO: get Function.__call__ to return None
+        else:
+            raise TypeError(
+                "output must be an PyTensor Variable or Out instance (or list of them)",
+                outputs,
+            )
+
+    # Iterate over update_expr, cloning its elements, and updating
+    # shared_inputs, update_d and update_expr from the SharedVariables
+    # we discover.
+    # If the variable to be updated is a shared variable not already
+    # in shared_inputs, add it.
+    # Note: we extend update_expr while iterating over it.
+
+    i = 0
+    while i < len(update_expr):
+        v, v_update = update_expr[i]
+        cloned_v_update = clone_v_get_shared_updates(v_update, copy_inputs_over)
+        update_d[v] = cloned_v_update
+        if isinstance(v, SharedVariable) and v not in shared_inputs:
+            shared_inputs.append(v)
+        i += 1
+
+    return (
+        input_variables,
+        cloned_outputs,
+        (clone_d, update_d, update_expr, shared_inputs),
+    )
+
+
+def construct_function_ins_and_outs(
+    params,
+    outputs=None,
+    updates=None,
+    givens=None,
+    no_default_updates=False,
+    rebuild_strict=True,
+    allow_input_downcast=None,
+    fgraph: FunctionGraph | None = None,
+):
+    """Construct inputs and outputs for `pytensor.function`.
+
+    This function clones the graph (via ``rebuild_collect_shared``),
+    applies ``givens`` substitutions, discovers shared variables, and
+    wires up ``updates``.  The cloned outputs are then passed to
+    ``FunctionMaker``, where ``FunctionMaker.create_fgraph`` wraps them in a
+    ``FunctionGraph`` without cloning again (since the inputs are
+    already atomic after cloning here).
+
+    When `fgraph` is non-``None``, nothing is cloned and the given `fgraph` is
+    simply prepared for direct use.
+
+    """
+    if updates is None:
+        updates = []
+
+    if givens is None:
+        givens = []
+
+    if not isinstance(params, list | tuple):
+        raise TypeError("The `params` argument must be a list or a tuple")
+
+    if not isinstance(no_default_updates, bool | list):
+        raise TypeError("The `no_default_update` argument must be a boolean or list")
+
+    if updates:
+        update_pairs = updates.items() if isinstance(updates, dict) else updates
+        if not all(
+            isinstance(pair, tuple | list)
+            and len(pair) == 2
+            and isinstance(pair[0], Variable)
+            for pair in update_pairs
+        ):
+            raise TypeError(
+                "The `updates` parameter must be an ordered mapping or a list of pairs"
+            )
+
+    # Transform params into pytensor.compile.In objects.
+    def param_to_in(param, allow_downcast=None):
+        if isinstance(param, Constant):
+            raise TypeError("Constants not allowed in param list", param)
+        if isinstance(param, Variable):  # N.B. includes SharedVariable
+            return In(variable=param, strict=False, allow_downcast=allow_downcast)
+        elif isinstance(param, In):
+            return param
+        raise TypeError(f"Unknown parameter type: {type(param)}")
+
+    inputs = [param_to_in(p, allow_downcast=allow_input_downcast) for p in params]
+
+    in_variables = [input.variable for input in inputs]
+
+    # Check if some variable is present more than once in inputs
+    for i, v in enumerate(in_variables):
+        if v in in_variables[(i + 1) :]:
+            dup_v_i = in_variables.index(v, (i + 1))
+            raise UnusedInputError(
+                f"Variable {v} is used twice in inputs to pytensor.function, "
+                f"at indices {i} and {dup_v_i}.  This would result in values "
+                "provided for it being ignored. Please do not duplicate "
+                "variables in the inputs list."
+            )
+
+    if givens:
+        # Check that we are not using `givens` to replace input variables, because
+        # this typically does nothing, contrary to what one may expect.
+        in_var_set = set(in_variables)
+        try:
+            givens_pairs = list(givens.items())
+        except AttributeError:
+            givens_pairs = givens
+        for x, y in givens_pairs:
+            if x in in_var_set:
+                raise RuntimeError(
+                    f"You are trying to replace variable '{x}' through the "
+                    "`givens` parameter, but this variable is an input to your "
+                    "function. Replacing inputs is currently forbidden because it "
+                    "has no effect. One way to modify an input `x` to a function "
+                    "evaluating f(x) is to define a new input `y` and use "
+                    "`pytensor.function([y], f(x), givens={x: g(y)})`. Another "
+                    "solution consists in using `pytensor.clone_replace`, e.g. like this: "
+                    "`pytensor.function([x], "
+                    "pytensor.clone_replace(f(x), replace={x: g(x)}))`."
+                )
+
+    if not fgraph:
+        # Extend the outputs with the updates on input variables so they are also cloned
+        additional_outputs = [i.update for i in inputs if i.update is not None]
+        if outputs is None:
+            out_list = []
+        else:
+            if isinstance(outputs, list | tuple):
+                out_list = list(outputs)
+            else:
+                out_list = [outputs]
+        extended_outputs = out_list + additional_outputs
+
+        output_vars = rebuild_collect_shared(
+            extended_outputs,
+            in_variables,
+            replace=givens,
+            updates=updates,
+            rebuild_strict=rebuild_strict,
+            copy_inputs_over=True,
+            no_default_updates=no_default_updates,
+        )
+        input_variables, cloned_extended_outputs, other_stuff = output_vars
+        clone_d, update_d, _update_expr, shared_inputs = other_stuff
+
+        # Recover only the clones of the original outputs
+        if outputs is None:
+            new_outputs = []
+        else:
+            if isinstance(outputs, list | tuple):
+                new_outputs = cloned_extended_outputs[: len(outputs)]
+            else:
+                new_outputs = cloned_extended_outputs[0]
+
+        new_inputs = []
+
+        for i, iv in zip(inputs, input_variables, strict=True):
+            new_i = copy(i)
+            new_i.variable = iv
+
+            # If needed, replace the input's update by its cloned equivalent
+            if i.update is not None:
+                new_i.update = clone_d[i.update]
+
+            new_inputs.append(new_i)
+
+        for sv in shared_inputs:
+            if sv in update_d:
+                si = In(
+                    variable=sv,
+                    value=sv.container,
+                    mutable=True,
+                    borrow=True,
+                    update=update_d[sv],
+                    shared=True,
+                )
+            else:
+                si = In(
+                    variable=sv,
+                    value=sv.container,
+                    mutable=False,
+                    borrow=True,
+                    shared=True,
+                )
+            new_inputs.append(si)
+
+    else:
+        assert len(fgraph.inputs) == len(inputs)
+        assert len(fgraph.outputs) == len(outputs)
+
+        for fg_inp, inp in zip(fgraph.inputs, inputs, strict=True):
+            if fg_inp != getattr(inp, "variable", inp):
+                raise ValueError(
+                    f"`fgraph`'s input does not match the provided input: {fg_inp}, {inp}"
+                )
+
+        for fg_out, out in zip(fgraph.outputs, outputs, strict=True):
+            if fg_out != getattr(out, "variable", out):
+                raise ValueError(
+                    f"`fgraph`'s output does not match the provided output: {fg_out}, {out}"
+                )
+
+        new_inputs = inputs
+        new_outputs = outputs
+
+    return new_inputs, new_outputs

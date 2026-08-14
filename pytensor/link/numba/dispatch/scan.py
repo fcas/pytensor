@@ -1,19 +1,20 @@
+from hashlib import sha256
 from textwrap import dedent, indent
 
 import numpy as np
 from numba import types
 from numba.extending import overload
 
-from pytensor.compile.mode import NUMBA
+from pytensor.compile.aliasing import alias_root
+from pytensor.link.numba.cache import compile_numba_function_src
 from pytensor.link.numba.dispatch import basic as numba_basic
 from pytensor.link.numba.dispatch.basic import (
-    create_arg_string,
-    create_tuple_string,
-    numba_funcify,
+    numba_funcify_and_cache_key,
+    register_funcify_and_cache_key,
 )
-from pytensor.link.utils import compile_function_src
+from pytensor.link.numba.dispatch.compile_ops import numba_deepcopy
+from pytensor.link.numba.dispatch.string_codegen import create_tuple_string
 from pytensor.scan.op import Scan
-from pytensor.tensor.type import TensorType
 
 
 def idx_to_str(
@@ -23,9 +24,8 @@ def idx_to_str(
     idx_symbol: str = "i",
     allow_scalar=False,
 ) -> str:
-    if offset < 0:
-        indices = f"{idx_symbol} + {array_name}.shape[0] - {offset}"
-    elif offset > 0:
+    assert offset >= 0
+    if offset > 0:
         indices = f"{idx_symbol} + {offset}"
     else:
         indices = idx_symbol
@@ -52,20 +52,30 @@ def array0d_range(x):
         return range_arr
 
 
-@numba_funcify.register(Scan)
-def numba_funcify_Scan(op, node, **kwargs):
-    # Apply inner rewrites
-    # TODO: Not sure this is the right place to do this, should we have a rewrite that
-    #  explicitly triggers the optimization of the inner graphs of Scan?
-    #  The C-code defers it to the make_thunk phase
-    rewriter = (
-        op.mode_instance.including("numba")
-        .excluding(*NUMBA._optimizer.exclude)
-        .optimizer
-    )
-    rewriter(op.fgraph)
+@register_funcify_and_cache_key(Scan)
+def numba_funcify_Scan(op: Scan, node, **kwargs):
+    """Generate a Numba implementation of a `Scan` loop."""
+    # Outer untraced_sit_sot outputs whose inner input the baked step fn destroys;
+    # when not owned, the codegen copies the outer input on the first iteration.
+    destroyed_roots = {
+        alias_root(inner_node.inputs[pos])
+        for inner_node in op.fgraph.apply_nodes
+        for positions in inner_node.op.destroy_map.values()
+        for pos in positions
+    }
+    untraced_inputs_destroyed_by_inner_function = {
+        outer_out_idx
+        for inner_inp, (outer_out_idx, _) in zip(
+            op.inner_untraced_sit_sot(op.fgraph.inputs),
+            op.outer_untraced_sit_sot_outs(node.outputs, with_idx=True),
+            strict=True,
+        )
+        if inner_inp in destroyed_roots
+    }
 
-    scan_inner_func = numba_basic.numba_njit(numba_funcify(op.fgraph))
+    scan_inner_func, inner_func_cache_key = numba_funcify_and_cache_key(
+        op.fgraph, fgraph_name="numba_scan", ofg_memo=kwargs.get("ofg_memo")
+    )
 
     outer_in_names_to_vars = {
         (f"outer_in_{i}" if i > 0 else "n_steps"): v for i, v in enumerate(node.inputs)
@@ -76,19 +86,19 @@ def numba_funcify_Scan(op, node, **kwargs):
     outer_in_mit_sot_names = op.outer_mitsot(outer_in_names)
     outer_in_sit_sot_names = op.outer_sitsot(outer_in_names)
     outer_in_nit_sot_names = op.outer_nitsot(outer_in_names)
-    outer_in_shared_names = op.outer_shared(outer_in_names)
+    outer_in_untraced_sit_sot_names = op.outer_untraced_sit_sot(outer_in_names)
     outer_in_non_seqs_names = op.outer_non_seqs(outer_in_names)
 
     # These are all the outer-input names that have produce outputs/have output
     # taps (i.e. they have inner-outputs and corresponding outer-outputs).
     # Outer-outputs are ordered as follows:
-    # mit-mot-outputs + mit-sot-outputs + sit-sot-outputs + nit-sots + shared-outputs
+    # mit-mot-outputs + mit-sot-outputs + sit-sot-outputs + nit-sots + untraced-sit-sot-outputs
     outer_in_outtap_names = (
         outer_in_mit_mot_names
         + outer_in_mit_sot_names
         + outer_in_sit_sot_names
         + outer_in_nit_sot_names
-        + outer_in_shared_names
+        + outer_in_untraced_sit_sot_names
     )
 
     # We create distinct variables for/references to the storage arrays for
@@ -106,8 +116,10 @@ def numba_funcify_Scan(op, node, **kwargs):
     for outer_in_name in outer_in_nit_sot_names:
         outer_in_to_storage_name[outer_in_name] = f"{outer_in_name}_nitsot_storage"
 
-    for outer_in_name in outer_in_shared_names:
-        outer_in_to_storage_name[outer_in_name] = f"{outer_in_name}_shared_storage"
+    for outer_in_name in outer_in_untraced_sit_sot_names:
+        outer_in_to_storage_name[outer_in_name] = (
+            f"{outer_in_name}_untraced_sit_sot_storage"
+        )
 
     outer_output_names = list(outer_in_to_storage_name.values())
     assert len(outer_output_names) == len(node.outputs)
@@ -115,8 +127,8 @@ def numba_funcify_Scan(op, node, **kwargs):
     # Construct the inner-input expressions (e.g. indexed storage expressions)
     # Inner-inputs are ordered as follows:
     # sequences + mit-mot-inputs + mit-sot-inputs + sit-sot-inputs +
-    # shared-inputs + non-sequences.
-    temp_scalar_storage_alloc_stmts: list[str] = []
+    # untraced-sit-sot-inputs + non-sequences.
+    temp_0d_storage_alloc_stmts: list[str] = []
     inner_in_exprs_scalar: list[str] = []
     inner_in_exprs: list[str] = []
 
@@ -134,7 +146,7 @@ def numba_funcify_Scan(op, node, **kwargs):
             )
             temp_storage = f"{storage_name}_temp_scalar_{tap_offset}"
             storage_dtype = outer_in_var.type.numpy_dtype.name
-            temp_scalar_storage_alloc_stmts.append(
+            temp_0d_storage_alloc_stmts.append(
                 f"{temp_storage} = np.empty((), dtype=np.{storage_dtype})"
             )
             inner_in_exprs_scalar.append(
@@ -146,7 +158,7 @@ def numba_funcify_Scan(op, node, **kwargs):
                 storage_name
                 if tap_offset is None
                 else idx_to_str(
-                    storage_name, tap_offset, size=storage_size_var, allow_scalar=False
+                    storage_name, tap_offset, size=storage_size_var, allow_scalar=True
                 )
             )
         inner_in_exprs.append(indexed_inner_in_str)
@@ -172,10 +184,8 @@ def numba_funcify_Scan(op, node, **kwargs):
 
     # Inner-outputs consist of:
     # mit-mot-outputs + mit-sot-outputs + sit-sot-outputs + nit-sots +
-    # shared-outputs [+ while-condition]
+    # untraced-sit-sot-outputs [+ while-condition]
     inner_output_names = [f"inner_out_{i}" for i in range(len(op.inner_outputs))]
-
-    # inner_out_shared_names = op.inner_shared_outs(inner_output_names)
 
     # The assignment statements that copy inner-outputs into the outer-outputs
     # storage
@@ -185,16 +195,30 @@ def numba_funcify_Scan(op, node, **kwargs):
     # rotation for initially truncated storage.
     output_storage_post_proc_stmts: list[str] = []
 
-    # In truncated storage situations (e.g. created by `scan_save_mem`),
+    # In truncated storage situations (e.g. created by `scan_reduce_trace`),
     # the taps and output storage overlap, instead of the standard situation in
     # which the output storage is large enough to contain both the initial taps
     # values and the output storage.  In this truncated case, we use the
     # storage array like a circular buffer, and that's why we need to track the
     # storage size along with the taps length/indexing offset.
     def add_output_storage_post_proc_stmt(
-        outer_in_name: str, tap_sizes: tuple[int, ...], storage_size: str
+        outer_in_name: str, max_offset: int, storage_size: str
     ):
-        tap_size = max(tap_sizes)
+        # Rotate the storage so that the last computed value is at the end of the storage array.
+        # This is needed when the output storage array does not have a length
+        # equal to the number of taps plus `n_steps`.
+        output_storage_post_proc_stmts.append(
+            dedent(
+                f"""
+                if 1 < {storage_size} < (i + {max_offset}):
+                    {outer_in_name}_shift = (i + {max_offset}) % ({storage_size})
+                    if {outer_in_name}_shift > 0:
+                        {outer_in_name}_left = {outer_in_name}[:{outer_in_name}_shift]
+                        {outer_in_name}_right = {outer_in_name}[{outer_in_name}_shift:]
+                        {outer_in_name} = np.concatenate(({outer_in_name}_right, {outer_in_name}_left))
+                """
+            ).strip()
+        )
 
         if op.info.as_while:
             # While loops need to truncate the output storage to a length given
@@ -202,28 +226,22 @@ def numba_funcify_Scan(op, node, **kwargs):
             output_storage_post_proc_stmts.append(
                 dedent(
                     f"""
-                    if i + {tap_size} < {storage_size}:
-                        {storage_size} = i + {tap_size}
-                        {outer_in_name} = {outer_in_name}[:{storage_size}]
+                    elif {storage_size} > (i + {max_offset}):
+                        {outer_in_name} = {outer_in_name}[:i + {max_offset}]
                     """
                 ).strip()
             )
-
-        # Rotate the storage so that the last computed value is at the end of
-        # the storage array.
-        # This is needed when the output storage array does not have a length
-        # equal to the number of taps plus `n_steps`.
-        output_storage_post_proc_stmts.append(
-            dedent(
-                f"""
-                if (i + {tap_size}) > {storage_size}:
-                    {outer_in_name}_shift = (i + {tap_size}) % ({storage_size})
-                    {outer_in_name}_left = {outer_in_name}[:{outer_in_name}_shift]
-                    {outer_in_name}_right = {outer_in_name}[{outer_in_name}_shift:]
-                    {outer_in_name} = np.concatenate(({outer_in_name}_right, {outer_in_name}_left))
-                """
-            ).strip()
-        )
+        else:
+            # And regular loops should zero out unused entries of the output buffer
+            # These show up with truncated gradients of while loops
+            output_storage_post_proc_stmts.append(
+                dedent(
+                    f"""
+                    elif {storage_size} > (i + {max_offset}):
+                        {outer_in_name}[i + {max_offset}:] = 0
+                    """
+                ).strip()
+            )
 
     # Special in-loop statements that create (nit-sot) storage arrays after a
     # single iteration is performed.  This is necessary because we don't know
@@ -247,17 +265,16 @@ def numba_funcify_Scan(op, node, **kwargs):
         if outer_in_name not in outer_in_nit_sot_names:
             storage_name = outer_in_to_storage_name[outer_in_name]
 
-            is_tensor_type = isinstance(outer_in_var.type, TensorType)
-            if is_tensor_type:
+            is_tapped = outer_in_name not in outer_in_untraced_sit_sot_names
+            if is_tapped:
                 storage_size_name = f"{outer_in_name}_len"
                 storage_size_stmt = f"{storage_size_name} = {outer_in_name}.shape[0]"
                 input_taps = inner_in_names_to_input_taps[outer_in_name]
-                tap_storage_size = -min(input_taps)
-                assert tap_storage_size >= 0
+                max_lookback_inp_tap = -min(0, min(input_taps))
+                assert max_lookback_inp_tap >= 0
 
                 for in_tap in input_taps:
-                    tap_offset = in_tap + tap_storage_size
-                    assert tap_offset >= 0
+                    tap_offset = max_lookback_inp_tap + in_tap
                     is_vector = outer_in_var.ndim == 1
                     add_inner_in_expr(
                         outer_in_name,
@@ -266,22 +283,25 @@ def numba_funcify_Scan(op, node, **kwargs):
                         vector_slice_opt=is_vector,
                     )
 
-                output_taps = inner_in_names_to_output_taps.get(
-                    outer_in_name, [tap_storage_size]
-                )
-                inner_out_to_outer_in_stmts.extend(
-                    idx_to_str(
-                        storage_name,
-                        out_tap,
-                        size=storage_size_name,
-                        allow_scalar=True,
+                output_taps = inner_in_names_to_output_taps.get(outer_in_name, [0])
+                for out_tap in output_taps:
+                    tap_offset = max_lookback_inp_tap + out_tap
+                    assert tap_offset >= 0
+                    inner_out_to_outer_in_stmts.append(
+                        idx_to_str(
+                            storage_name,
+                            tap_offset,
+                            size=storage_size_name,
+                            allow_scalar=True,
+                        )
                     )
-                    for out_tap in output_taps
-                )
 
-                add_output_storage_post_proc_stmt(
-                    storage_name, output_taps, storage_size_name
-                )
+                if outer_in_name not in outer_in_mit_mot_names:
+                    # MIT-SOT and SIT-SOT may require buffer rolling/truncation after the main loop
+                    max_offset_out_tap = max(output_taps) + max_lookback_inp_tap
+                    add_output_storage_post_proc_stmt(
+                        storage_name, max_offset_out_tap, storage_size_name
+                    )
 
             else:
                 storage_size_stmt = ""
@@ -289,10 +309,18 @@ def numba_funcify_Scan(op, node, **kwargs):
                 inner_out_to_outer_in_stmts.append(storage_name)
 
             output_idx = outer_output_names.index(storage_name)
-            if output_idx in node.op.destroy_map or not is_tensor_type:
-                storage_alloc_stmt = f"{storage_name} = {outer_in_name}"
+            # Copy the outer inputs when the loop mutates them and the destroy_map doesn't already grant permission
+            needs_copy = output_idx not in node.op.destroy_map and (
+                # Traced buffers are always mutated by the loop write-back procedure
+                is_tapped
+                # Untraced inputs are only mutated by the inner function,
+                # so we make the copy conditional on that actually happening
+                or output_idx in untraced_inputs_destroyed_by_inner_function
+            )
+            if needs_copy:
+                storage_alloc_stmt = f"{storage_name} = numba_deepcopy({outer_in_name})"
             else:
-                storage_alloc_stmt = f"{storage_name} = np.copy({outer_in_name})"
+                storage_alloc_stmt = f"{storage_name} = {outer_in_name}"
 
             storage_alloc_stmt = dedent(
                 f"""
@@ -315,7 +343,7 @@ def numba_funcify_Scan(op, node, **kwargs):
             inner_out_to_outer_in_stmts.append(
                 idx_to_str(storage_name, 0, size=storage_size_name, allow_scalar=True)
             )
-            add_output_storage_post_proc_stmt(storage_name, (0,), storage_size_name)
+            add_output_storage_post_proc_stmt(storage_name, 0, storage_size_name)
 
             # In case of nit-sots we are provided the length of the array in
             # the iteration dimension instead of actual arrays, hence we
@@ -323,23 +351,27 @@ def numba_funcify_Scan(op, node, **kwargs):
             curr_nit_sot_position = outer_in_nit_sot_names.index(outer_in_name)
             curr_nit_sot = op.inner_nitsot_outs(op.inner_outputs)[curr_nit_sot_position]
 
-            storage_shape = create_tuple_string(
-                [storage_size_name] + ["0"] * curr_nit_sot.ndim
-            )
+            known_static_shape = all(dim is not None for dim in curr_nit_sot.type.shape)
+            if known_static_shape:
+                storage_shape = create_tuple_string(
+                    (storage_size_name, *(map(str, curr_nit_sot.type.shape)))
+                )
+            else:
+                storage_shape = create_tuple_string(
+                    (storage_size_name, *(["0"] * curr_nit_sot.ndim))
+                )
             storage_dtype = curr_nit_sot.type.numpy_dtype.name
 
             storage_alloc_stmts.append(
                 dedent(
                     f"""
-                {storage_size_name} = to_numba_scalar({outer_in_name})
+                {storage_size_name} = {outer_in_name}.item()
                 {storage_name} = np.empty({storage_shape}, dtype=np.{storage_dtype})
                 """
                 ).strip()
             )
 
-            if curr_nit_sot.type.ndim > 0:
-                storage_alloc_stmts.append(f"{outer_in_name}_ready = False")
-
+            if not known_static_shape:
                 # In this case, we don't know the shape of the output storage
                 # array until we get some output from the inner-function.
                 # With the following we add delayed output storage initialization:
@@ -349,9 +381,8 @@ def numba_funcify_Scan(op, node, **kwargs):
                 inner_out_post_processing_stmts.append(
                     dedent(
                         f"""
-                    if not {outer_in_name}_ready:
+                    if i == 0:
                         {storage_name} = np.empty(({storage_size_name},) + np.shape({inner_out_name}), dtype=np.{storage_dtype})
-                        {outer_in_name}_ready = True
                     """
                     ).strip()
                 )
@@ -366,10 +397,11 @@ def numba_funcify_Scan(op, node, **kwargs):
     assert len(inner_in_exprs) == len(op.fgraph.inputs)
 
     inner_scalar_in_args_to_temp_storage = "\n".join(inner_in_exprs_scalar)
-    inner_in_args = create_arg_string(inner_in_exprs)
+    # Break inputs in new lines, just for readability of the source code
+    inner_in_args = f",\n{' ' * 12}".join(inner_in_exprs)
     inner_outputs = create_tuple_string(inner_output_names)
     input_storage_block = "\n".join(storage_alloc_stmts)
-    input_temp_scalar_storage_block = "\n".join(temp_scalar_storage_alloc_stmts)
+    input_temp_0d_storage_block = "\n".join(temp_0d_storage_alloc_stmts)
     output_storage_post_processing_block = "\n".join(output_storage_post_proc_stmts)
     inner_out_post_processing_block = "\n".join(inner_out_post_processing_stmts)
 
@@ -383,29 +415,43 @@ def scan({", ".join(outer_in_names)}):
 
 {indent(input_storage_block, " " * 4)}
 
-{indent(input_temp_scalar_storage_block, " " * 4)}
+{indent(input_temp_0d_storage_block, " " * 4)}
 
     i = 0
     cond = np.array(False)
     while i < n_steps and not cond.item():
 {indent(inner_scalar_in_args_to_temp_storage, " " * 8)}
 
-        {inner_outputs} = scan_inner_func({inner_in_args})
+        {inner_outputs} = scan_inner_func(
+            {inner_in_args}
+        )
 {indent(inner_out_post_processing_block, " " * 8)}
 {indent(inner_out_to_outer_out_stmts, " " * 8)}
         i += 1
 
 {indent(output_storage_post_processing_block, " " * 4)}
 
-    return {create_arg_string(outer_output_names)}
+    return {", ".join(outer_output_names)}
     """
 
-    global_env = {
-        "scan_inner_func": scan_inner_func,
-        "to_numba_scalar": numba_basic.to_scalar,
-    }
-    global_env["np"] = np
+    scan_op_fn = compile_numba_function_src(
+        scan_op_src,
+        "scan",
+        globals()
+        | {
+            "np": np,
+            "scan_inner_func": scan_inner_func,
+            "numba_deepcopy": numba_deepcopy,
+        },
+    )
 
-    scan_op_fn = compile_function_src(scan_op_src, "scan", {**globals(), **global_env})
+    if inner_func_cache_key is None:
+        # If we can't cache the inner function, we can't cache the Scan either
+        scan_cache_key = None
+    else:
+        scan_cache_version = 1
+        scan_cache_key = sha256(
+            f"({scan_op_src}, {inner_func_cache_key}, {scan_cache_version})".encode()
+        ).hexdigest()
 
-    return numba_basic.numba_njit(scan_op_fn)
+    return numba_basic.numba_njit(scan_op_fn, boundscheck=False), scan_cache_key

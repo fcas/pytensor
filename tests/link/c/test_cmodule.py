@@ -17,7 +17,7 @@ import pytest
 
 import pytensor
 import pytensor.tensor as pt
-from pytensor.compile.function import function
+from pytensor.compile.maker import function
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply
@@ -92,21 +92,15 @@ def test_inter_process_cache():
     """
 
     x, y = dvectors("xy")
-    f = function([x, y], [MyOp()(x), MyOp()(y)])
+    f = function([x, y], [MyOp()(x), MyOp()(y)], mode="CVM")
     f(np.arange(60), np.arange(60))
-    if config.mode == "FAST_COMPILE" or config.cxx == "":
-        assert MyOp.nb_called == 0
-    else:
-        assert MyOp.nb_called == 1
+    assert MyOp.nb_called == 1
 
     # What if we compile a new function with new variables?
     x, y = dvectors("xy")
-    f = function([x, y], [MyOp()(x), MyOp()(y)])
+    f = function([x, y], [MyOp()(x), MyOp()(y)], mode="CVM")
     f(np.arange(60), np.arange(60))
-    if config.mode == "FAST_COMPILE" or config.cxx == "":
-        assert MyOp.nb_called == 0
-    else:
-        assert MyOp.nb_called == 1
+    assert MyOp.nb_called == 1
 
 
 @pytest.mark.filterwarnings("error")
@@ -128,7 +122,7 @@ def test_cache_versioning():
     z = my_add(x)
     z_v = my_add_ver(x)
 
-    with tempfile.TemporaryDirectory() as dir_name:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dir_name:
         cache = ModuleCache(dir_name)
 
         lnk = CLinker().accept(FunctionGraph(outputs=[z]))
@@ -228,23 +222,19 @@ def cxx_search_dirs(blas_libs, mock_system):
         )
 
 
-@pytest.fixture(
-    scope="function", params=[True, False], ids=["Working_CXX", "Broken_CXX"]
+@pytest.mark.parametrize(
+    "working_cxx", [True, False], ids=["Working_CXX", "Broken_CXX"]
 )
-def cxx_search_dirs_status(request):
-    return request.param
-
-
 @patch("pytensor.link.c.cmodule.std_lib_dirs", return_value=[])
 @patch("pytensor.link.c.cmodule.check_mkl_openmp", return_value=None)
 def test_default_blas_ldflags(
-    mock_std_lib_dirs, mock_check_mkl_openmp, cxx_search_dirs, cxx_search_dirs_status
+    mock_std_lib_dirs, mock_check_mkl_openmp, cxx_search_dirs, working_cxx
 ):
     cxx_search_dirs, expected_blas_ldflags, enabled_accelerate_framework = (
         cxx_search_dirs
     )
     mock_process = MagicMock()
-    if cxx_search_dirs_status:
+    if working_cxx:
         error_message = ""
         mock_process.communicate = lambda *args, **kwargs: (cxx_search_dirs, b"")
         mock_process.returncode = 0
@@ -258,7 +248,6 @@ def test_default_blas_ldflags(
     def patched_compile_tmp(*args, **kwargs):
         def wrapped(test_code, tmp_prefix, flags, try_run, output):
             if len(flags) >= 2 and flags[:2] == ["-framework", "Accelerate"]:
-                print(enabled_accelerate_framework)
                 if enabled_accelerate_framework:
                     return (True, True)
                 else:
@@ -274,7 +263,7 @@ def test_default_blas_ldflags(
             "try_compile_tmp",
             new_callable=patched_compile_tmp,
         ):
-            if cxx_search_dirs_status:
+            if working_cxx:
                 assert set(default_blas_ldflags().split(" ")) == set(
                     expected_blas_ldflags.split(" ")
                 )
@@ -400,18 +389,18 @@ def test_linking_patch(listdir_mock, platform):
             ]
 
 
+@config.change_flags(on_opt_error="raise", on_shape_error="raise")
+def _f_build_cache_race_condition(factor):
+    # Some of the caching issues arise during constant folding within the
+    # optimization passes, so we need these config changes to prevent the
+    # exceptions from being caught
+    a = pt.vector()
+    f = pytensor.function([a], factor * a, mode="CVM")
+    return f(np.array([1], dtype=config.floatX))
+
+
 def test_cache_race_condition():
     with tempfile.TemporaryDirectory() as dir_name:
-
-        @config.change_flags(on_opt_error="raise", on_shape_error="raise")
-        def f_build(factor):
-            # Some of the caching issues arise during constant folding within the
-            # optimization passes, so we need these config changes to prevent the
-            # exceptions from being caught
-            a = pt.vector()
-            f = pytensor.function([a], factor * a)
-            return f(np.array([1], dtype=config.floatX))
-
         ctx = multiprocessing.get_context()
         compiledir_prop = pytensor.config._config_var_dict["compiledir"]
 
@@ -430,7 +419,7 @@ def test_cache_race_condition():
                 # A random, constant input to prevent caching between runs
                 factor = rng.random()
                 procs = [
-                    ctx.Process(target=f_build, args=(factor,))
+                    ctx.Process(target=_f_build_cache_race_condition, args=(factor,))
                     for i in range(num_procs)
                 ]
                 for proc in procs:

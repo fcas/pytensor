@@ -335,9 +335,9 @@ class TestIfelse(utt.OptimizationTestMixin):
         z = matrix("csr", dtype=self.dtype, name="z")
         cond = iscalar("cond")
 
-        with pytest.raises(TypeError, match=".*do not match."):
+        with pytest.raises(TypeError, match=r".*do not match."):
             ifelse(cond, x, y)
-        with pytest.raises(TypeError, match=".*do not match."):
+        with pytest.raises(TypeError, match=r".*do not match."):
             ifelse(cond, y, x)
         with pytest.raises(TypeError):
             ifelse(cond, x, z)
@@ -497,14 +497,6 @@ class TestIfelse(utt.OptimizationTestMixin):
         vw2 = rng.uniform()
         assert np.allclose(f(vx1, vx2, vy1, vy2, vw1, vw2, 1), vx1 + vy1 + vw1)
         assert np.allclose(f(vx1, vx2, vy1, vy2, vw1, vw2, 0), vx2 + vy2 + vw2)
-
-    def test_grad_test_values(self):
-        # Regression test for test values of `ifelse` gradient.
-        with pytensor.config.change_flags(compute_test_value="raise"):
-            x = scalar("x")
-            x.tag.test_value = 1
-            # Used to crash due to undefined test value.
-            pytensor.grad(ifelse(0, x, x), x)
 
     def test_grad_int_value(self):
         w = pytensor.shared(np.random.random(10))
