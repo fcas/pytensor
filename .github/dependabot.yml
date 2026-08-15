@@ -2,8 +2,9 @@ version: 2
 updates:
   - package-ecosystem: "pip"
     directory: "/"
+    target-branch: "main"
     pull-request-branch-name:
       separator: "-"
     schedule:
       interval: "cron"
-      cron: "34 10 * * *"
+      cron: "1 13 * * *"
